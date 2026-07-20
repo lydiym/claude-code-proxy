@@ -501,6 +501,25 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             if system_text:
                 messages.append({"role": "system", "content": system_text.strip()})
 
+    # Context compaction in the client can truncate history and leave tool
+    # calls and their results unpaired. Strict OpenAI backends reject both an
+    # assistant tool_call with no following tool message and a role="tool"
+    # message with no preceding call, so pre-scan the ids of each side to know
+    # which pairs actually survive.
+    call_ids = set()
+    result_ids = set()
+    for msg in anthropic_request.messages:
+        if not isinstance(msg.content, list):
+            continue
+        for block in msg.content:
+            block_type = getattr(block, "type", None)
+            if block_type == "tool_use":
+                call_ids.add(block.id)
+            elif block_type == "tool_result":
+                rid = getattr(block, "tool_use_id", "") or ""
+                if rid:
+                    result_ids.add(rid)
+
     # Add conversation messages, converting to OpenAI/LiteLLM format.
     # LiteLLM's canonical input is OpenAI Chat format for every provider, so
     # tool calls travel as assistant.tool_calls and their results as role="tool"
@@ -521,16 +540,26 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 if block_type == "text":
                     text_parts.append(block.text)
                 elif block_type == "tool_use":
-                    tool_calls.append(
-                        {
-                            "id": block.id,
-                            "type": "function",
-                            "function": {
-                                "name": block.name,
-                                "arguments": json.dumps(block.input),
-                            },
-                        }
-                    )
+                    if block.id in result_ids:
+                        tool_calls.append(
+                            {
+                                "id": block.id,
+                                "type": "function",
+                                "function": {
+                                    "name": block.name,
+                                    "arguments": json.dumps(block.input),
+                                },
+                            }
+                        )
+                    else:
+                        # Dangling call whose result was truncated from history.
+                        # Describe it in prose rather than a tool-call-like syntax
+                        # (which small models tend to mimic) so the backend does
+                        # not demand a response for an unanswerable call.
+                        text_parts.append(
+                            f"(An earlier {block.name} tool call is missing its "
+                            f"result in this context.)"
+                        )
 
             assistant_msg = {"role": "assistant"}
             text = "\n".join(text_parts).strip()
@@ -552,15 +581,27 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 user_parts.append(convert_image_block(block.source))
             elif block_type == "tool_result":
                 tool_use_id = getattr(block, "tool_use_id", "") or ""
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": parse_tool_result_content(
-                            getattr(block, "content", None)
-                        ),
-                    }
+                result_text = parse_tool_result_content(
+                    getattr(block, "content", None)
                 )
+                if tool_use_id in call_ids:
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": result_text,
+                        }
+                    )
+                else:
+                    # Orphaned result whose call was truncated from history. Fold
+                    # into user text so we never emit an unpaired tool message;
+                    # the ghost id would be meaningless to the model, so drop it.
+                    user_parts.append(
+                        {
+                            "type": "text",
+                            "text": f"(Result from an earlier tool call:)\n{result_text}",
+                        }
+                    )
 
         # Tool results must immediately follow the assistant turn that produced
         # the matching tool_calls, so emit them before any trailing user text.
