@@ -35,13 +35,6 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
    uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
    ```
 
-#### Docker
-
-```bash
-curl -O .env https://raw.githubusercontent.com/lydiym/claude-code-proxy/refs/heads/main/.env.example
-docker run -d --env-file .env -p 8082:8082 ghcr.io/lydiym/claude-code-proxy:latest
-```
-
 ### Using with Claude Code 🎮
 
 ```bash
