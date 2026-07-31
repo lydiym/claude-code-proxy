@@ -72,6 +72,13 @@ OPENAI_MODELS = {
 }
 
 
+STOP_REASON_MAP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+}
+
+
 # Models for Anthropic API requests
 class ContentBlockText(BaseModel):
     type: Literal["text"]
@@ -122,10 +129,6 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 
-class ThinkingConfig(BaseModel):
-    enabled: bool = True
-
-
 class MessagesRequest(BaseModel):
     model: str
     max_tokens: int
@@ -136,14 +139,11 @@ class MessagesRequest(BaseModel):
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = None
     top_k: Optional[int] = None
-    metadata: Optional[Dict[str, Any]] = None
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Dict[str, Any]] = None
-    thinking: Optional[ThinkingConfig] = None
-    original_model: Optional[str] = None
 
     @field_validator("model")
-    def validate_model_field(cls, v, info):
+    def validate_model_field(cls, v):
         original_model = v
 
         # Strip any prefix the client might have added so we match on the bare
@@ -170,10 +170,6 @@ class MessagesRequest(BaseModel):
             new_model = f"openai/{clean_v}"
 
         logger.debug(f"MODEL MAPPING: '{original_model}' -> '{new_model}'")
-
-        values = info.data
-        if isinstance(values, dict):
-            values["original_model"] = original_model
 
         return new_model
 
@@ -580,12 +576,7 @@ def convert_litellm_to_anthropic(
             prompt_tokens = getattr(usage_info, "prompt_tokens", 0)
             completion_tokens = getattr(usage_info, "completion_tokens", 0)
 
-        stop_reason_map = {
-            "stop": "end_turn",
-            "length": "max_tokens",
-            "tool_calls": "tool_use",
-        }
-        stop_reason = stop_reason_map.get(finish_reason, "end_turn")
+        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
 
         # Make sure content is never empty
         if not content:
@@ -620,7 +611,6 @@ def convert_litellm_to_anthropic(
 
 async def handle_streaming(response_generator, original_request: MessagesRequest):
     """Convert a LiteLLM streaming response into Anthropic SSE events."""
-    stop_reason_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
     def emit(event: str, data: Dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -801,7 +791,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             yield text_delta(accumulated_text)
                         yield text_block_close()
 
-                    stop_reason = stop_reason_map.get(finish_reason, "end_turn")
+                    stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
                     for chunk in finish_stream(stop_reason, output_tokens):
                         yield chunk
                     return
