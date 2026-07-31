@@ -17,7 +17,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
 
 1. **Clone and enter the repo:**
    ```bash
-   git clone https://github.com/1rgs/claude-code-proxy.git
+   git clone https://github.com/lydiym/claude-code-proxy.git
    cd claude-code-proxy
    ```
 
@@ -38,8 +38,8 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
 #### Docker
 
 ```bash
-curl -O .env https://raw.githubusercontent.com/1rgs/claude-code-proxy/refs/heads/main/.env.example
-docker run -d --env-file .env -p 8082:8082 ghcr.io/1rgs/claude-code-proxy:latest
+curl -O .env https://raw.githubusercontent.com/lydiym/claude-code-proxy/refs/heads/main/.env.example
+docker run -d --env-file .env -p 8082:8082 ghcr.io/lydiym/claude-code-proxy:latest
 ```
 
 ### Using with Claude Code 🎮
