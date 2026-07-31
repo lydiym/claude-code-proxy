@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Smoke tests for the Anthropic → OpenAI proxy.
+Tests for the Anthropic → OpenAI proxy.
 
-Each test sends a real request to a locally running proxy on PROXY_URL and
-checks the response shape (no live Anthropic API calls). Useful for catching
-regressions in the request/response translation.
+Includes both integration smoke tests (require a running server on PROXY_URL)
+and unit tests for the request/response translation (no network needed).
 
 Usage:
-  python tests.py                  # run all tests
-  python tests.py --simple         # skip the tool scenarios
-  python tests.py --tools          # only tool scenarios
+  python tests.py                  # run unit tests only (default)
+  python tests.py --integration    # run integration smoke tests
+  python tests.py --all            # run both
+  python tests.py --simple         # (integration) skip tool scenarios
+  python tests.py --tools          # (integration) only tool scenarios
 """
 
 import argparse
@@ -81,6 +82,369 @@ TEST_SCENARIOS: Dict[str, Dict[str, Any]] = {
         "tool_choice": {"type": "auto"},
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — translation logic only, no network.
+# ---------------------------------------------------------------------------
+
+import server as srv
+
+
+def _make_request(payload: Dict[str, Any]) -> srv.MessagesRequest:
+    """Build a MessagesRequest from a dict (validates + runs model_validator)."""
+    return srv.MessagesRequest(**payload)
+
+
+def test_capture_original_model_copies_model_field() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.original_model == "claude-3-5-sonnet-20241022"
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_capture_original_model_preserves_explicit_override() -> None:
+    req = _make_request({
+        "model": "openai/gpt-4.1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.original_model == "openai/gpt-4.1"
+    assert req.model == "openai/gpt-4.1"
+
+
+def test_validate_model_field_haiku_mapping() -> None:
+    req = _make_request({
+        "model": "claude-3-5-haiku-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.SMALL_MODEL}"
+
+
+def test_validate_model_field_sonnet_mapping() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_known_openai_model_gets_prefix() -> None:
+    req = _make_request({
+        "model": "gpt-4.1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/gpt-4.1"
+
+
+def test_validate_model_field_existing_openai_prefix_passthrough() -> None:
+    req = _make_request({
+        "model": "openai/custom-model",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/custom-model"
+
+
+def test_validate_model_field_unknown_name_gets_prefix() -> None:
+    req = _make_request({
+        "model": "my-local-llama",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/my-local-llama"
+
+
+def test_validate_model_field_strips_anthropic_prefix() -> None:
+    req = _make_request({
+        "model": "anthropic/claude-3-5-haiku-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.SMALL_MODEL}"
+    assert req.original_model == "anthropic/claude-3-5-haiku-20241022"
+
+
+def test_sanitize_messages_for_openai_removes_foreign_keys() -> None:
+    messages = [
+        {"role": "user", "content": "hi", "stop_reason": "end_turn", "type": "message"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "x"}]},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "plain"},
+    ]
+    srv.sanitize_messages_for_openai(messages)
+    assert messages[0] == {"role": "user", "content": "hi"}
+    # When tool_calls is present OpenAI allows content=None, so we leave it.
+    assert messages[1] == {"role": "assistant", "content": None, "tool_calls": [{"id": "x"}]}
+    # Empty content with no tool_calls gets filled with the ellipsis sentinel.
+    assert messages[2] == {"role": "assistant", "content": "..."}
+    assert messages[3] == {"role": "user", "content": "plain"}
+
+
+def test_sanitize_messages_for_openai_keeps_allowed_keys() -> None:
+    messages = [
+        {
+            "role": "tool",
+            "name": "calculator",
+            "tool_call_id": "abc",
+            "content": "42",
+            "foreign_field": "x",
+        }
+    ]
+    srv.sanitize_messages_for_openai(messages)
+    assert "foreign_field" not in messages[0]
+    assert messages[0]["name"] == "calculator"
+    assert messages[0]["tool_call_id"] == "abc"
+    assert messages[0]["content"] == "42"
+
+
+def test_convert_anthropic_to_litellm_minimal_request() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": "Hello"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["model"] == f"openai/{srv.BIG_MODEL}"
+    assert out["max_completion_tokens"] == 200
+    assert out["temperature"] == 1.0
+    assert out["stream"] is False
+    assert out["messages"] == [{"role": "user", "content": "Hello"}]
+    assert "system" not in out["messages"][0]
+    assert "tools" not in out
+    assert "tool_choice" not in out
+
+
+def test_convert_anthropic_to_litellm_clamps_max_tokens() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": srv.MAX_OUTPUT_TOKENS + 1000,
+        "messages": [{"role": "user", "content": "Hello"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["max_completion_tokens"] == srv.MAX_OUTPUT_TOKENS
+
+
+def test_convert_anthropic_to_litellm_with_string_system() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "system": "You are helpful.",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][0] == {"role": "system", "content": "You are helpful."}
+
+
+def test_convert_anthropic_to_litellm_with_list_system_joins_text_blocks() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "system": [
+            {"type": "text", "text": "Be concise."},
+            {"type": "text", "text": "Answer in English."},
+        ],
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][0]["role"] == "system"
+    assert "Be concise." in out["messages"][0]["content"]
+    assert "Answer in English." in out["messages"][0]["content"]
+
+
+def test_convert_anthropic_to_litellm_with_tools_and_choice() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "tools": [{
+            "name": "calc",
+            "description": "calculator",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        }],
+        "tool_choice": {"type": "tool", "name": "calc"},
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["tools"] == [{
+        "type": "function",
+        "function": {
+            "name": "calc",
+            "description": "calculator",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        },
+    }]
+    assert out["tool_choice"] == {"type": "function", "function": {"name": "calc"}}
+
+
+def test_convert_anthropic_to_litellm_passes_optional_sampling() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stop_sequences": ["END"],
+        "top_p": 0.9,
+        "top_k": 40,
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["stop"] == ["END"]
+    assert out["top_p"] == 0.9
+    assert out["top_k"] == 40
+
+
+def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 200,
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "calc", "input": {"q": "2+2"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "4"},
+            ]},
+        ],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][1]["role"] == "assistant"
+    assert out["messages"][1]["tool_calls"] == [{
+        "id": "t1", "type": "function",
+        "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
+    }]
+    assert out["messages"][2] == {"role": "tool", "tool_call_id": "t1", "content": "4"}
+
+
+def test_convert_litellm_to_anthropic_text_response() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "id": "resp-1",
+        "choices": [{
+            "message": {"role": "assistant", "content": "Hello there"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 5},
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.id == "resp-1"
+    assert out.model == f"openai/{srv.BIG_MODEL}"
+    assert out.role == "assistant"
+    assert out.stop_reason == "end_turn"
+    assert [b.model_dump() for b in out.content] == [{"type": "text", "text": "Hello there"}]
+    assert out.usage.input_tokens == 11
+    assert out.usage.output_tokens == 5
+
+
+def test_convert_litellm_to_anthropic_tool_use_response() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.stop_reason == "tool_use"
+    assert len(out.content) == 1
+    block = out.content[0]
+    assert block.model_dump() == {
+        "type": "tool_use", "id": "call_1", "name": "calc", "input": {"q": "2+2"},
+    }
+
+
+def test_convert_litellm_to_anthropic_generates_id_when_missing() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.id.startswith("msg_")
+    assert out.usage.input_tokens == 0
+    assert out.usage.output_tokens == 0
+
+
+def test_convert_litellm_to_anthropic_maps_length_stop_reason() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 5,
+        "messages": [{"role": "user", "content": "Tell me a long story"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "Once upon..."}, "finish_reason": "length"}],
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.stop_reason == "max_tokens"
+
+
+def test_convert_litellm_to_anthropic_handles_empty_choices() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {"choices": []}
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert [b.model_dump() for b in out.content] == [{"type": "text", "text": ""}]
+    assert out.stop_reason == "end_turn"
+
+
+def test_convert_litellm_to_anthropic_uses_keyword_usage_args() -> None:
+    """Regression: Usage(...) must be built with keyword args, not positional."""
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.usage.input_tokens == 4
+    assert out.usage.output_tokens == 2
+
+
+def test_convert_litellm_to_anthropic_recovers_from_broken_usage() -> None:
+    """Regression: even if usage is malformed, we still return a usable response."""
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": "not-a-dict",
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.usage.input_tokens == 0
+    assert out.usage.output_tokens == 0
+    assert out.content[0].model_dump() == {"type": "text", "text": "ok"}
 
 REQUIRED_EVENT_TYPES = {
     "message_start",
@@ -210,19 +574,58 @@ def filter_scenarios(scenarios: Dict[str, Dict[str, Any]], args: argparse.Namesp
     return scenarios
 
 
+def discover_unit_tests() -> List[str]:
+    """Collect every top-level test_* function defined in this module."""
+    import inspect
+    return [name for name, _ in inspect.getmembers(sys.modules[__name__], inspect.isfunction)
+            if name.startswith("test_")]
+
+
+def run_unit_tests(names: List[str]) -> List[bool]:
+    """Invoke each test_* function; return one bool per test."""
+    results: List[bool] = []
+    for name in names:
+        try:
+            getattr(sys.modules[__name__], name)()
+            print(f"OK   {name}")
+            results.append(True)
+        except AssertionError as e:
+            print(f"FAIL {name}: {e}")
+            results.append(False)
+        except Exception as e:
+            print(f"ERROR {name}: {type(e).__name__}: {e}")
+            results.append(False)
+    return results
+
+
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="Smoke tests for the Anthropic → OpenAI proxy")
-    parser.add_argument("--simple", action="store_true", help="skip tool scenarios")
-    parser.add_argument("--tools", action="store_true", help="only run tool scenarios")
+    parser = argparse.ArgumentParser(description="Tests for the Anthropic → OpenAI proxy")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--unit", action="store_true", help="run unit tests only (default)")
+    mode.add_argument("--integration", action="store_true", help="run integration smoke tests")
+    mode.add_argument("--all", action="store_true", help="run unit + integration tests")
+    parser.add_argument("--simple", action="store_true", help="(integration) skip tool scenarios")
+    parser.add_argument("--tools", action="store_true", help="(integration) only tool scenarios")
     args = parser.parse_args()
 
-    scenarios = filter_scenarios(TEST_SCENARIOS, args)
-    results: List[bool] = []
-    for name, payload in scenarios.items():
-        results.append(await run_one(name, payload))
+    run_units = args.all or (not args.integration)
+    run_integration = args.all or args.integration
 
-    passed = sum(results)
-    total = len(results)
+    unit_results: List[bool] = []
+    if run_units:
+        names = discover_unit_tests()
+        print(f"--- unit tests ({len(names)}) ---")
+        unit_results = run_unit_tests(names)
+
+    integration_results: List[bool] = []
+    if run_integration:
+        scenarios = filter_scenarios(TEST_SCENARIOS, args)
+        print(f"\n--- integration tests ({len(scenarios)}) ---")
+        for name, payload in scenarios.items():
+            integration_results.append(await run_one(name, payload))
+
+    passed = sum(unit_results) + sum(integration_results)
+    total = len(unit_results) + len(integration_results)
     print(f"\n{passed}/{total} tests passed")
     return 0 if passed == total else 1
 
