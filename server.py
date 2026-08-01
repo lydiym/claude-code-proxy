@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional, Union, Literal
 import logging
 import json
 import os
+import sys
 import time
 import uuid
 from dotenv import load_dotenv
@@ -13,15 +14,71 @@ import uvicorn
 
 load_dotenv()
 
+# Single source of truth for log format. Used both by the root handler
+# (basicConfig) and by LOG_CONFIG below so uvicorn's loggers emit through
+# the same format when the server runs as `python server.py`.
+_LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
+_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 logging.basicConfig(
     level=logging.WARN,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format=_LOG_FORMAT,
+    datefmt=_DATE_FORMAT,
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error", "LiteLLM", "httpx", "httpcore"):
+for noisy in ("LiteLLM", "httpx", "httpcore"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+class Colors:
+    """ANSI color codes used to highlight parts of operational log lines."""
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def _color(code, text):
+    """Wrap text in ANSI code when stderr is a TTY, otherwise return plain."""
+    try:
+        if sys.stderr.isatty():
+            return f"{code}{text}{Colors.RESET}"
+    except (ValueError, AttributeError):
+        pass
+    return text
+
+
+# Handed to uvicorn.run() so uvicorn's loggers share the format above and
+# propagate to the root handler instead of installing their own. We keep
+# uvicorn.access at WARNING so per-request access lines stay out of the log.
+LOG_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": _LOG_FORMAT,
+            "datefmt": _DATE_FORMAT,
+        },
+    },
+    "handlers": {
+        "default": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "stream": "ext://sys.stderr",
+        },
+    },
+    "loggers": {
+        "uvicorn": {"level": "INFO", "propagate": True},
+        "uvicorn.error": {"level": "INFO", "propagate": True},
+        "uvicorn.access": {"level": "WARNING", "propagate": True},
+    },
+}
 
 app = FastAPI()
 
@@ -562,18 +619,19 @@ def convert_litellm_to_anthropic(
 
 
 def log_request(method, path, source_model, target_model, num_messages, num_tools, status_code):
-    """Log a one-line request summary with the source/target model mapping."""
+    """Log a one-line request summary highlighting the source/target model mapping."""
     endpoint = path.split("?", 1)[0] if "?" in path else path
-    logger.info(
-        "%s %s %d %s → %s (%d tools, %d messages)",
-        method,
-        endpoint,
-        status_code,
-        short_model(source_model),
-        short_model(target_model),
-        num_tools,
-        num_messages,
+    status_color = Colors.GREEN if status_code == 200 else Colors.RED
+    line = (
+        f"{_color(Colors.BOLD, method)} {_color(Colors.BOLD, endpoint)} "
+        f"{_color(status_color, status_code)} "
+        f"{_color(Colors.CYAN, short_model(source_model))} "
+        f"{_color(Colors.BOLD, '→')} "
+        f"{_color(Colors.GREEN, short_model(target_model))} "
+        f"({_color(Colors.MAGENTA, f'{num_tools} tools')}, "
+        f"{_color(Colors.BLUE, f'{num_messages} messages')})"
     )
+    logger.info(line)
 
 
 async def handle_streaming(response_generator, original_request: MessagesRequest):
@@ -821,4 +879,4 @@ async def root():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT, log_level="error")
+    uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT, log_config=LOG_CONFIG)
