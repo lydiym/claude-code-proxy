@@ -18,6 +18,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error", "LiteLLM", "httpx", "httpcore"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
