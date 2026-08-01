@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
@@ -14,9 +15,10 @@ import uvicorn
 
 load_dotenv()
 
-# Single source of truth for log format. Used both by the root handler
-# (basicConfig) and by LOG_CONFIG below so uvicorn's loggers emit through
-# the same format when the server runs as `python server.py`.
+# Single source of truth for log format. Used by the root handler below and
+# applied again via the lifespan hook so it sticks even when uvicorn is
+# started directly via `uvicorn server:app` (which would otherwise install
+# its own formatters and handlers).
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -54,33 +56,30 @@ def _color(code, text):
     return text
 
 
-# Handed to uvicorn.run() so uvicorn's loggers share the format above and
-# propagate to the root handler instead of installing their own. We keep
-# uvicorn.access at WARNING so per-request access lines stay out of the log.
-LOG_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "default": {
-            "format": _LOG_FORMAT,
-            "datefmt": _DATE_FORMAT,
-        },
-    },
-    "handlers": {
-        "default": {
-            "class": "logging.StreamHandler",
-            "formatter": "default",
-            "stream": "ext://sys.stderr",
-        },
-    },
-    "loggers": {
-        "uvicorn": {"level": "INFO", "propagate": True},
-        "uvicorn.error": {"level": "INFO", "propagate": True},
-        "uvicorn.access": {"level": "WARNING", "propagate": True},
-    },
-}
+@asynccontextmanager
+async def _configure_logging(app: FastAPI):
+    """Runs after uvicorn has installed its log handlers. Replace them with
+    our unified format and silence uvicorn.access, which would otherwise
+    duplicate log_request on every call."""
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
 
-app = FastAPI()
+    root = logging.getLogger()
+    root.handlers = [handler]
+
+    for name in ("uvicorn", "uvicorn.error"):
+        log = logging.getLogger(name)
+        log.handlers = []
+        log.propagate = True
+
+    access = logging.getLogger("uvicorn.access")
+    access.handlers = []
+    access.propagate = False
+
+    yield
+
+
+app = FastAPI(lifespan=_configure_logging)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
@@ -879,4 +878,4 @@ async def root():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT, log_config=LOG_CONFIG, access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT)
