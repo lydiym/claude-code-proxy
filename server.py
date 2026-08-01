@@ -15,10 +15,10 @@ import uvicorn
 
 load_dotenv()
 
-# Single source of truth for log format. Used by the root handler below and
-# applied again via the lifespan hook so it sticks even when uvicorn is
-# started directly via `uvicorn server:app` (which would otherwise install
-# its own formatters and handlers).
+# Single source of truth for log format. basicConfig gives sensible output
+# for plain `import server` (e.g. tests); the lifespan hook re-applies it
+# after uvicorn has installed its own handlers, so the same format holds
+# when the server is started via `uvicorn server:app` too.
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -28,10 +28,6 @@ logging.basicConfig(
     datefmt=_DATE_FORMAT,
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-for noisy in ("LiteLLM", "httpx", "httpcore"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 class Colors:
@@ -56,25 +52,29 @@ def _color(code, text):
     return text
 
 
+def _reset_logger(name, *, propagate):
+    log = logging.getLogger(name)
+    log.handlers.clear()
+    log.propagate = propagate
+
+
 @asynccontextmanager
 async def _configure_logging(app: FastAPI):
-    """Runs after uvicorn has installed its log handlers. Replace them with
-    our unified format and silence uvicorn.access, which would otherwise
-    duplicate log_request on every call."""
+    """Unify the log format and silence uvicorn.access. Runs after uvicorn's
+    own configure_logging() so it overrides whatever uvicorn set up."""
+    root = logging.getLogger()
+    root.handlers.clear()
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
+    root.addHandler(handler)
 
-    root = logging.getLogger()
-    root.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    for noisy in ("LiteLLM", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    for name in ("uvicorn", "uvicorn.error"):
-        log = logging.getLogger(name)
-        log.handlers = []
-        log.propagate = True
-
-    access = logging.getLogger("uvicorn.access")
-    access.handlers = []
-    access.propagate = False
+    _reset_logger("uvicorn", propagate=True)
+    _reset_logger("uvicorn.error", propagate=True)
+    _reset_logger("uvicorn.access", propagate=False)
 
     yield
 
