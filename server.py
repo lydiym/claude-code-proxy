@@ -1,7 +1,8 @@
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator, model_validator
-from typing import List, Dict, Any, Optional, Union, Literal
+from typing import List, Dict, Any, Optional, Union, Literal, Iterator
 import logging
 import json
 import os
@@ -715,6 +716,158 @@ def convert_litellm_to_anthropic(
         )
 
 
+@dataclass
+class OpenBlock:
+    index: int
+    kind: str  # "text" | "thinking" | "tool_use"
+
+
+class BlockTracker:
+    """Allocates indices and tracks the currently-open Anthropic content block.
+
+    The state machine is caller-driven: ``ensure(kind)`` closes any
+    different-kind block that is open, then ``open(kind)`` allocates a fresh
+    index. ``open()`` is unconditional and overwrites the prior block — callers
+    that need close-before-open behaviour must call ``ensure()`` first. The
+    tool_use path relies on this so consecutive parallel tool calls each get
+    their own index without an intermediate ``content_block_stop``.
+    """
+
+    def __init__(self) -> None:
+        self._next_index = 0
+        self._current: Optional[OpenBlock] = None
+
+    @property
+    def current(self) -> Optional[OpenBlock]:
+        return self._current
+
+    def is_open(self, kind: Optional[str] = None) -> bool:
+        if kind is None:
+            return self._current is not None
+        return self._current is not None and self._current.kind == kind
+
+    def open(self, kind: str) -> OpenBlock:
+        block = OpenBlock(index=self._next_index, kind=kind)
+        self._next_index += 1
+        self._current = block
+        return block
+
+    def ensure(self, kind: str) -> List[str]:
+        if self._current is not None and self._current.kind != kind:
+            return self.close()
+        return []
+
+    def delta(self, delta_payload: Dict[str, Any]) -> str:
+        if self._current is None:
+            raise RuntimeError("no block is open; call open() first")
+        return SseFormatter.content_block_delta(self._current.index, delta_payload)
+
+    def close(self) -> List[str]:
+        if self._current is None:
+            return []
+        events = [SseFormatter.content_block_stop(self._current.index)]
+        self._current = None
+        return events
+
+
+class SseFormatter:
+    """Stateless formatters for Anthropic SSE events.
+
+    Each event is framed as ``event: <name>\\ndata: <json>\\n\\n``; the trailing
+    ``[DONE]`` sentinel is the only frame without an ``event:`` line. Keeping
+    these as pure functions makes the streaming loop read as a sequence of
+    named events rather than a wall of JSON literals.
+    """
+
+    @staticmethod
+    def event(event_type: str, payload: Dict[str, Any]) -> str:
+        return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+
+    @staticmethod
+    def content_block_start(index: int, block: Dict[str, Any]) -> str:
+        return SseFormatter.event("content_block_start", {
+            "type": "content_block_start", "index": index, "content_block": block,
+        })
+
+    @staticmethod
+    def content_block_delta(index: int, delta: Dict[str, Any]) -> str:
+        return SseFormatter.event("content_block_delta", {
+            "type": "content_block_delta", "index": index, "delta": delta,
+        })
+
+    @staticmethod
+    def content_block_stop(index: int) -> str:
+        return SseFormatter.event("content_block_stop", {
+            "type": "content_block_stop", "index": index,
+        })
+
+    @staticmethod
+    def message_delta(stop_reason: str, output_tokens: int) -> str:
+        return SseFormatter.event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        })
+
+    @staticmethod
+    def message_stop() -> str:
+        return SseFormatter.event("message_stop", {"type": "message_stop"})
+
+    @staticmethod
+    def ping() -> str:
+        return SseFormatter.event("ping", {"type": "ping"})
+
+    @staticmethod
+    def done() -> str:
+        return "data: [DONE]\n\n"
+
+    @staticmethod
+    def finish(stop_reason: str, output_tokens: int) -> List[str]:
+        """The standard end-of-stream sequence shared by every exit path."""
+        return [
+            SseFormatter.message_delta(stop_reason, output_tokens),
+            SseFormatter.message_stop(),
+            SseFormatter.done(),
+        ]
+
+
+def _open_block(
+    tracker: BlockTracker, kind: str, block_dict: Dict[str, Any]
+) -> Iterator[str]:
+    """Ensure the right block kind is open, emitting close + start events as needed."""
+    for event in tracker.ensure(kind):
+        yield event
+    if not tracker.is_open(kind):
+        block = tracker.open(kind)
+        yield SseFormatter.content_block_start(block.index, block_dict)
+
+
+def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
+    """Open a thinking block if needed and yield a single thinking_delta."""
+    if not text:
+        return
+    yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
+    yield tracker.delta({"type": "thinking_delta", "thinking": text})
+
+
+def _translate_parser_events(
+    events: List[tuple], tracker: BlockTracker
+) -> Iterator[str]:
+    """Drive BlockTracker from (kind, value) events yielded by ThinkStreamParser."""
+    for kind, value in events:
+        if kind == "open":
+            yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
+        elif kind == "close":
+            for event in tracker.close():
+                yield event
+        elif kind == "thinking" and value:
+            yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
+            yield tracker.delta({"type": "thinking_delta", "thinking": value})
+        elif kind == "text" and value:
+            yield from _open_block(tracker, "text", {"type": "text", "text": ""})
+            yield tracker.delta({"type": "text_delta", "text": value})
+
+
 def log_request(method, path, source_model, target_model, num_messages, num_tools, status_code):
     """Log a one-line request summary highlighting the source/target model mapping."""
     endpoint = path.split("?", 1)[0] if "?" in path else path
@@ -733,126 +886,42 @@ def log_request(method, path, source_model, target_model, num_messages, num_tool
 
 async def handle_streaming(response_generator, original_request: MessagesRequest):
     """Convert a LiteLLM streaming response into Anthropic SSE events."""
+    tracker = BlockTracker()
+    think_parser = ThinkStreamParser()
+    tool_index: Optional[int] = None
+    input_tokens = 0
+    output_tokens = 0
+    has_sent_stop_reason = False
 
-    def emit(event: str, data: Dict[str, Any]) -> str:
-        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-    def finish_stream(stop_reason: str, output_tokens: int) -> List[str]:
-        return [
-            emit(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": output_tokens},
-                },
-            ),
-            emit("message_stop", {"type": "message_stop"}),
-            "data: [DONE]\n\n",
-        ]
-
-    def new_tool_id():
+    def new_tool_id() -> str:
         return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
-    def block_open(idx: int, kind: str, **extra: Any) -> str:
-        payload = {"type": "text" if kind == "text" else kind, "text" if kind == "text" else "thinking": ""}
-        payload.update(extra)
-        return emit(
-            "content_block_start",
-            {"type": "content_block_start", "index": idx, "content_block": payload},
-        )
-
-    def block_delta(idx: int, payload: Dict[str, Any]) -> str:
-        return emit("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": payload})
-
-    def block_close(idx: int) -> str:
-        return emit("content_block_stop", {"type": "content_block_stop", "index": idx})
-
     try:
-        yield emit(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": new_msg_id(),
-                    "type": "message",
-                    "role": "assistant",
-                    "model": original_request.model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 0,
-                    },
+        yield SseFormatter.event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": new_msg_id(),
+                "type": "message",
+                "role": "assistant",
+                "model": original_request.model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
                 },
             },
-        )
+        })
 
-        # A monotonically increasing counter hands out indices for every content
-        # block we emit. ``current_block_index`` tracks the one currently open
-        # (so text/thinking deltas target it); -1 means none is open yet.
-        next_block_index = 0
-        current_block_index = -1
-        current_block_kind: Optional[str] = None
+        # Always begin with a text block. Subsequent close-and-open transitions
+        # happen as the upstream switches between text, thinking, and tool_use.
+        for event in _open_block(tracker, "text", {"type": "text", "text": ""}):
+            yield event
+        yield SseFormatter.ping()
 
-        def open_block(kind: str, **extra: Any) -> str:
-            nonlocal next_block_index, current_block_index, current_block_kind
-            next_block_index += 1
-            current_block_index = next_block_index - 1
-            current_block_kind = kind
-            return block_open(current_block_index, kind, **extra)
-
-        # Text and thinking must live in their own blocks, so always begin with
-        # a text block. If the very first delta is `\<think\>` or the model
-        # later switches to reasoning, close_and_*() emits content_block_stop
-        # for the previous block first.
-        yield open_block("text")
-        yield emit("ping", {"type": "ping"})
-
-        think_parser = ThinkStreamParser()
-        tool_index: Optional[int] = None
-        input_tokens = 0
-        output_tokens = 0
-        has_sent_stop_reason = False
-
-        # Single sink that turns (kind, value) events from the parser into SSE.
-        # Used both for live chunks and for the final flush at end-of-stream.
-        def emit_parser_events(events):
-            nonlocal current_block_index, current_block_kind
-            for kind, value in events:
-                if kind == "open":
-                    if current_block_kind is not None and current_block_kind != "thinking":
-                        yield block_close(current_block_index)
-                    if current_block_kind != "thinking":
-                        yield open_block("thinking")
-                elif kind == "close":
-                    if current_block_kind == "thinking":
-                        yield block_close(current_block_index)
-                        current_block_index = -1
-                        current_block_kind = None
-                elif kind == "thinking" and value:
-                    if current_block_kind != "thinking":
-                        yield open_block("thinking")
-                    yield block_delta(current_block_index, {"type": "thinking_delta", "thinking": value})
-                elif kind == "text" and value:
-                    if current_block_kind != "text":
-                        if current_block_kind is not None:
-                            yield block_close(current_block_index)
-                        yield open_block("text")
-                    yield block_delta(current_block_index, {"type": "text_delta", "text": value})
-
-        def close_open_block():
-            nonlocal current_block_index, current_block_kind
-            if current_block_kind is not None:
-                yield block_close(current_block_index)
-                current_block_index = -1
-                current_block_kind = None
-
-        # ``yield from`` is not allowed inside async generators, so we loop
-        # over the helpers explicitly to forward each event.
         async for chunk in response_generator:
             try:
                 usage = get_field(chunk, "usage")
@@ -868,9 +937,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 finish_reason = get_field(choice, "finish_reason")
 
                 # litellm exposes structured reasoning on some providers as a
-                # separate delta.reasoning_content. Honour it when present so a
-                # model with native reasoning fields stays spec-compliant;
-                # otherwise we parse `` markers out of plain content below.
+                # separate delta.reasoning_content. Honour it so models with
+                # native reasoning fields stay spec-compliant; otherwise we
+                # parse `` markers out of plain content below.
                 delta_reasoning = get_field(delta, "reasoning_content")
 
                 delta_content = get_field(delta, "content")
@@ -878,11 +947,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     delta_content = delta["content"]
 
                 if delta_reasoning:
-                    for event in emit_parser_events([("thinking", delta_reasoning)]):
+                    for event in _emit_thinking(tracker, delta_reasoning):
                         yield event
 
                 if delta_content and tool_index is None:
-                    for event in emit_parser_events(think_parser.feed(delta_content)):
+                    for event in _translate_parser_events(think_parser.feed(delta_content), tracker):
                         yield event
 
                 delta_tool_calls = get_field(delta, "tool_calls")
@@ -891,9 +960,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
                 if delta_tool_calls:
                     if tool_index is None:
-                        for event in close_open_block():
+                        for event in tracker.close():
                             yield event
-
                     if not isinstance(delta_tool_calls, list):
                         delta_tool_calls = [delta_tool_calls]
 
@@ -905,45 +973,45 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             function = get_field(tool_call, "function", {}) or {}
                             name = get_field(function, "name", "")
                             tool_id = get_field(tool_call, "id") or new_tool_id()
-                            yield open_block("tool_use", id=tool_id, name=name, input={})
+                            block = tracker.open("tool_use")
+                            yield SseFormatter.content_block_start(block.index, {
+                                "type": "tool_use", "id": tool_id, "name": name, "input": {},
+                            })
 
                         function = get_field(tool_call, "function", {}) or {}
                         arguments = get_field(function, "arguments", "")
                         if arguments:
                             if isinstance(arguments, str):
-                                yield block_delta(current_block_index, {"type": "input_json_delta", "partial_json": arguments})
+                                yield tracker.delta({"type": "input_json_delta", "partial_json": arguments})
                             else:
-                                yield block_delta(current_block_index, {"type": "input_json_delta", "partial_json": json.dumps(arguments)})
+                                yield tracker.delta({"type": "input_json_delta", "partial_json": json.dumps(arguments)})
 
                 if finish_reason and not has_sent_stop_reason:
                     has_sent_stop_reason = True
-                    for event in emit_parser_events(think_parser.flush()):
+                    for event in _translate_parser_events(think_parser.flush(), tracker):
                         yield event
-                    for event in close_open_block():
+                    for event in tracker.close():
                         yield event
-                    for chunk in finish_stream(to_anthropic_stop_reason(finish_reason), output_tokens):
-                        yield chunk
+                    for event in SseFormatter.finish(to_anthropic_stop_reason(finish_reason), output_tokens):
+                        yield event
                     return
             except Exception as e:
                 logger.error(f"Error processing chunk: {e}")
                 continue
 
         if not has_sent_stop_reason:
-            for event in emit_parser_events(think_parser.flush()):
+            for event in _translate_parser_events(think_parser.flush(), tracker):
                 yield event
-            for event in close_open_block():
+            for event in tracker.close():
                 yield event
-            for chunk in finish_stream("end_turn", output_tokens):
-                yield chunk
+            for event in SseFormatter.finish("end_turn", output_tokens):
+                yield event
 
     except Exception as e:
         logger.error(f"Error in streaming: {e}", exc_info=True)
-        yield emit(
-            "message_delta",
-            {"type": "message_delta", "delta": {"stop_reason": "error", "stop_sequence": None}, "usage": {"output_tokens": 0}},
-        )
-        yield emit("message_stop", {"type": "message_stop"})
-        yield "data: [DONE]\n\n"
+        yield SseFormatter.message_delta("error", 0)
+        yield SseFormatter.message_stop()
+        yield SseFormatter.done()
 
 
 @app.post("/v1/messages")
