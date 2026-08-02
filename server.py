@@ -407,19 +407,50 @@ def convert_image_block(source: Any) -> Dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": str(source)}}
 
 
+def _extract_text(content) -> str:
+    """Pull plain text out of a content field — None, string, or list of blocks.
+
+    Used for system messages (and any other role) whose text we want to
+    concatenate without preserving block structure. Non-text blocks (images,
+    tool_use, tool_result, thinking) are skipped.
+    """
+    if not content:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = [
+        get_field(block, "text", "")
+        for block in content
+        if get_field(block, "type") == "text"
+    ]
+    return "\n\n".join(p for p in parts if p)
+
+
 def system_to_message(system):
     """Build a single OpenAI system message from the Anthropic system field."""
-    if not system:
-        return None
-    if isinstance(system, str):
-        return {"role": "system", "content": system}
-    parts = []
-    for block in system:
-        if get_field(block, "type") != "text":
-            continue
-        text = get_field(block, "text")
-        if text:
-            parts.append(text)
+    text = _extract_text(system) if system else ""
+    return {"role": "system", "content": text} if text else None
+
+
+def _build_system_message(system_field, messages) -> Optional[Dict[str, str]]:
+    """Combine the top-level system field with any in-band role='system' messages
+    into a single OpenAI system message.
+
+    Anthropic's spec only allows system at the top level, but Claude Code
+    2.1.220+ has started embedding system reminders inline. We hoist them all
+    to the start so OpenAI sees one system message at the top. Order is
+    preserved: in-band messages come first, then the top-level field — which
+    is the order Claude Code most likely intended when it injected the
+    reminders inline.
+    """
+    parts = [
+        text
+        for text in (_extract_text(m.content) for m in messages if m.role == "system")
+        if text
+    ]
+    top = _extract_text(system_field)
+    if top:
+        parts.append(top)
     if not parts:
         return None
     return {"role": "system", "content": "\n\n".join(parts)}
@@ -522,6 +553,15 @@ def convert_user_message(msg, call_ids):
     return out
 
 
+def _convert_message(msg, result_ids, call_ids) -> List[Dict[str, Any]]:
+    """Dispatch one Anthropic user/assistant message to its OpenAI conversion."""
+    if isinstance(msg.content, str):
+        return [{"role": msg.role, "content": msg.content}]
+    if msg.role == "assistant":
+        return [convert_assistant_message(msg, result_ids)]
+    return convert_user_message(msg, call_ids)
+
+
 def convert_tool_definitions(tools):
     """Convert Anthropic tool definitions to OpenAI function tool definitions."""
     return [
@@ -565,51 +605,19 @@ def sanitize_messages_for_openai(messages):
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert an Anthropic Messages request to a LiteLLM (OpenAI Chat) request."""
-    messages = []
-    system_parts: List[str] = []
-
-    # Claude Code 2.1.220+ embeds system reminders (e.g. "[skill: foo] ...") as
-    # messages with role="system" inside messages[]. Anthropic's spec only
-    # allows system at the top level, so hoist every in-band system message
-    # into a single OpenAI system message at the start. Order is preserved:
-    # in-band system messages come first, then the top-level system field.
-    for msg in anthropic_request.messages:
-        if msg.role != "system":
-            continue
-        if isinstance(msg.content, str):
-            if msg.content:
-                system_parts.append(msg.content)
-            continue
-        parts = [
-            get_field(block, "text", "")
-            for block in msg.content
-            if get_field(block, "type") == "text"
-        ]
-        text = "\n\n".join(p for p in parts if p)
-        if text:
-            system_parts.append(text)
-
-    if top_level := system_to_message(anthropic_request.system):
-        system_parts.append(top_level["content"])
-
-    if system_parts:
-        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-
     call_ids, result_ids = collect_tool_ids(anthropic_request.messages)
+
+    messages = []
+    if system := _build_system_message(anthropic_request.system, anthropic_request.messages):
+        messages.append(system)
 
     # LiteLLM's canonical input is OpenAI Chat format for every provider, so
     # tool calls travel as assistant.tool_calls and their results as role="tool"
     # messages. Flattening them into plain text (the previous behaviour) taught
     # small models to emit tool calls as literal text, which broke tool use.
     for msg in anthropic_request.messages:
-        if msg.role == "system":
-            continue  # already hoisted above
-        if isinstance(msg.content, str):
-            messages.append({"role": msg.role, "content": msg.content})
-        elif msg.role == "assistant":
-            messages.append(convert_assistant_message(msg, result_ids))
-        else:
-            messages.extend(convert_user_message(msg, call_ids))
+        if msg.role != "system":
+            messages.extend(_convert_message(msg, result_ids, call_ids))
 
     litellm_request = {
         "model": anthropic_request.model,
