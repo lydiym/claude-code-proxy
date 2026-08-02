@@ -143,6 +143,16 @@ class ContentBlockText(BaseModel):
     text: str
 
 
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"]
+    thinking: str
+    # Anthropic populates this when echoing a thinking block back as part of
+    # conversation history; we don't generate one, but downstream requests
+    # (e.g. Claude Code's next turn) carry it through verbatim. Optional so
+    # that requests omitting it still validate.
+    signature: Optional[str] = None
+
+
 class ContentBlockImage(BaseModel):
     type: Literal["image"]
     source: Dict[str, Any]
@@ -173,6 +183,7 @@ class Message(BaseModel):
         List[
             Union[
                 ContentBlockText,
+                ContentBlockThinking,
                 ContentBlockImage,
                 ContentBlockToolUse,
                 ContentBlockToolResult,
@@ -250,13 +261,90 @@ class MessagesResponse(BaseModel):
     id: str
     model: str
     role: Literal["assistant"] = "assistant"
-    content: List[Union[ContentBlockText, ContentBlockToolUse]]
+    content: List[Union[ContentBlockText, ContentBlockThinking, ContentBlockToolUse]]
     type: Literal["message"] = "message"
     stop_reason: Optional[
         Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
     ] = None
     stop_sequence: Optional[str] = None
     usage: Usage
+
+
+# Anthropic API expects reasoning as `type: "thinking"` content blocks. Some
+# backends (notably llama.cpp with `--reasoning-format none`) fold their
+# reasoning into `content` wrapped in <think>...</think>; the streaming parser
+# below splits that out so Claude Code renders it correctly.
+THINK_OPEN_TAG = "<think>"
+THINK_CLOSE_TAG = "</think>"
+
+
+class ThinkStreamParser:
+    """Incremental parser that splits a stream into thinking vs. text chunks.
+
+    The OpenAI-compatible model emits <think>...</think> markers inside its
+    content stream. Anthropic SSE needs these surfaced as their own content
+    blocks, so we buffer just enough to recognise a marker split across chunks
+    and yield tagged deltas for the caller to forward.
+    """
+
+    def __init__(self):
+        self.in_thinking = False
+        self.buffer = ""
+
+    def feed(self, text):
+        """Consume a chunk of model output; return a list of (kind, value).
+
+        kind is "text" or "thinking" for a delta, or "open" / "close" for a
+        block transition (value is None for those).
+        """
+        if not text:
+            return []
+        events = []
+        self.buffer += text
+        while self._drain(events):
+            pass
+        return events
+
+    def _drain(self, events):
+        if not self.buffer:
+            return False
+        tag = THINK_CLOSE_TAG if self.in_thinking else THINK_OPEN_TAG
+        idx = self.buffer.find(tag)
+        if idx < 0:
+            if self.in_thinking:
+                # Hold everything until we see ``. Emitting early commits
+                # the bytes to "thinking" even though they could be the
+                # visible answer if the close tag never arrives or arrives
+                # mid-word in a later chunk.
+                return False
+            # Text mode: the only risk is a stray open tag, so we can flush
+            # anything before the last '<' immediately.
+            last_lt = self.buffer.rfind("<")
+            if last_lt < 0:
+                events.append(("text", self.buffer))
+                self.buffer = ""
+            elif last_lt > 0:
+                events.append(("text", self.buffer[:last_lt]))
+                self.buffer = self.buffer[last_lt:]
+            return False
+        if idx > 0:
+            kind = "thinking" if self.in_thinking else "text"
+            events.append((kind, self.buffer[:idx]))
+        events.append(("close" if self.in_thinking else "open", None))
+        self.in_thinking = not self.in_thinking
+        self.buffer = self.buffer[idx + len(tag):]
+        return True
+
+    def flush(self):
+        """Emit anything still buffered at end of stream."""
+        if not self.buffer:
+            return []
+        events = [(("thinking" if self.in_thinking else "text"), self.buffer)]
+        self.buffer = ""
+        if self.in_thinking:
+            events.append(("close", None))
+            self.in_thinking = False
+        return events
 
 
 def parse_tool_result_content(content):
@@ -553,9 +641,18 @@ def _parse_tool_arguments(raw):
         return {"raw": raw}
 
 
-def _build_content_blocks(text, tool_calls):
-    """Turn message text + tool calls into Anthropic content blocks."""
+def _build_content_blocks(text, reasoning, tool_calls):
+    """Turn message text + reasoning + tool calls into Anthropic content blocks.
+
+    For non-streaming responses, litellm has already extracted any
+    ``<think>...</think>`` text the backend inlined into ``content`` and surfaced
+    it as ``reasoning_content``; we forward that as a ``thinking`` block.
+    Streaming responses are built incrementally in ``handle_streaming`` and do
+    not go through this helper.
+    """
     blocks = []
+    if reasoning:
+        blocks.append({"type": "thinking", "thinking": reasoning})
     if text:
         blocks.append({"type": "text", "text": text})
     for tool_call in tool_calls:
@@ -584,6 +681,7 @@ def convert_litellm_to_anthropic(
     try:
         message = _first_message(litellm_response)
         text = get_field(message, "content") or ""
+        reasoning = get_field(message, "reasoning_content") or ""
         tool_calls = _extract_tool_calls(message)
         choice = _first_choice(litellm_response)
         finish_reason = get_field(choice, "finish_reason", "stop")
@@ -595,7 +693,7 @@ def convert_litellm_to_anthropic(
             id=response_id,
             model=original_request.model,
             role="assistant",
-            content=_build_content_blocks(text, tool_calls),
+            content=_build_content_blocks(text, reasoning, tool_calls),
             stop_reason=to_anthropic_stop_reason(finish_reason),
             stop_sequence=None,
             usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
@@ -639,40 +737,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
     def emit(event: str, data: Dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
-    def text_block_open() -> str:
-        return emit(
-            "content_block_start",
-            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-        )
-
-    def text_delta(text: str) -> str:
-        return emit(
-            "content_block_delta",
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
-        )
-
-    def text_block_close() -> str:
-        return emit("content_block_stop", {"type": "content_block_stop", "index": 0})
-
-    def tool_block_open(idx: int, tool_id: str, name: str) -> str:
-        return emit(
-            "content_block_start",
-            {
-                "type": "content_block_start",
-                "index": idx,
-                "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
-            },
-        )
-
-    def tool_delta(idx: int, partial_json: str) -> str:
-        return emit(
-            "content_block_delta",
-            {"type": "content_block_delta", "index": idx, "delta": {"type": "input_json_delta", "partial_json": partial_json}},
-        )
-
-    def tool_block_close(idx: int) -> str:
-        return emit("content_block_stop", {"type": "content_block_stop", "index": idx})
-
     def finish_stream(stop_reason: str, output_tokens: int) -> List[str]:
         return [
             emit(
@@ -689,6 +753,20 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
     def new_tool_id():
         return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
+
+    def block_open(idx: int, kind: str, **extra: Any) -> str:
+        payload = {"type": "text" if kind == "text" else kind, "text" if kind == "text" else "thinking": ""}
+        payload.update(extra)
+        return emit(
+            "content_block_start",
+            {"type": "content_block_start", "index": idx, "content_block": payload},
+        )
+
+    def block_delta(idx: int, payload: Dict[str, Any]) -> str:
+        return emit("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": payload})
+
+    def block_close(idx: int) -> str:
+        return emit("content_block_stop", {"type": "content_block_stop", "index": idx})
 
     try:
         yield emit(
@@ -712,18 +790,69 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 },
             },
         )
-        yield text_block_open()
+
+        # A monotonically increasing counter hands out indices for every content
+        # block we emit. ``current_block_index`` tracks the one currently open
+        # (so text/thinking deltas target it); -1 means none is open yet.
+        next_block_index = 0
+        current_block_index = -1
+        current_block_kind: Optional[str] = None
+
+        def open_block(kind: str, **extra: Any) -> str:
+            nonlocal next_block_index, current_block_index, current_block_kind
+            next_block_index += 1
+            current_block_index = next_block_index - 1
+            current_block_kind = kind
+            return block_open(current_block_index, kind, **extra)
+
+        # Text and thinking must live in their own blocks, so always begin with
+        # a text block. If the very first delta is `\<think\>` or the model
+        # later switches to reasoning, close_and_*() emits content_block_stop
+        # for the previous block first.
+        yield open_block("text")
         yield emit("ping", {"type": "ping"})
 
+        think_parser = ThinkStreamParser()
         tool_index: Optional[int] = None
-        accumulated_text = ""
-        text_sent = False
-        text_block_closed = False
         input_tokens = 0
         output_tokens = 0
         has_sent_stop_reason = False
-        last_tool_index = 0
 
+        # Single sink that turns (kind, value) events from the parser into SSE.
+        # Used both for live chunks and for the final flush at end-of-stream.
+        def emit_parser_events(events):
+            nonlocal current_block_index, current_block_kind
+            for kind, value in events:
+                if kind == "open":
+                    if current_block_kind is not None and current_block_kind != "thinking":
+                        yield block_close(current_block_index)
+                    if current_block_kind != "thinking":
+                        yield open_block("thinking")
+                elif kind == "close":
+                    if current_block_kind == "thinking":
+                        yield block_close(current_block_index)
+                        current_block_index = -1
+                        current_block_kind = None
+                elif kind == "thinking" and value:
+                    if current_block_kind != "thinking":
+                        yield open_block("thinking")
+                    yield block_delta(current_block_index, {"type": "thinking_delta", "thinking": value})
+                elif kind == "text" and value:
+                    if current_block_kind != "text":
+                        if current_block_kind is not None:
+                            yield block_close(current_block_index)
+                        yield open_block("text")
+                    yield block_delta(current_block_index, {"type": "text_delta", "text": value})
+
+        def close_open_block():
+            nonlocal current_block_index, current_block_kind
+            if current_block_kind is not None:
+                yield block_close(current_block_index)
+                current_block_index = -1
+                current_block_kind = None
+
+        # ``yield from`` is not allowed inside async generators, so we loop
+        # over the helpers explicitly to forward each event.
         async for chunk in response_generator:
             try:
                 usage = get_field(chunk, "usage")
@@ -738,14 +867,23 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 delta = get_field(choice, "delta") or get_field(choice, "message", {}) or {}
                 finish_reason = get_field(choice, "finish_reason")
 
+                # litellm exposes structured reasoning on some providers as a
+                # separate delta.reasoning_content. Honour it when present so a
+                # model with native reasoning fields stays spec-compliant;
+                # otherwise we parse `` markers out of plain content below.
+                delta_reasoning = get_field(delta, "reasoning_content")
+
                 delta_content = get_field(delta, "content")
                 if isinstance(delta, dict) and "content" in delta and delta_content is None:
                     delta_content = delta["content"]
-                if delta_content:
-                    accumulated_text += delta_content
-                    if tool_index is None and not text_block_closed:
-                        text_sent = True
-                        yield text_delta(delta_content)
+
+                if delta_reasoning:
+                    for event in emit_parser_events([("thinking", delta_reasoning)]):
+                        yield event
+
+                if delta_content and tool_index is None:
+                    for event in emit_parser_events(think_parser.feed(delta_content)):
+                        yield event
 
                 delta_tool_calls = get_field(delta, "tool_calls")
                 if isinstance(delta, dict) and "tool_calls" in delta and delta_tool_calls is None:
@@ -753,21 +891,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
                 if delta_tool_calls:
                     if tool_index is None:
-                        # Tool calls must come after the text block is closed.
-                        # If we've been streaming text, flush the trailing
-                        # delta (if any) and close the block first.
-                        if text_sent:
-                            if not text_block_closed:
-                                text_block_closed = True
-                                yield text_block_close()
-                        elif accumulated_text and not text_block_closed:
-                            text_sent = True
-                            yield text_delta(accumulated_text)
-                            text_block_closed = True
-                            yield text_block_close()
-                        elif not text_block_closed:
-                            text_block_closed = True
-                            yield text_block_close()
+                        for event in close_open_block():
+                            yield event
 
                     if not isinstance(delta_tool_calls, list):
                         delta_tool_calls = [delta_tool_calls]
@@ -777,31 +902,25 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
                         if tool_index is None or current_index != tool_index:
                             tool_index = current_index
-                            last_tool_index += 1
                             function = get_field(tool_call, "function", {}) or {}
                             name = get_field(function, "name", "")
                             tool_id = get_field(tool_call, "id") or new_tool_id()
-                            yield tool_block_open(last_tool_index, tool_id, name)
+                            yield open_block("tool_use", id=tool_id, name=name, input={})
 
                         function = get_field(tool_call, "function", {}) or {}
                         arguments = get_field(function, "arguments", "")
                         if arguments:
                             if isinstance(arguments, str):
-                                yield tool_delta(last_tool_index, arguments)
+                                yield block_delta(current_block_index, {"type": "input_json_delta", "partial_json": arguments})
                             else:
-                                yield tool_delta(last_tool_index, json.dumps(arguments))
+                                yield block_delta(current_block_index, {"type": "input_json_delta", "partial_json": json.dumps(arguments)})
 
                 if finish_reason and not has_sent_stop_reason:
                     has_sent_stop_reason = True
-                    if tool_index is not None:
-                        for i in range(1, last_tool_index + 1):
-                            yield tool_block_close(i)
-
-                    if not text_block_closed:
-                        if accumulated_text and not text_sent:
-                            yield text_delta(accumulated_text)
-                        yield text_block_close()
-
+                    for event in emit_parser_events(think_parser.flush()):
+                        yield event
+                    for event in close_open_block():
+                        yield event
                     for chunk in finish_stream(to_anthropic_stop_reason(finish_reason), output_tokens):
                         yield chunk
                     return
@@ -810,11 +929,10 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 continue
 
         if not has_sent_stop_reason:
-            if tool_index is not None:
-                for i in range(1, last_tool_index + 1):
-                    yield tool_block_close(i)
-            if not text_block_closed:
-                yield text_block_close()
+            for event in emit_parser_events(think_parser.flush()):
+                yield event
+            for event in close_open_block():
+                yield event
             for chunk in finish_stream("end_turn", output_tokens):
                 yield chunk
 
