@@ -634,6 +634,47 @@ def test_no_system_message_does_not_add_one() -> None:
     assert all(m["role"] != "system" for m in out["messages"])
 
 
+def test_system_role_message_in_messages_array_is_hoisted() -> None:
+    """Claude Code 2.1.220+ embeds system reminders as messages with role='system'.
+    The proxy must accept them (Pydantic Literal must include 'system') and
+    hoist the content into a single system message at the start of the OpenAI
+    request — never inline as a 'system' message in the middle.
+    """
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "system": "You are concise.",
+        "messages": [
+            {"role": "system", "content": "[skill: foo] description"},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "system", "content": [{"type": "text", "text": "[skill: baz] more"}]},
+            {"role": "user", "content": "and now?"},
+        ],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    roles = [m["role"] for m in out["messages"]]
+    assert roles == ["system", "user", "assistant", "user"], f"got {roles}"
+    sys_content = out["messages"][0]["content"]
+    # Order preserved: in-band system messages come first, then the top-level field.
+    assert sys_content.index("[skill: foo]") < sys_content.index("[skill: baz]") < sys_content.index("You are concise.")
+
+
+def test_system_role_message_with_string_content_is_hoisted() -> None:
+    """A system message with string content is treated identically to a list."""
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "system", "content": "top-of-stream reminder"},
+            {"role": "user", "content": "Hi"},
+        ],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][0] == {"role": "system", "content": "top-of-stream reminder"}
+    assert out["messages"][1]["role"] == "user"
+
+
 # ===========================================================================
 # 10. REASONING CONTENT — `<think>...</think>` parsing
 # ===========================================================================

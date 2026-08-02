@@ -178,7 +178,7 @@ class SystemContent(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[
         str,
         List[
@@ -566,8 +566,34 @@ def sanitize_messages_for_openai(messages):
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert an Anthropic Messages request to a LiteLLM (OpenAI Chat) request."""
     messages = []
-    if system := system_to_message(anthropic_request.system):
-        messages.append(system)
+    system_parts: List[str] = []
+
+    # Claude Code 2.1.220+ embeds system reminders (e.g. "[skill: foo] ...") as
+    # messages with role="system" inside messages[]. Anthropic's spec only
+    # allows system at the top level, so hoist every in-band system message
+    # into a single OpenAI system message at the start. Order is preserved:
+    # in-band system messages come first, then the top-level system field.
+    for msg in anthropic_request.messages:
+        if msg.role != "system":
+            continue
+        if isinstance(msg.content, str):
+            if msg.content:
+                system_parts.append(msg.content)
+            continue
+        parts = [
+            get_field(block, "text", "")
+            for block in msg.content
+            if get_field(block, "type") == "text"
+        ]
+        text = "\n\n".join(p for p in parts if p)
+        if text:
+            system_parts.append(text)
+
+    if top_level := system_to_message(anthropic_request.system):
+        system_parts.append(top_level["content"])
+
+    if system_parts:
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
     call_ids, result_ids = collect_tool_ids(anthropic_request.messages)
 
@@ -576,6 +602,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     # messages. Flattening them into plain text (the previous behaviour) taught
     # small models to emit tool calls as literal text, which broke tool use.
     for msg in anthropic_request.messages:
+        if msg.role == "system":
+            continue  # already hoisted above
         if isinstance(msg.content, str):
             messages.append({"role": msg.role, "content": msg.content})
         elif msg.role == "assistant":
