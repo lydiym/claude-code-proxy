@@ -437,7 +437,7 @@ def _build_system_message(system_field, messages) -> Optional[Dict[str, str]]:
     into a single OpenAI system message.
 
     Anthropic's spec only allows system at the top level, but Claude Code
-    2.1.220+ has started embedding system reminders inline. We hoist them all
+    2.1.154+ has started embedding system reminders inline. We hoist them all
     to the start so OpenAI sees one system message at the top. Order is
     preserved: in-band messages come first, then the top-level field — which
     is the order Claude Code most likely intended when it injected the

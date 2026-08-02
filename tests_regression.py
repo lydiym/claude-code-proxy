@@ -635,7 +635,7 @@ def test_no_system_message_does_not_add_one() -> None:
 
 
 def test_system_role_message_in_messages_array_is_hoisted() -> None:
-    """Claude Code 2.1.220+ embeds system reminders as messages with role='system'.
+    """Claude Code 2.1.154+ embeds system reminders as messages with role='system'.
     The proxy must accept them (Pydantic Literal must include 'system') and
     hoist the content into a single system message at the start of the OpenAI
     request — never inline as a 'system' message in the middle.
