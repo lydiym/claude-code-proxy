@@ -152,6 +152,24 @@ def test_validate_model_field_opus_with_dated_id() -> None:
     assert req.model == f"openai/{srv.BIG_MODEL}"
 
 
+def test_validate_model_field_fable_maps_to_big_model() -> None:
+    req = _make_request({
+        "model": "claude-fable-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_mythos_maps_to_big_model() -> None:
+    req = _make_request({
+        "model": "claude-mythos-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
 def test_validate_model_field_known_openai_model_gets_prefix() -> None:
     req = _make_request({
         "model": "gpt-4.1",

@@ -123,6 +123,11 @@ DEFAULT_PORT = 8082
 
 MSG_ID_HEX_LEN = 24
 
+# Claude model tiers that route to BIG_MODEL. Substring-matched against the
+# lowercased model name so `claude-opus-5`, `claude-sonnet-5-20251215`, etc.
+# all hit. Add new "big" tiers here rather than chaining another elif.
+BIG_TIERS = ("sonnet", "opus", "fable", "mythos")
+
 # OpenAI models recognised without an explicit `openai/` prefix. Anything not
 # here is treated as opaque — pass through, prefixed with `openai/` — so users
 # can target custom OpenAI-compatible endpoints that use arbitrary names.
@@ -262,13 +267,11 @@ class MessagesRequest(BaseModel):
         lower = clean_v.lower()
         if "haiku" in lower:
             new_model = f"openai/{SMALL_MODEL}"
-        elif "sonnet" in lower:
-            new_model = f"openai/{BIG_MODEL}"
-        elif "opus" in lower:
-            # Opus is the same tier as sonnet for our purposes: route it to
-            # BIG_MODEL. Without this clause, unknown Claude names fall through
-            # to the "passthrough with openai/ prefix" branch and the upstream
-            # rejects them as invalid model names.
+        elif any(tier in lower for tier in BIG_TIERS):
+            # sonnet / opus / fable / mythos — route everything else from
+            # BIG_TIERS to BIG_MODEL. Without an explicit rule the unknown
+            # Claude name falls through to the passthrough branch and the
+            # upstream rejects it as an invalid model name.
             new_model = f"openai/{BIG_MODEL}"
         elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
             new_model = f"openai/{clean_v}"
