@@ -51,11 +51,14 @@ Claude Code sends requests naming Claude models (`claude-3-5-sonnet-...`, `claud
 
 | Claude Model | Default Mapping | Override |
 |--------------|-----------------|----------|
-| haiku        | `openai/SMALL_MODEL` (default `gpt-4.1-mini`) | set `SMALL_MODEL` |
-| sonnet / opus / fable / mythos | `openai/BIG_MODEL` (default `gpt-4.1`) | set `BIG_MODEL`   |
+| haiku        | `openai/SMALL_MODEL` (default `gpt-4.1-mini`) | set `SMALL_MODEL` or `HAIKU_MODEL` |
+| sonnet       | `openai/BIG_MODEL` (default `gpt-4.1`) | set `BIG_MODEL` or `SONNET_MODEL` |
+| opus / fable / mythos | `openai/BIG_MODEL` (default `gpt-4.1`) | set `BIG_MODEL`, or `OPUS_MODEL` / `FABLE_MODEL` / `MYTHOS_MODEL` |
 | anything else with `openai/` prefix | passed through | — |
 | bare model name in `OPENAI_MODELS` | `openai/<name>` | add to the list in `server.py` |
 | anything else | `openai/<name>` (assumes custom OpenAI-compatible endpoint) | — |
+
+A per-tier override (`HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `MYTHOS_MODEL`) takes precedence over `BIG_MODEL` / `SMALL_MODEL` for that tier only; tiers without an override keep using `BIG_MODEL` / `SMALL_MODEL`. Use this to point different Claude tiers at different backends — e.g. opus at a strong model while sonnet uses the default.
 
 To target a custom model on a compatible endpoint, set both `BIG_MODEL` and `SMALL_MODEL` to that name:
 

@@ -103,6 +103,19 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
+# Per-tier default; the matching TIERNAME_MODEL env var overrides it (None = use default).
+# Insertion order is the routing priority: haiku is checked first so it wins over big tiers.
+TIER_DEFAULT = {
+    "haiku": SMALL_MODEL,
+    "sonnet": BIG_MODEL,
+    "opus": BIG_MODEL,
+    "fable": BIG_MODEL,
+    "mythos": BIG_MODEL,
+}
+TIER_OVERRIDE = {
+    tier: os.environ.get(f"{tier.upper()}_MODEL") for tier in TIER_DEFAULT
+}
+
 # Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
 OPENAI_TLS_VERIFY = _str_to_bool(os.environ.get("OPENAI_TLS_VERIFY", "true"))
 litellm.ssl_verify = OPENAI_TLS_VERIFY
@@ -116,9 +129,6 @@ MAX_OUTPUT_TOKENS = 16384
 DEFAULT_PORT = 8082
 
 MSG_ID_HEX_LEN = 24
-
-# Substring-matched against the lowercased model name; add new "big" tiers here.
-BIG_TIERS = ("sonnet", "opus", "fable", "mythos")
 
 # Recognised bare names; anything else is opaque and passed through with openai/.
 OPENAI_MODELS = {
@@ -248,19 +258,21 @@ class MessagesRequest(BaseModel):
                 break
 
         lower = clean_v.lower()
-        if "haiku" in lower:
-            new_model = f"openai/{SMALL_MODEL}"
-        elif any(tier in lower for tier in BIG_TIERS):
-            # Without an explicit rule, unknown Claude names fall through and the upstream rejects them.
-            new_model = f"openai/{BIG_MODEL}"
-        elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-            new_model = f"openai/{clean_v}"
-        elif v.startswith("openai/"):
-            new_model = v
-        else:
-            # Custom endpoint: pass the bare name through with the openai/ prefix.
-            logger.debug(f"No mapping rule for model '{v}', passing through")
-            new_model = f"openai/{clean_v}"
+        new_model = None
+        for tier, default in TIER_DEFAULT.items():
+            if tier in lower:
+                chosen = TIER_OVERRIDE[tier] or default
+                new_model = f"openai/{chosen}"
+                break
+        if new_model is None:
+            if clean_v in OPENAI_MODELS and not v.startswith("openai/"):
+                new_model = f"openai/{clean_v}"
+            elif v.startswith("openai/"):
+                new_model = v
+            else:
+                # Custom endpoint: pass the bare name through with the openai/ prefix.
+                logger.debug(f"No mapping rule for model '{v}', passing through")
+                new_model = f"openai/{clean_v}"
 
         logger.debug(f"MODEL MAPPING: '{v}' -> '{new_model}'")
 

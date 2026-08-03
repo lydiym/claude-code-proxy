@@ -170,6 +170,54 @@ def test_validate_model_field_mythos_maps_to_big_model() -> None:
     assert req.model == f"openai/{srv.BIG_MODEL}"
 
 
+def test_validate_model_field_sonnet_override_takes_precedence() -> None:
+    original = srv.TIER_OVERRIDE["sonnet"]
+    srv.TIER_OVERRIDE["sonnet"] = "custom-sonnet-model"
+    try:
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert req.model == "openai/custom-sonnet-model"
+    finally:
+        srv.TIER_OVERRIDE["sonnet"] = original
+
+
+def test_validate_model_field_opus_override_is_independent() -> None:
+    original_opus = srv.TIER_OVERRIDE["opus"]
+    srv.TIER_OVERRIDE["opus"] = "custom-opus-model"
+    try:
+        opus_req = _make_request({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert opus_req.model == "openai/custom-opus-model"
+        sonnet_req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert sonnet_req.model == f"openai/{srv.BIG_MODEL}"
+    finally:
+        srv.TIER_OVERRIDE["opus"] = original_opus
+
+
+def test_validate_model_field_haiku_override() -> None:
+    original = srv.TIER_OVERRIDE["haiku"]
+    srv.TIER_OVERRIDE["haiku"] = "custom-haiku-model"
+    try:
+        req = _make_request({
+            "model": "claude-3-5-haiku-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert req.model == "openai/custom-haiku-model"
+    finally:
+        srv.TIER_OVERRIDE["haiku"] = original
+
+
 def test_validate_model_field_known_openai_model_gets_prefix() -> None:
     req = _make_request({
         "model": "gpt-4.1",
