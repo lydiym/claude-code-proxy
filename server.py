@@ -148,7 +148,6 @@ OPENAI_MODELS = {
 
 
 def to_anthropic_stop_reason(finish_reason):
-    """Map an OpenAI/LiteLLM finish_reason to an Anthropic stop_reason."""
     return {
         "stop": "end_turn",
         "length": "max_tokens",
@@ -157,7 +156,6 @@ def to_anthropic_stop_reason(finish_reason):
 
 
 def get_field(obj, key, default=None):
-    """Read a field from a dict or object uniformly."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
@@ -171,7 +169,6 @@ def short_model(name):
     return name.split("/")[-1] if "/" in name else name
 
 
-# Models for Anthropic API requests
 class ContentBlockText(BaseModel):
     type: Literal["text"]
     text: str
@@ -374,7 +371,6 @@ class ThinkStreamParser:
         return True
 
     def flush(self):
-        """Emit anything still buffered at end of stream."""
         if not self.buffer:
             return []
         events = [(("thinking" if self.in_thinking else "text"), self.buffer)]
@@ -386,7 +382,6 @@ class ThinkStreamParser:
 
 
 def parse_tool_result_content(content):
-    """Helper function to properly parse and normalize tool result content."""
     if content is None:
         return "No content provided"
 
@@ -430,7 +425,6 @@ def parse_tool_result_content(content):
 
 
 def convert_image_block(source: Any) -> Dict[str, Any]:
-    """Convert an Anthropic image source block to OpenAI image_url format."""
     if isinstance(source, dict):
         if source.get("type") == "base64":
             media_type = source.get("media_type", "image/png")
@@ -464,7 +458,6 @@ def _extract_text(content) -> str:
 
 
 def system_to_message(system):
-    """Build a single OpenAI system message from the Anthropic system field."""
     text = _extract_text(system) if system else ""
     return {"role": "system", "content": text} if text else None
 
@@ -494,7 +487,6 @@ def _build_system_message(system_field, messages) -> Optional[Dict[str, str]]:
 
 
 def collect_tool_ids(messages):
-    """Return (call_ids, result_ids) sets across all messages."""
     call_ids = set()
     result_ids = set()
     for msg in messages:
@@ -512,7 +504,6 @@ def collect_tool_ids(messages):
 
 
 def convert_assistant_message(msg, result_ids):
-    """Convert an Anthropic assistant message to OpenAI format."""
     text_parts = []
     tool_calls = []
 
@@ -550,7 +541,6 @@ def convert_assistant_message(msg, result_ids):
 
 
 def convert_user_message(msg, call_ids):
-    """Convert an Anthropic user message into one or more OpenAI messages."""
     tool_messages = []
     user_parts = []
 
@@ -591,7 +581,6 @@ def convert_user_message(msg, call_ids):
 
 
 def _convert_message(msg, result_ids, call_ids) -> List[Dict[str, Any]]:
-    """Dispatch one Anthropic user/assistant message to its OpenAI conversion."""
     if isinstance(msg.content, str):
         return [{"role": msg.role, "content": msg.content}]
     if msg.role == "assistant":
@@ -600,7 +589,6 @@ def _convert_message(msg, result_ids, call_ids) -> List[Dict[str, Any]]:
 
 
 def convert_tool_definitions(tools):
-    """Convert Anthropic tool definitions to OpenAI function tool definitions."""
     return [
         {
             "type": "function",
@@ -615,7 +603,6 @@ def convert_tool_definitions(tools):
 
 
 def convert_tool_choice(choice):
-    """Convert an Anthropic tool_choice to OpenAI tool_choice."""
     choice_type = get_field(choice, "type")
     if choice_type == "auto":
         return "auto"
@@ -629,7 +616,6 @@ def convert_tool_choice(choice):
 
 
 def sanitize_messages_for_openai(messages):
-    """Strip message fields foreign to OpenAI Chat and fill empty content."""
     allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls"}
     for msg in messages:
         for key in list(msg.keys()):
@@ -641,7 +627,6 @@ def sanitize_messages_for_openai(messages):
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
-    """Convert an Anthropic Messages request to a LiteLLM (OpenAI Chat) request."""
     call_ids, result_ids = collect_tool_ids(anthropic_request.messages)
 
     messages = []
@@ -679,7 +664,6 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
 
 def _first_choice(response):
-    """Return the first choice of a LiteLLM response, or None."""
     choices = get_field(response, "choices", [])
     if not choices:
         return None
@@ -687,7 +671,6 @@ def _first_choice(response):
 
 
 def _first_message(response):
-    """Return the first choice's message dict/object, or empty dict."""
     choice = _first_choice(response)
     if choice is None:
         return {}
@@ -695,7 +678,6 @@ def _first_message(response):
 
 
 def _extract_tool_calls(message):
-    """Return a list of tool_call dicts/objects from a message, or []."""
     raw = get_field(message, "tool_calls")
     if not raw:
         return []
@@ -705,7 +687,6 @@ def _extract_tool_calls(message):
 
 
 def _parse_tool_arguments(raw):
-    """Parse a tool call arguments string into a dict; return raw on failure."""
     if not isinstance(raw, str):
         return raw if raw is not None else {}
     try:
@@ -741,7 +722,6 @@ def _build_content_blocks(text, reasoning, tool_calls):
 
 
 def _extract_usage(usage):
-    """Return (prompt_tokens, completion_tokens) from a usage object or dict."""
     return (
         get_field(usage, "prompt_tokens", 0) or 0,
         get_field(usage, "completion_tokens", 0) or 0,
@@ -751,7 +731,6 @@ def _extract_usage(usage):
 def convert_litellm_to_anthropic(
     litellm_response: Union[Dict[str, Any], Any], original_request: MessagesRequest
 ) -> MessagesResponse:
-    """Convert a LiteLLM (OpenAI Chat) response to an Anthropic Messages response."""
     try:
         message = _first_message(litellm_response)
         text = get_field(message, "content") or ""
@@ -896,7 +875,6 @@ class SseFormatter:
 
     @staticmethod
     def finish(stop_reason: str, output_tokens: int) -> List[str]:
-        """The standard end-of-stream sequence shared by every exit path."""
         return [
             SseFormatter.message_delta(stop_reason, output_tokens),
             SseFormatter.message_stop(),
@@ -907,7 +885,6 @@ class SseFormatter:
 def _open_block(
     tracker: BlockTracker, kind: str, block_dict: Dict[str, Any]
 ) -> Iterator[str]:
-    """Ensure the right block kind is open, emitting close + start events as needed."""
     for event in tracker.ensure(kind):
         yield event
     if not tracker.is_open(kind):
@@ -916,7 +893,6 @@ def _open_block(
 
 
 def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
-    """Open a thinking block if needed and yield a single thinking_delta."""
     if not text:
         return
     yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
@@ -926,7 +902,6 @@ def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
 def _translate_parser_events(
     events: List[tuple], tracker: BlockTracker
 ) -> Iterator[str]:
-    """Drive BlockTracker from (kind, value) events yielded by ThinkStreamParser."""
     for kind, value in events:
         if kind == "open":
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
@@ -942,7 +917,6 @@ def _translate_parser_events(
 
 
 def log_request(method, path, source_model, target_model, num_messages, num_tools, status_code):
-    """Log a one-line request summary highlighting the source/target model mapping."""
     endpoint = path.split("?", 1)[0] if "?" in path else path
     status_color = Colors.GREEN if status_code == 200 else Colors.RED
     line = (
@@ -958,7 +932,6 @@ def log_request(method, path, source_model, target_model, num_messages, num_tool
 
 
 async def handle_streaming(response_generator, original_request: MessagesRequest):
-    """Convert a LiteLLM streaming response into Anthropic SSE events."""
     tracker = BlockTracker()
     think_parser = ThinkStreamParser()
     tool_index: Optional[int] = None
