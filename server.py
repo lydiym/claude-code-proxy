@@ -82,10 +82,31 @@ async def _configure_logging(app: FastAPI):
 
 app = FastAPI(lifespan=_configure_logging)
 
+
+def _str_to_bool(value, *, default=False):
+    """Parse an env-style boolean string.
+
+    Truthy: 1/true/yes/on (case-insensitive). Anything else returns ``default``;
+    we don't raise on garbage because bad config shouldn't crash the proxy on
+    import — the caller decides what to do with the value.
+    """
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+
+# Set OPENAI_TLS_VERIFY=false to skip TLS certificate validation when
+# OPENAI_BASE_URL points at an HTTPS endpoint with a self-signed cert
+# (typical for a local LLM box). Default is to verify.
+OPENAI_TLS_VERIFY = _str_to_bool(os.environ.get("OPENAI_TLS_VERIFY", "true"))
+litellm.ssl_verify = OPENAI_TLS_VERIFY
+if not OPENAI_TLS_VERIFY:
+    logger.warning("OPENAI_TLS_VERIFY=false — TLS certificate validation is disabled. Do not use this in production.")
 
 # OpenAI Chat Completions caps max_completion_tokens at this value for most
 # current models; over it the API rejects the request.

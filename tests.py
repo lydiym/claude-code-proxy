@@ -446,6 +446,32 @@ def test_convert_litellm_to_anthropic_recovers_from_broken_usage() -> None:
     assert out.usage.output_tokens == 0
     assert out.content[0].model_dump() == {"type": "text", "text": "ok"}
 
+
+def test_str_to_bool_truthy_values() -> None:
+    for v in ("1", "true", "TRUE", "True", "yes", "YES", "on", "On"):
+        assert srv._str_to_bool(v) is True, v
+
+
+def test_str_to_bool_falsy_values() -> None:
+    for v in ("0", "false", "False", "no", "off", "", "garbage"):
+        assert srv._str_to_bool(v) is False, v
+
+
+def test_str_to_bool_none_uses_default() -> None:
+    assert srv._str_to_bool(None) is False
+    assert srv._str_to_bool(None, default=True) is True
+
+
+def test_str_to_bool_strips_whitespace() -> None:
+    assert srv._str_to_bool("  true  ") is True
+    assert srv._str_to_bool(" false ") is False
+
+
+def test_tls_verify_wiring_matches_module_setting() -> None:
+    """OPENAI_TLS_VERIFY is read at import time and propagated to litellm."""
+    assert srv.OPENAI_TLS_VERIFY == srv.litellm.ssl_verify
+
+
 REQUIRED_EVENT_TYPES = {
     "message_start",
     "content_block_start",

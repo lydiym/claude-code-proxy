@@ -29,6 +29,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
    - `OPENAI_API_KEY`: your OpenAI (or compatible) API key
    - `OPENAI_BASE_URL` (optional): override the endpoint, e.g. `https://api.your-provider.com/v1`
    - `BIG_MODEL` / `SMALL_MODEL` (optional): target models for `sonnet` / `haiku` requests. Defaults: `gpt-4.1` / `gpt-4.1-mini`.
+   - `OPENAI_TLS_VERIFY` (optional): set to `false` to skip TLS certificate validation — useful when `OPENAI_BASE_URL` points at a self-signed HTTPS endpoint on your local network. Default: `true`.
 
 3. **Run the server:**
    ```bash
