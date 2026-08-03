@@ -12,10 +12,8 @@ import uuid
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 
-# LiteLLM tries to refresh its per-model cost map from raw.githubusercontent.com
-# on every call. We never call completion_cost(), so the network attempt is pure
-# noise — and on isolated networks it spams a warning on every request. Setting
-# this before litellm is imported guarantees the local bundled map is used.
+# Must be set before litellm is imported — otherwise it tries to refresh the
+# model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 import litellm
@@ -23,10 +21,8 @@ import uvicorn
 
 load_dotenv()
 
-# Single source of truth for log format. basicConfig gives sensible output
-# for plain `import server` (e.g. tests); the lifespan hook re-applies it
-# after uvicorn has installed its own handlers, so the same format holds
-# when the server is started via `uvicorn server:app` too.
+# basicConfig covers plain `import server`; the lifespan hook re-applies it
+# after uvicorn installs its own handlers.
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -107,9 +103,7 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
-# Set OPENAI_TLS_VERIFY=false to skip TLS certificate validation when
-# OPENAI_BASE_URL points at an HTTPS endpoint with a self-signed cert
-# (typical for a local LLM box). Default is to verify.
+# Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
 OPENAI_TLS_VERIFY = _str_to_bool(os.environ.get("OPENAI_TLS_VERIFY", "true"))
 litellm.ssl_verify = OPENAI_TLS_VERIFY
 if not OPENAI_TLS_VERIFY:
@@ -123,14 +117,10 @@ DEFAULT_PORT = 8082
 
 MSG_ID_HEX_LEN = 24
 
-# Claude model tiers that route to BIG_MODEL. Substring-matched against the
-# lowercased model name so `claude-opus-5`, `claude-sonnet-5-20251215`, etc.
-# all hit. Add new "big" tiers here rather than chaining another elif.
+# Substring-matched against the lowercased model name; add new "big" tiers here.
 BIG_TIERS = ("sonnet", "opus", "fable", "mythos")
 
-# OpenAI models recognised without an explicit `openai/` prefix. Anything not
-# here is treated as opaque — pass through, prefixed with `openai/` — so users
-# can target custom OpenAI-compatible endpoints that use arbitrary names.
+# Recognised bare names; anything else is opaque and passed through with openai/.
 OPENAI_MODELS = {
     "o3-mini",
     "o1",
@@ -177,10 +167,7 @@ class ContentBlockText(BaseModel):
 class ContentBlockThinking(BaseModel):
     type: Literal["thinking"]
     thinking: str
-    # Anthropic populates this when echoing a thinking block back as part of
-    # conversation history; we don't generate one, but downstream requests
-    # (e.g. Claude Code's next turn) carry it through verbatim. Optional so
-    # that requests omitting it still validate.
+    # Echoed back in conversation history; we don't generate it locally.
     signature: Optional[str] = None
 
 
@@ -253,8 +240,7 @@ class MessagesRequest(BaseModel):
 
     @field_validator("model")
     def validate_model_field(cls, v):
-        # Strip any prefix the client might have added so we match on the bare
-        # name (Claude Code sends `claude-3-5-sonnet-20241022`).
+        # Clients may prefix with anthropic/, openai/, or gemini/ — strip so we match on the bare name.
         clean_v = v
         for prefix in ("anthropic/", "openai/", "gemini/"):
             if clean_v.startswith(prefix):
@@ -265,18 +251,14 @@ class MessagesRequest(BaseModel):
         if "haiku" in lower:
             new_model = f"openai/{SMALL_MODEL}"
         elif any(tier in lower for tier in BIG_TIERS):
-            # sonnet / opus / fable / mythos — route everything else from
-            # BIG_TIERS to BIG_MODEL. Without an explicit rule the unknown
-            # Claude name falls through to the passthrough branch and the
-            # upstream rejects it as an invalid model name.
+            # Without an explicit rule, unknown Claude names fall through and the upstream rejects them.
             new_model = f"openai/{BIG_MODEL}"
         elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
             new_model = f"openai/{clean_v}"
         elif v.startswith("openai/"):
             new_model = v
         else:
-            # Custom OpenAI-compatible endpoint (e.g. local models). Pass the
-            # bare name through with the openai/ prefix so LiteLLM routes it.
+            # Custom endpoint: pass the bare name through with the openai/ prefix.
             logger.debug(f"No mapping rule for model '{v}', passing through")
             new_model = f"openai/{clean_v}"
 
@@ -305,10 +287,8 @@ class MessagesResponse(BaseModel):
     usage: Usage
 
 
-# Anthropic API expects reasoning as `type: "thinking"` content blocks. Some
-# backends (notably llama.cpp with `--reasoning-format none`) fold their
-# reasoning into `content` wrapped in <think>...</think>; the streaming parser
-# below splits that out so Claude Code renders it correctly.
+# Anthropic wants `type: "thinking"` blocks; some backends fold reasoning
+# into `<think>...</think>` inside `content` and the parser below splits them out.
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 
@@ -347,13 +327,10 @@ class ThinkStreamParser:
         idx = self.buffer.find(tag)
         if idx < 0:
             if self.in_thinking:
-                # Hold everything until we see ``. Emitting early commits
-                # the bytes to "thinking" even though they could be the
-                # visible answer if the close tag never arrives or arrives
-                # mid-word in a later chunk.
+                # Hold until close tag: emitting early would commit bytes to
+                # "thinking" if the tag never arrives or splits mid-word later.
                 return False
-            # Text mode: the only risk is a stray open tag, so we can flush
-            # anything before the last '<' immediately.
+            # Text mode: only risk is a stray open tag, so flush up to the last '<'.
             last_lt = self.buffer.rfind("<")
             if last_lt < 0:
                 events.append(("text", self.buffer))
@@ -522,10 +499,8 @@ def convert_assistant_message(msg, result_ids):
                     },
                 })
             else:
-                # Dangling call whose result was truncated from history.
-                # Describe it in prose rather than a tool-call-like syntax
-                # (which small models tend to mimic) so the backend does
-                # not demand a response for an unanswerable call.
+                # Dangling call (result truncated from history): describe in
+                # prose — small models mimic tool-call syntax otherwise.
                 text_parts.append(
                     f"(An earlier {block.name} tool call is missing its "
                     f"result in this context.)"
@@ -560,16 +535,13 @@ def convert_user_message(msg, call_ids):
                     "content": result_text,
                 })
             else:
-                # Orphaned result whose call was truncated from history. Fold
-                # into user text so we never emit an unpaired tool message;
-                # the ghost id would be meaningless to the model, so drop it.
+                # Orphaned result (truncated call): fold into user text; the ghost id is meaningless.
                 user_parts.append({
                     "type": "text",
                     "text": f"(Result from an earlier tool call:)\n{result_text}",
                 })
 
-    # Tool results must immediately follow the assistant turn that produced
-    # the matching tool_calls, so emit them before any trailing user text.
+    # Tool results must follow the matching assistant turn, so emit them first.
     out = list(tool_messages)
     if user_parts:
         if all(part.get("type") == "text" for part in user_parts):
@@ -633,10 +605,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if system := _build_system_message(anthropic_request.system, anthropic_request.messages):
         messages.append(system)
 
-    # LiteLLM's canonical input is OpenAI Chat format for every provider, so
-    # tool calls travel as assistant.tool_calls and their results as role="tool"
-    # messages. Flattening them into plain text (the previous behaviour) taught
-    # small models to emit tool calls as literal text, which broke tool use.
+    # LiteLLM uses assistant.tool_calls + role="tool"; flattening taught small
+    # models to emit tool calls as literal text and broke tool use.
     for msg in anthropic_request.messages:
         if msg.role != "system":
             messages.extend(_convert_message(msg, result_ids, call_ids))
@@ -962,8 +932,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             },
         })
 
-        # Always begin with a text block. Subsequent close-and-open transitions
-        # happen as the upstream switches between text, thinking, and tool_use.
+        # Always start with a text block; close-and-open transitions handle upstream switches.
         for event in _open_block(tracker, "text", {"type": "text", "text": ""}):
             yield event
         yield SseFormatter.ping()
@@ -982,10 +951,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 delta = get_field(choice, "delta") or get_field(choice, "message", {}) or {}
                 finish_reason = get_field(choice, "finish_reason")
 
-                # litellm exposes structured reasoning on some providers as a
-                # separate delta.reasoning_content. Honour it so models with
-                # native reasoning fields stay spec-compliant; otherwise we
-                # parse `` markers out of plain content below.
+                # litellm exposes native reasoning as delta.reasoning_content on some providers;
+                # honour it before falling back to `` parsing.
                 delta_reasoning = get_field(delta, "reasoning_content")
 
                 delta_content = get_field(delta, "content")
@@ -1059,11 +1026,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield SseFormatter.message_stop()
         yield SseFormatter.done()
     finally:
-        # Close the litellm async generator so its internal httpx client is
-        # released deterministically. Without this, when the SSE consumer
-        # (Claude Code) drops the connection mid-stream, the underlying
-        # httpx.AsyncClient leaks and httpx's __del__ logs "Unclosed
-        # client session" at GC time.
+        # Close so the internal httpx client releases deterministically —
+        # otherwise mid-stream cancellation leaks it until GC.
         await response_generator.aclose()
 
 
@@ -1072,8 +1036,7 @@ async def create_message(request: MessagesRequest):
     try:
         litellm_request = convert_anthropic_to_litellm(request)
 
-        # OpenAI (or any OpenAI-compatible endpoint). After validation every
-        # request.model has the openai/ prefix, so this is the only branch.
+        # After validation every model has the openai/ prefix, so this is the only branch we need.
         litellm_request["api_key"] = OPENAI_API_KEY
         if OPENAI_BASE_URL:
             litellm_request["api_base"] = OPENAI_BASE_URL
