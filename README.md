@@ -53,6 +53,7 @@ Claude Code sends requests naming Claude models (`claude-3-5-sonnet-...`, `claud
 |--------------|-----------------|----------|
 | haiku        | `openai/SMALL_MODEL` (default `gpt-4.1-mini`) | set `SMALL_MODEL` |
 | sonnet       | `openai/BIG_MODEL` (default `gpt-4.1`)        | set `BIG_MODEL`   |
+| opus         | `openai/BIG_MODEL` (default `gpt-4.1`)        | set `BIG_MODEL`   |
 | anything else with `openai/` prefix | passed through | — |
 | bare model name in `OPENAI_MODELS` | `openai/<name>` | add to the list in `server.py` |
 | anything else | `openai/<name>` (assumes custom OpenAI-compatible endpoint) | — |

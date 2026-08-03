@@ -264,6 +264,12 @@ class MessagesRequest(BaseModel):
             new_model = f"openai/{SMALL_MODEL}"
         elif "sonnet" in lower:
             new_model = f"openai/{BIG_MODEL}"
+        elif "opus" in lower:
+            # Opus is the same tier as sonnet for our purposes: route it to
+            # BIG_MODEL. Without this clause, unknown Claude names fall through
+            # to the "passthrough with openai/ prefix" branch and the upstream
+            # rejects them as invalid model names.
+            new_model = f"openai/{BIG_MODEL}"
         elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
             new_model = f"openai/{clean_v}"
         elif v.startswith("openai/"):
