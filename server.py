@@ -11,6 +11,13 @@ import time
 import uuid
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
+
+# LiteLLM tries to refresh its per-model cost map from raw.githubusercontent.com
+# on every call. We never call completion_cost(), so the network attempt is pure
+# noise — and on isolated networks it spams a warning on every request. Setting
+# this before litellm is imported guarantees the local bundled map is used.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
 import litellm
 import uvicorn
 
