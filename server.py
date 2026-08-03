@@ -1076,6 +1076,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield SseFormatter.message_delta("error", 0)
         yield SseFormatter.message_stop()
         yield SseFormatter.done()
+    finally:
+        # Close the litellm async generator so its internal httpx client is
+        # released deterministically. Without this, when the SSE consumer
+        # (Claude Code) drops the connection mid-stream, the underlying
+        # httpx.AsyncClient leaks and httpx's __del__ logs "Unclosed
+        # client session" at GC time.
+        await response_generator.aclose()
 
 
 @app.post("/v1/messages")
