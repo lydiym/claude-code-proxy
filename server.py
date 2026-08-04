@@ -12,8 +12,6 @@ import uuid
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 
-# Load .env before any env-var-driven logic below so flags like
-# TIKTOKEN_OFFLINE are visible to the conditional import.
 load_dotenv()
 
 # Must be set before litellm is imported — otherwise it tries to refresh the
