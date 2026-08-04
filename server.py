@@ -21,12 +21,8 @@ load_dotenv()
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 if os.getenv("TIKTOKEN_OFFLINE", "true").lower() not in ("false", "0", "no", "off"):
-    # LiteLLM uses tiktoken for context-window checks. By default tiktoken
-    # fetches cl100k_base.tiktoken from Azure blob storage on first use; on
-    # an isolated network that DNS lookup fails on every request. Replace
-    # tiktoken.get_encoding and tiktoken.encoding_for_model with stubs that
-    # accept any text without network access. Token counts are not accurate
-    # but we read the real counts from the upstream response's usage field.
+    # Stub tiktoken: skip the Azure blob fetch of cl100k_base.tiktoken.
+    # Token counts are approximate; real counts come from upstream usage.
     import tiktoken
 
     class _OfflineEncoding:
