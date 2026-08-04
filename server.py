@@ -12,14 +12,38 @@ import uuid
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 
+load_dotenv()
+
 # Must be set before litellm is imported — otherwise it tries to refresh the
 # model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
+if os.getenv("TIKTOKEN_OFFLINE", "true").lower() not in ("false", "0", "no", "off"):
+    # Stub tiktoken: skip the Azure blob fetch of cl100k_base.tiktoken.
+    # Token counts are approximate; real counts come from upstream usage.
+    import tiktoken
+
+    class _OfflineEncoding:
+        def encode(self, text, *args, **kwargs):
+            return [1] * max(1, len(text) // 4)
+
+        def encode_ordinary(self, text, *args, **kwargs):
+            return self.encode(text, *args, **kwargs)
+
+        def encode_single_token(self, token, *args, **kwargs):
+            return [1]
+
+        def decode(self, tokens, *args, **kwargs):
+            return ""
+
+        def decode_single_token_bytes(self, token):
+            return b""
+
+    tiktoken.get_encoding = lambda name: _OfflineEncoding()
+    tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
+
 import litellm
 import uvicorn
-
-load_dotenv()
 
 # basicConfig covers plain `import server`; the lifespan hook re-applies it
 # after uvicorn installs its own handlers.

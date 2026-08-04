@@ -30,6 +30,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
    - `OPENAI_BASE_URL` (optional): override the endpoint, e.g. `https://api.your-provider.com/v1`
    - `BIG_MODEL` / `SMALL_MODEL` (optional): target models for `sonnet` / `haiku` requests. Defaults: `gpt-4.1` / `gpt-4.1-mini`.
    - `OPENAI_TLS_VERIFY` (optional): set to `false` to skip TLS certificate validation — useful when `OPENAI_BASE_URL` points at a self-signed HTTPS endpoint on your local network. Default: `true`.
+   - `TIKTOKEN_OFFLINE` (optional): stub out tiktoken and skip its network fetch of `cl100k_base.tiktoken` from Azure blob storage. Default: `true`. Set to `false` to let tiktoken fetch the real BPE file on first use (only useful if you want accurate tiktoken-based counts; the proxy reads the real counts from the upstream response's `usage` field either way).
 
 3. **Run the server:**
    ```bash
