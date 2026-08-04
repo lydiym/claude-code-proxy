@@ -12,43 +12,44 @@ import uuid
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
 
+# Load .env before any env-var-driven logic below so flags like
+# TIKTOKEN_OFFLINE are visible to the conditional import.
+load_dotenv()
+
 # Must be set before litellm is imported — otherwise it tries to refresh the
 # model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
-import tiktoken
+if os.getenv("TIKTOKEN_OFFLINE", "").lower() in ("true", "1", "yes", "on"):
+    # LiteLLM uses tiktoken for context-window checks. By default tiktoken
+    # fetches cl100k_base.tiktoken from Azure blob storage on first use; on
+    # an isolated network that DNS lookup fails on every request. Replace
+    # tiktoken.get_encoding and tiktoken.encoding_for_model with stubs that
+    # accept any text without network access. Token counts are not accurate
+    # but we read the real counts from the upstream response's usage field.
+    import tiktoken
 
+    class _OfflineEncoding:
+        def encode(self, text, *args, **kwargs):
+            return [1] * max(1, len(text) // 4)
 
-# LiteLLM uses tiktoken for context-window checks. By default tiktoken fetches
-# cl100k_base.tiktoken from Azure blob storage on first use; on an isolated
-# network that DNS lookup fails on every request. Replace tiktoken.get_encoding
-# and tiktoken.encoding_for_model with stubs that accept any text without
-# network access. Token counts are not accurate but we read the real counts
-# from the upstream response's usage field.
-class _OfflineEncoding:
-    def encode(self, text, *args, **kwargs):
-        return [1] * max(1, len(text) // 4)
+        def encode_ordinary(self, text, *args, **kwargs):
+            return self.encode(text, *args, **kwargs)
 
-    def encode_ordinary(self, text, *args, **kwargs):
-        return self.encode(text, *args, **kwargs)
+        def encode_single_token(self, token, *args, **kwargs):
+            return [1]
 
-    def encode_single_token(self, token, *args, **kwargs):
-        return [1]
+        def decode(self, tokens, *args, **kwargs):
+            return ""
 
-    def decode(self, tokens, *args, **kwargs):
-        return ""
+        def decode_single_token_bytes(self, token):
+            return b""
 
-    def decode_single_token_bytes(self, token):
-        return b""
-
-
-tiktoken.get_encoding = lambda name: _OfflineEncoding()
-tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
+    tiktoken.get_encoding = lambda name: _OfflineEncoding()
+    tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
 
 import litellm
 import uvicorn
-
-load_dotenv()
 
 # basicConfig covers plain `import server`; the lifespan hook re-applies it
 # after uvicorn installs its own handlers.
