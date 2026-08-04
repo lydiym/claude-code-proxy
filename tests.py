@@ -1,716 +1,744 @@
 #!/usr/bin/env python3
 """
-Comprehensive test suite for Claude-on-OpenAI Proxy.
+Tests for the Anthropic → OpenAI proxy.
 
-This script provides tests for both streaming and non-streaming requests,
-with various scenarios including tool use, multi-turn conversations,
-and content blocks.
+Includes both integration smoke tests (require a running server on PROXY_URL)
+and unit tests for the request/response translation (no network needed).
 
 Usage:
-  python tests.py                    # Run all tests
-  python tests.py --no-streaming     # Skip streaming tests
-  python tests.py --simple           # Run only simple tests
-  python tests.py --tools            # Run tool-related tests only
+  python tests.py                  # run unit tests only (default)
+  python tests.py --integration    # run integration smoke tests
+  python tests.py --all            # run both
+  python tests.py --simple         # (integration) skip tool scenarios
+  python tests.py --tools          # (integration) only tool scenarios
 """
 
-import os
-import json
-import time
-import httpx
 import argparse
 import asyncio
+import json
 import sys
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Set
+import time
+from typing import Any, Dict, List
+
+import httpx
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
-# Configuration
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-PROXY_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # Using same key for proxy
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-PROXY_API_URL = "http://localhost:8082/v1/messages"
+PROXY_URL = "http://localhost:8082/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-MODEL = "claude-3-sonnet-20240229"  # Change to your preferred model
+DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
 
-# Headers
-anthropic_headers = {
-    "x-api-key": ANTHROPIC_API_KEY,
+HEADERS = {
+    "x-api-key": "dummy",
     "anthropic-version": ANTHROPIC_VERSION,
     "content-type": "application/json",
 }
 
-proxy_headers = {
-    "x-api-key": PROXY_API_KEY,
-    "anthropic-version": ANTHROPIC_VERSION,
-    "content-type": "application/json",
-}
-
-# Tool definitions
-calculator_tool = {
+CALCULATOR_TOOL = {
     "name": "calculator",
-    "description": "Evaluate mathematical expressions",
+    "description": "Evaluate a math expression and return the result.",
     "input_schema": {
         "type": "object",
-        "properties": {
-            "expression": {
-                "type": "string",
-                "description": "The mathematical expression to evaluate"
-            }
-        },
-        "required": ["expression"]
-    }
+        "properties": {"expression": {"type": "string"}},
+        "required": ["expression"],
+    },
 }
 
-weather_tool = {
-    "name": "weather",
-    "description": "Get weather information for a location",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "location": {
-                "type": "string",
-                "description": "The city or location to get weather for"
-            },
-            "units": {
-                "type": "string",
-                "enum": ["celsius", "fahrenheit"],
-                "description": "Temperature units"
-            }
-        },
-        "required": ["location"]
-    }
-}
-
-search_tool = {
-    "name": "search",
-    "description": "Search for information on the web",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string", 
-                "description": "The search query"
-            }
-        },
-        "required": ["query"]
-    }
-}
-
-# Test scenarios
-TEST_SCENARIOS = {
-    # Simple text response
+TEST_SCENARIOS: Dict[str, Dict[str, Any]] = {
     "simple": {
-        "model": MODEL,
-        "max_tokens": 300,
-        "messages": [
-            {"role": "user", "content": "Hello, world! Can you tell me about Paris in 2-3 sentences?"}
-        ]
+        "model": DEFAULT_MODEL,
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": "Reply with the word OK and nothing else."}],
     },
-    
-    # Basic tool use
-    "calculator": {
-        "model": MODEL,
-        "max_tokens": 300,
-        "messages": [
-            {"role": "user", "content": "What is 135 + 7.5 divided by 2.5?"}
-        ],
-        "tools": [calculator_tool],
-        "tool_choice": {"type": "auto"}
-    },
-    
-    # Multiple tools
-    "multi_tool": {
-        "model": MODEL,
-        "max_tokens": 500,
-        "temperature": 0.7,
-        "top_p": 0.95,
-        "system": "You are a helpful assistant that uses tools when appropriate. Be concise and precise.",
-        "messages": [
-            {"role": "user", "content": "I'm planning a trip to New York next week. What's the weather like and what are some interesting places to visit?"}
-        ],
-        "tools": [weather_tool, search_tool],
-        "tool_choice": {"type": "auto"}
-    },
-    
-    # Multi-turn conversation
     "multi_turn": {
-        "model": MODEL,
-        "max_tokens": 500,
+        "model": DEFAULT_MODEL,
+        "max_tokens": 200,
         "messages": [
-            {"role": "user", "content": "Let's do some math. What is 240 divided by 8?"},
-            {"role": "assistant", "content": "To calculate 240 divided by 8, I'll perform the division:\n\n240 ÷ 8 = 30\n\nSo the result is 30."},
-            {"role": "user", "content": "Now multiply that by 4 and tell me the result."}
+            {"role": "user", "content": "My favourite colour is blue. Acknowledge in one sentence."},
+            {"role": "assistant", "content": "Got it — your favourite colour is blue."},
+            {"role": "user", "content": "What is my favourite colour? Answer in one short sentence."},
         ],
-        "tools": [calculator_tool],
-        "tool_choice": {"type": "auto"}
     },
-    
-    # Content blocks
-    "content_blocks": {
-        "model": MODEL,
-        "max_tokens": 500,
-        "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": "I need to know the weather in Los Angeles and calculate 75.5 / 5. Can you help with both?"}
-            ]}
-        ],
-        "tools": [calculator_tool, weather_tool],
-        "tool_choice": {"type": "auto"}
+    "tools": {
+        "model": DEFAULT_MODEL,
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": "What is 12 * 7?"}],
+        "tools": [CALCULATOR_TOOL],
+        "tool_choice": {"type": "auto"},
     },
-    
-    # Simple streaming test
-    "simple_stream": {
-        "model": MODEL,
+    "streaming": {
+        "model": DEFAULT_MODEL,
         "max_tokens": 100,
         "stream": True,
-        "messages": [
-            {"role": "user", "content": "Count from 1 to 5, with one number per line."}
-        ]
+        "messages": [{"role": "user", "content": "Count 1, 2, 3, each on its own line."}],
     },
-    
-    # Tool use with streaming
-    "calculator_stream": {
-        "model": MODEL,
-        "max_tokens": 300,
+    "streaming_tools": {
+        "model": DEFAULT_MODEL,
+        "max_tokens": 200,
         "stream": True,
-        "messages": [
-            {"role": "user", "content": "What is 135 + 17.5 divided by 2.5?"}
+        "messages": [{"role": "user", "content": "Compute (45 + 15) / 4 with the calculator tool."}],
+        "tools": [CALCULATOR_TOOL],
+        "tool_choice": {"type": "auto"},
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — translation logic only, no network.
+# ---------------------------------------------------------------------------
+
+import server as srv
+
+
+def _make_request(payload: Dict[str, Any]) -> srv.MessagesRequest:
+    """Build a MessagesRequest from a dict (validates + runs model_validator)."""
+    return srv.MessagesRequest(**payload)
+
+
+def test_capture_original_model_copies_model_field() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.original_model == "claude-3-5-sonnet-20241022"
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_capture_original_model_preserves_explicit_override() -> None:
+    req = _make_request({
+        "model": "openai/gpt-4.1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.original_model == "openai/gpt-4.1"
+    assert req.model == "openai/gpt-4.1"
+
+
+def test_validate_model_field_haiku_mapping() -> None:
+    req = _make_request({
+        "model": "claude-3-5-haiku-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.SMALL_MODEL}"
+
+
+def test_validate_model_field_sonnet_mapping() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_opus_maps_to_big_model() -> None:
+    req = _make_request({
+        "model": "claude-opus-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_opus_with_dated_id() -> None:
+    req = _make_request({
+        "model": "claude-opus-5-20251215",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_fable_maps_to_big_model() -> None:
+    req = _make_request({
+        "model": "claude-fable-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_mythos_maps_to_big_model() -> None:
+    req = _make_request({
+        "model": "claude-mythos-5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_validate_model_field_sonnet_override_takes_precedence() -> None:
+    original = srv.TIER_OVERRIDE["sonnet"]
+    srv.TIER_OVERRIDE["sonnet"] = "custom-sonnet-model"
+    try:
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert req.model == "openai/custom-sonnet-model"
+    finally:
+        srv.TIER_OVERRIDE["sonnet"] = original
+
+
+def test_validate_model_field_opus_override_is_independent() -> None:
+    original_opus = srv.TIER_OVERRIDE["opus"]
+    srv.TIER_OVERRIDE["opus"] = "custom-opus-model"
+    try:
+        opus_req = _make_request({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert opus_req.model == "openai/custom-opus-model"
+        sonnet_req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert sonnet_req.model == f"openai/{srv.BIG_MODEL}"
+    finally:
+        srv.TIER_OVERRIDE["opus"] = original_opus
+
+
+def test_validate_model_field_haiku_override() -> None:
+    original = srv.TIER_OVERRIDE["haiku"]
+    srv.TIER_OVERRIDE["haiku"] = "custom-haiku-model"
+    try:
+        req = _make_request({
+            "model": "claude-3-5-haiku-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert req.model == "openai/custom-haiku-model"
+    finally:
+        srv.TIER_OVERRIDE["haiku"] = original
+
+
+def test_validate_model_field_known_openai_model_gets_prefix() -> None:
+    req = _make_request({
+        "model": "gpt-4.1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/gpt-4.1"
+
+
+def test_validate_model_field_existing_openai_prefix_passthrough() -> None:
+    req = _make_request({
+        "model": "openai/custom-model",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/custom-model"
+
+
+def test_validate_model_field_unknown_name_gets_prefix() -> None:
+    req = _make_request({
+        "model": "my-local-llama",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/my-local-llama"
+
+
+def test_validate_model_field_strips_anthropic_prefix() -> None:
+    req = _make_request({
+        "model": "anthropic/claude-3-5-haiku-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == f"openai/{srv.SMALL_MODEL}"
+    assert req.original_model == "anthropic/claude-3-5-haiku-20241022"
+
+
+def test_sanitize_messages_for_openai_removes_foreign_keys() -> None:
+    messages = [
+        {"role": "user", "content": "hi", "stop_reason": "end_turn", "type": "message"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "x"}]},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "plain"},
+    ]
+    srv.sanitize_messages_for_openai(messages)
+    assert messages[0] == {"role": "user", "content": "hi"}
+    # When tool_calls is present OpenAI allows content=None, so we leave it.
+    assert messages[1] == {"role": "assistant", "content": None, "tool_calls": [{"id": "x"}]}
+    # Empty content with no tool_calls gets filled with the ellipsis sentinel.
+    assert messages[2] == {"role": "assistant", "content": "..."}
+    assert messages[3] == {"role": "user", "content": "plain"}
+
+
+def test_sanitize_messages_for_openai_keeps_allowed_keys() -> None:
+    messages = [
+        {
+            "role": "tool",
+            "name": "calculator",
+            "tool_call_id": "abc",
+            "content": "42",
+            "foreign_field": "x",
+        }
+    ]
+    srv.sanitize_messages_for_openai(messages)
+    assert "foreign_field" not in messages[0]
+    assert messages[0]["name"] == "calculator"
+    assert messages[0]["tool_call_id"] == "abc"
+    assert messages[0]["content"] == "42"
+
+
+def test_convert_anthropic_to_litellm_minimal_request() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": "Hello"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["model"] == f"openai/{srv.BIG_MODEL}"
+    assert out["max_completion_tokens"] == 200
+    assert out["temperature"] == 1.0
+    assert out["stream"] is False
+    assert out["messages"] == [{"role": "user", "content": "Hello"}]
+    assert "system" not in out["messages"][0]
+    assert "tools" not in out
+    assert "tool_choice" not in out
+
+
+def test_convert_anthropic_to_litellm_clamps_max_tokens() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": srv.MAX_OUTPUT_TOKENS + 1000,
+        "messages": [{"role": "user", "content": "Hello"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["max_completion_tokens"] == srv.MAX_OUTPUT_TOKENS
+
+
+def test_convert_anthropic_to_litellm_with_string_system() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "system": "You are helpful.",
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][0] == {"role": "system", "content": "You are helpful."}
+
+
+def test_convert_anthropic_to_litellm_with_list_system_joins_text_blocks() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "system": [
+            {"type": "text", "text": "Be concise."},
+            {"type": "text", "text": "Answer in English."},
         ],
-        "tools": [calculator_tool],
-        "tool_choice": {"type": "auto"}
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][0]["role"] == "system"
+    assert "Be concise." in out["messages"][0]["content"]
+    assert "Answer in English." in out["messages"][0]["content"]
+
+
+def test_convert_anthropic_to_litellm_with_tools_and_choice() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": "What is 2+2?"}],
+        "tools": [{
+            "name": "calc",
+            "description": "calculator",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        }],
+        "tool_choice": {"type": "tool", "name": "calc"},
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["tools"] == [{
+        "type": "function",
+        "function": {
+            "name": "calc",
+            "description": "calculator",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        },
+    }]
+    assert out["tool_choice"] == {"type": "function", "function": {"name": "calc"}}
+
+
+def test_convert_anthropic_to_litellm_passes_optional_sampling() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stop_sequences": ["END"],
+        "top_p": 0.9,
+        "top_k": 40,
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["stop"] == ["END"]
+    assert out["top_p"] == 0.9
+    assert out["top_k"] == 40
+
+
+def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 200,
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "calc", "input": {"q": "2+2"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "4"},
+            ]},
+        ],
+    })
+    out = srv.convert_anthropic_to_litellm(req)
+    assert out["messages"][1]["role"] == "assistant"
+    assert out["messages"][1]["tool_calls"] == [{
+        "id": "t1", "type": "function",
+        "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
+    }]
+    assert out["messages"][2] == {"role": "tool", "tool_call_id": "t1", "content": "4"}
+
+
+def test_convert_litellm_to_anthropic_text_response() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "id": "resp-1",
+        "choices": [{
+            "message": {"role": "assistant", "content": "Hello there"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 5},
     }
-}
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.id == "resp-1"
+    assert out.model == f"openai/{srv.BIG_MODEL}"
+    assert out.role == "assistant"
+    assert out.stop_reason == "end_turn"
+    assert [b.model_dump() for b in out.content] == [{"type": "text", "text": "Hello there"}]
+    assert out.usage.input_tokens == 11
+    assert out.usage.output_tokens == 5
 
-# Required event types for Anthropic streaming responses
+
+def test_convert_litellm_to_anthropic_tool_use_response() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.stop_reason == "tool_use"
+    assert len(out.content) == 1
+    block = out.content[0]
+    assert block.model_dump() == {
+        "type": "tool_use", "id": "call_1", "name": "calc", "input": {"q": "2+2"},
+    }
+
+
+def test_convert_litellm_to_anthropic_generates_id_when_missing() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.id.startswith("msg_")
+    assert out.usage.input_tokens == 0
+    assert out.usage.output_tokens == 0
+
+
+def test_convert_litellm_to_anthropic_maps_length_stop_reason() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 5,
+        "messages": [{"role": "user", "content": "Tell me a long story"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "Once upon..."}, "finish_reason": "length"}],
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.stop_reason == "max_tokens"
+
+
+def test_convert_litellm_to_anthropic_handles_empty_choices() -> None:
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {"choices": []}
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert [b.model_dump() for b in out.content] == [{"type": "text", "text": ""}]
+    assert out.stop_reason == "end_turn"
+
+
+def test_convert_litellm_to_anthropic_uses_keyword_usage_args() -> None:
+    """Regression: Usage(...) must be built with keyword args, not positional."""
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.usage.input_tokens == 4
+    assert out.usage.output_tokens == 2
+
+
+def test_convert_litellm_to_anthropic_recovers_from_broken_usage() -> None:
+    """Regression: even if usage is malformed, we still return a usable response."""
+    req = _make_request({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    })
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": "not-a-dict",
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.usage.input_tokens == 0
+    assert out.usage.output_tokens == 0
+    assert out.content[0].model_dump() == {"type": "text", "text": "ok"}
+
+
+def test_str_to_bool_truthy_values() -> None:
+    for v in ("1", "true", "TRUE", "True", "yes", "YES", "on", "On"):
+        assert srv._str_to_bool(v) is True, v
+
+
+def test_str_to_bool_falsy_values() -> None:
+    for v in ("0", "false", "False", "no", "off", "", "garbage"):
+        assert srv._str_to_bool(v) is False, v
+
+
+def test_str_to_bool_none_uses_default() -> None:
+    assert srv._str_to_bool(None) is False
+    assert srv._str_to_bool(None, default=True) is True
+
+
+def test_str_to_bool_strips_whitespace() -> None:
+    assert srv._str_to_bool("  true  ") is True
+    assert srv._str_to_bool(" false ") is False
+
+
+def test_tls_verify_wiring_matches_module_setting() -> None:
+    """OPENAI_TLS_VERIFY is read at import time and propagated to litellm."""
+    assert srv.OPENAI_TLS_VERIFY == srv.litellm.ssl_verify
+
+
 REQUIRED_EVENT_TYPES = {
-    "message_start", 
-    "content_block_start", 
-    "content_block_delta", 
-    "content_block_stop", 
-    "message_delta", 
-    "message_stop"
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
 }
 
-# ================= NON-STREAMING TESTS =================
 
-def get_response(url, headers, data):
-    """Send a request and get the response."""
-    start_time = time.time()
-    response = httpx.post(url, headers=headers, json=data, timeout=30)
-    elapsed = time.time() - start_time
-    
-    print(f"Response time: {elapsed:.2f} seconds")
-    return response
+def _check_non_streaming(payload: Dict[str, Any], *, expect_tools: bool) -> None:
+    assert payload.get("role") == "assistant", f"role={payload.get('role')!r}"
+    assert payload.get("type") == "message", f"type={payload.get('type')!r}"
+    assert payload.get("stop_reason") in {"end_turn", "max_tokens", "tool_use", "stop_sequence", None}
+    content = payload.get("content") or []
+    assert isinstance(content, list) and content, "content must be a non-empty list"
 
-def compare_responses(anthropic_response, proxy_response, check_tools=False):
-    """Compare the two responses to see if they're similar enough."""
-    anthropic_json = anthropic_response.json()
-    proxy_json = proxy_response.json()
-    
-    print("\n--- Anthropic Response Structure ---")
-    print(json.dumps({k: v for k, v in anthropic_json.items() if k != "content"}, indent=2))
-    
-    print("\n--- Proxy Response Structure ---")
-    print(json.dumps({k: v for k, v in proxy_json.items() if k != "content"}, indent=2))
-    
-    # Basic structure verification with more flexibility
-    # The proxy might map values differently, so we're more lenient in our checks
-    assert proxy_json.get("role") == "assistant", "Proxy role is not 'assistant'"
-    assert proxy_json.get("type") == "message", "Proxy type is not 'message'"
-    
-    # Check if stop_reason is reasonable (might be different between Anthropic and our proxy)
-    valid_stop_reasons = ["end_turn", "max_tokens", "stop_sequence", "tool_use", None]
-    assert proxy_json.get("stop_reason") in valid_stop_reasons, "Invalid stop reason"
-    
-    # Check content exists and has valid structure
-    assert "content" in anthropic_json, "No content in Anthropic response"
-    assert "content" in proxy_json, "No content in Proxy response"
-    
-    anthropic_content = anthropic_json["content"]
-    proxy_content = proxy_json["content"]
-    
-    # Make sure content is a list and has at least one item
-    assert isinstance(anthropic_content, list), "Anthropic content is not a list"
-    assert isinstance(proxy_content, list), "Proxy content is not a list" 
-    assert len(proxy_content) > 0, "Proxy content is empty"
-    
-    # If we're checking for tool uses
-    if check_tools:
-        # Check if content has tool use
-        anthropic_tool = None
-        proxy_tool = None
-        
-        # Find tool use in Anthropic response
-        for item in anthropic_content:
-            if item.get("type") == "tool_use":
-                anthropic_tool = item
-                break
-                
-        # Find tool use in Proxy response
-        for item in proxy_content:
-            if item.get("type") == "tool_use":
-                proxy_tool = item
-                break
-        
-        # At least one of them should have a tool use
-        if anthropic_tool is not None:
-            print("\n---------- ANTHROPIC TOOL USE ----------")
-            print(json.dumps(anthropic_tool, indent=2))
-            
-            if proxy_tool is not None:
-                print("\n---------- PROXY TOOL USE ----------")
-                print(json.dumps(proxy_tool, indent=2))
-                
-                # Check tool structure
-                assert proxy_tool.get("name") is not None, "Proxy tool has no name"
-                assert proxy_tool.get("input") is not None, "Proxy tool has no input"
-                
-                print("\n✅ Both responses contain tool use")
-            else:
-                print("\n⚠️ Proxy response does not contain tool use, but Anthropic does")
-        elif proxy_tool is not None:
-            print("\n---------- PROXY TOOL USE ----------")
-            print(json.dumps(proxy_tool, indent=2))
-            print("\n⚠️ Proxy response contains tool use, but Anthropic does not")
-        else:
-            print("\n⚠️ Neither response contains tool use")
-    
-    # Check if content has text
-    anthropic_text = None
-    proxy_text = None
-    
-    for item in anthropic_content:
-        if item.get("type") == "text":
-            anthropic_text = item.get("text")
-            break
-            
-    for item in proxy_content:
-        if item.get("type") == "text":
-            proxy_text = item.get("text")
-            break
-    
-    # For tool use responses, there might not be text content
-    if check_tools and (anthropic_text is None or proxy_text is None):
-        print("\n⚠️ One or both responses don't have text content (expected for tool-only responses)")
-        return True
-    
-    assert anthropic_text is not None, "No text found in Anthropic response"
-    assert proxy_text is not None, "No text found in Proxy response"
-    
-    # Print the first few lines of each text response
-    max_preview_lines = 5
-    anthropic_preview = "\n".join(anthropic_text.strip().split("\n")[:max_preview_lines])
-    proxy_preview = "\n".join(proxy_text.strip().split("\n")[:max_preview_lines])
-    
-    print("\n---------- ANTHROPIC TEXT PREVIEW ----------")
-    print(anthropic_preview)
-    
-    print("\n---------- PROXY TEXT PREVIEW ----------")
-    print(proxy_preview)
-    
-    # Check for some minimum text overlap - proxy might have different exact wording
-    # but should have roughly similar content
-    return True  # We're not enforcing similarity, just basic structure
+    has_tool_use = any(block.get("type") == "tool_use" for block in content)
+    has_text = any(block.get("type") == "text" for block in content)
 
-def test_request(test_name, request_data, check_tools=False):
-    """Run a test with the given request data."""
-    print(f"\n{'='*20} RUNNING TEST: {test_name} {'='*20}")
-    
-    # Log the request data
-    print(f"\nRequest data:\n{json.dumps({k: v for k, v in request_data.items() if k != 'messages'}, indent=2)}")
-    
-    # Make copies of the request data to avoid modifying the original
-    anthropic_data = request_data.copy()
-    proxy_data = request_data.copy()
-    
-    try:
-        # Send requests to both APIs
-        print("\nSending to Anthropic API...")
-        anthropic_response = get_response(ANTHROPIC_API_URL, anthropic_headers, anthropic_data)
-        
-        print("\nSending to Proxy...")
-        proxy_response = get_response(PROXY_API_URL, proxy_headers, proxy_data)
-        
-        # Check response codes
-        print(f"\nAnthropic status code: {anthropic_response.status_code}")
-        print(f"Proxy status code: {proxy_response.status_code}")
-        
-        if anthropic_response.status_code != 200 or proxy_response.status_code != 200:
-            print("\n⚠️ One or both requests failed")
-            if anthropic_response.status_code != 200:
-                print(f"Anthropic error: {anthropic_response.text}")
-            if proxy_response.status_code != 200:
-                print(f"Proxy error: {proxy_response.text}")
-            return False
-        
-        # Compare the responses
-        result = compare_responses(anthropic_response, proxy_response, check_tools=check_tools)
-        if result:
-            print(f"\n✅ Test {test_name} passed!")
-            return True
-        else:
-            print(f"\n❌ Test {test_name} failed!")
-            return False
-    
-    except Exception as e:
-        print(f"\n❌ Error in test {test_name}: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    if expect_tools:
+        assert has_tool_use, "expected a tool_use block when tools are provided"
+    else:
+        assert has_text, "expected a text block"
+
+
+async def run_non_streaming(name: str, payload: Dict[str, Any]) -> bool:
+    print(f"\n--- {name} (non-streaming) ---")
+    start = time.time()
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(PROXY_URL, headers=HEADERS, json=payload)
+    elapsed = time.time() - start
+    print(f"HTTP {response.status_code} in {elapsed:.2f}s")
+
+    if response.status_code != 200:
+        print(f"FAIL: {response.text[:300]}")
         return False
 
-# ================= STREAMING TESTS =================
+    body = response.json()
+    _check_non_streaming(body, expect_tools="tools" in payload)
+    print(f"OK  stop_reason={body.get('stop_reason')!r}, content_blocks={len(body.get('content', []))}")
+    return True
 
-class StreamStats:
-    """Track statistics about a streaming response."""
-    
-    def __init__(self):
-        self.event_types = set()
-        self.event_counts = {}
-        self.first_event_time = None
-        self.last_event_time = None
-        self.total_chunks = 0
-        self.events = []
-        self.text_content = ""
-        self.content_blocks = {}
-        self.has_tool_use = False
-        self.has_error = False
-        self.error_message = ""
-        self.text_content_by_block = {}
-        
-    def add_event(self, event_data):
-        """Track information about each received event."""
-        now = datetime.now()
-        if self.first_event_time is None:
-            self.first_event_time = now
-        self.last_event_time = now
-        
-        self.total_chunks += 1
-        
-        # Record event type and increment count
-        if "type" in event_data:
-            event_type = event_data["type"]
-            self.event_types.add(event_type)
-            self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
-            
-            # Track specific event data
-            if event_type == "content_block_start":
-                block_idx = event_data.get("index")
-                content_block = event_data.get("content_block", {})
-                if content_block.get("type") == "tool_use":
-                    self.has_tool_use = True
-                self.content_blocks[block_idx] = content_block
-                self.text_content_by_block[block_idx] = ""
-                
-            elif event_type == "content_block_delta":
-                block_idx = event_data.get("index")
-                delta = event_data.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    text = delta.get("text", "")
-                    self.text_content += text
-                    # Also track text by block ID
-                    if block_idx in self.text_content_by_block:
-                        self.text_content_by_block[block_idx] += text
-                        
-        # Keep track of all events for debugging
-        self.events.append(event_data)
-                
-    def get_duration(self):
-        """Calculate the total duration of the stream in seconds."""
-        if self.first_event_time is None or self.last_event_time is None:
-            return 0
-        return (self.last_event_time - self.first_event_time).total_seconds()
-        
-    def summarize(self):
-        """Print a summary of the stream statistics."""
-        print(f"Total chunks: {self.total_chunks}")
-        print(f"Unique event types: {sorted(list(self.event_types))}")
-        print(f"Event counts: {json.dumps(self.event_counts, indent=2)}")
-        print(f"Duration: {self.get_duration():.2f} seconds")
-        print(f"Has tool use: {self.has_tool_use}")
-        
-        # Print the first few lines of content
-        if self.text_content:
-            max_preview_lines = 5
-            text_preview = "\n".join(self.text_content.strip().split("\n")[:max_preview_lines])
-            print(f"Text preview:\n{text_preview}")
-        else:
-            print("No text content extracted")
-            
-        if self.has_error:
-            print(f"Error: {self.error_message}")
 
-async def stream_response(url, headers, data, stream_name):
-    """Send a streaming request and process the response."""
-    print(f"\nStarting {stream_name} stream...")
-    stats = StreamStats()
-    error = None
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            # Add stream flag to ensure it's streamed
-            request_data = data.copy()
-            request_data["stream"] = True
-            
-            start_time = time.time()
-            async with client.stream("POST", url, json=request_data, headers=headers, timeout=30) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    stats.has_error = True
-                    stats.error_message = f"HTTP {response.status_code}: {error_text.decode('utf-8')}"
-                    error = stats.error_message
-                    print(f"Error: {stats.error_message}")
-                    return stats, error
-                
-                print(f"{stream_name} connected, receiving events...")
-                
-                # Process each chunk
-                buffer = ""
-                async for chunk in response.aiter_text():
-                    if not chunk.strip():
-                        continue
-                    
-                    # Handle multiple events in one chunk
-                    buffer += chunk
-                    events = buffer.split("\n\n")
-                    
-                    # Process all complete events
-                    for event_text in events[:-1]:  # All but the last (possibly incomplete) event
-                        if not event_text.strip():
-                            continue
-                        
-                        # Parse server-sent event format
-                        if "data: " in event_text:
-                            # Extract the data part
-                            data_parts = []
-                            for line in event_text.split("\n"):
-                                if line.startswith("data: "):
-                                    data_part = line[len("data: "):]
-                                    # Skip the "[DONE]" marker
-                                    if data_part == "[DONE]":
-                                        break
-                                    data_parts.append(data_part)
-                            
-                            if data_parts:
-                                try:
-                                    event_data = json.loads("".join(data_parts))
-                                    stats.add_event(event_data)
-                                except json.JSONDecodeError as e:
-                                    print(f"Error parsing event: {e}\nRaw data: {''.join(data_parts)}")
-                    
-                    # Keep the last (potentially incomplete) event for the next iteration
-                    buffer = events[-1] if events else ""
-                    
-                # Process any remaining complete events in the buffer
-                if buffer.strip():
-                    lines = buffer.strip().split("\n")
-                    data_lines = [line[len("data: "):] for line in lines if line.startswith("data: ")]
-                    if data_lines and data_lines[0] != "[DONE]":
-                        try:
-                            event_data = json.loads("".join(data_lines))
-                            stats.add_event(event_data)
-                        except:
-                            pass
-                
-            elapsed = time.time() - start_time
-            print(f"{stream_name} stream completed in {elapsed:.2f} seconds")
-    except Exception as e:
-        stats.has_error = True
-        stats.error_message = str(e)
-        error = str(e)
-        print(f"Error in {stream_name} stream: {e}")
-    
-    return stats, error
+async def run_streaming(name: str, payload: Dict[str, Any]) -> bool:
+    print(f"\n--- {name} (streaming) ---")
+    payload = {**payload, "stream": True}
+    event_types: set = set()
+    text_content = ""
+    saw_tool_use = False
+    saw_done = False
 
-def compare_stream_stats(anthropic_stats, proxy_stats):
-    """Compare the statistics from the two streams to see if they're similar enough."""
-    
-    print("\n--- Stream Comparison ---")
-    
-    # Required events
-    anthropic_missing = REQUIRED_EVENT_TYPES - anthropic_stats.event_types
-    proxy_missing = REQUIRED_EVENT_TYPES - proxy_stats.event_types
-    
-    print(f"Anthropic missing event types: {anthropic_missing}")
-    print(f"Proxy missing event types: {proxy_missing}")
-    
-    # Check if proxy has the required events
-    if proxy_missing:
-        print(f"⚠️ Proxy is missing required event types: {proxy_missing}")
-    else:
-        print("✅ Proxy has all required event types")
-    
-    # Compare content
-    if anthropic_stats.text_content and proxy_stats.text_content:
-        anthropic_preview = "\n".join(anthropic_stats.text_content.strip().split("\n")[:5])
-        proxy_preview = "\n".join(proxy_stats.text_content.strip().split("\n")[:5])
-        
-        print("\n--- Anthropic Content Preview ---")
-        print(anthropic_preview)
-        
-        print("\n--- Proxy Content Preview ---")
-        print(proxy_preview)
-    
-    # Compare tool use
-    if anthropic_stats.has_tool_use and proxy_stats.has_tool_use:
-        print("✅ Both have tool use")
-    elif anthropic_stats.has_tool_use and not proxy_stats.has_tool_use:
-        print("⚠️ Anthropic has tool use but proxy does not")
-    elif not anthropic_stats.has_tool_use and proxy_stats.has_tool_use:
-        print("⚠️ Proxy has tool use but Anthropic does not")
-    
-    # Success as long as proxy has some content and no errors
-    return (not proxy_stats.has_error and 
-            len(proxy_stats.text_content) > 0 or proxy_stats.has_tool_use)
-
-async def test_streaming(test_name, request_data):
-    """Run a streaming test with the given request data."""
-    print(f"\n{'='*20} RUNNING STREAMING TEST: {test_name} {'='*20}")
-    
-    # Log the request data
-    print(f"\nRequest data:\n{json.dumps({k: v for k, v in request_data.items() if k != 'messages'}, indent=2)}")
-    
-    # Make copies of the request data to avoid modifying the original
-    anthropic_data = request_data.copy()
-    proxy_data = request_data.copy()
-    
-    if not anthropic_data.get("stream"):
-        anthropic_data["stream"] = True
-    if not proxy_data.get("stream"):
-        proxy_data["stream"] = True
-    
-    check_tools = "tools" in request_data
-    
-    try:
-        # Send streaming requests
-        anthropic_stats, anthropic_error = await stream_response(
-            ANTHROPIC_API_URL, anthropic_headers, anthropic_data, "Anthropic"
-        )
-        
-        proxy_stats, proxy_error = await stream_response(
-            PROXY_API_URL, proxy_headers, proxy_data, "Proxy"
-        )
-        
-        # Print statistics
-        print("\n--- Anthropic Stream Statistics ---")
-        anthropic_stats.summarize()
-        
-        print("\n--- Proxy Stream Statistics ---")
-        proxy_stats.summarize()
-        
-        # Compare the responses
-        if anthropic_error:
-            print(f"\n⚠️ Anthropic stream had an error: {anthropic_error}")
-            # If Anthropic errors, the test passes if proxy does anything useful
-            if not proxy_error and proxy_stats.total_chunks > 0:
-                print(f"\n✅ Test {test_name} passed! (Proxy worked even though Anthropic failed)")
-                return True
-            else:
-                print(f"\n❌ Test {test_name} failed! Both streams had errors.")
+    start = time.time()
+    async with httpx.AsyncClient(timeout=30) as client:
+        async with client.stream("POST", PROXY_URL, headers=HEADERS, json=payload) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                print(f"FAIL: HTTP {response.status_code} {body.decode('utf-8', 'replace')[:300]}")
                 return False
-        
-        if proxy_error:
-            print(f"\n❌ Test {test_name} failed! Proxy had an error: {proxy_error}")
-            return False
-        
-        result = compare_stream_stats(anthropic_stats, proxy_stats)
-        if result:
-            print(f"\n✅ Test {test_name} passed!")
-            return True
-        else:
-            print(f"\n❌ Test {test_name} failed!")
-            return False
-    
-    except Exception as e:
-        print(f"\n❌ Error in test {test_name}: {str(e)}")
-        import traceback
-        traceback.print_exc()
+
+            buffer = ""
+            async for chunk in response.aiter_text():
+                buffer += chunk
+                while "\n\n" in buffer:
+                    event, buffer = buffer.split("\n\n", 1)
+                    if not event.strip():
+                        continue
+                    data_lines = [
+                        line[len("data: "):]
+                        for line in event.splitlines()
+                        if line.startswith("data: ")
+                    ]
+                    if not data_lines:
+                        continue
+                    data_str = "".join(data_lines)
+                    if data_str == "[DONE]":
+                        saw_done = True
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    event_type = data.get("type")
+                    if event_type:
+                        event_types.add(event_type)
+                    if event_type == "content_block_delta":
+                        delta = data.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text_content += delta.get("text", "")
+                    if event_type == "content_block_start":
+                        if (data.get("content_block") or {}).get("type") == "tool_use":
+                            saw_tool_use = True
+
+    elapsed = time.time() - start
+    print(f"stream finished in {elapsed:.2f}s, events={sorted(event_types)}, text_len={len(text_content)}")
+
+    missing = REQUIRED_EVENT_TYPES - event_types
+    if missing:
+        print(f"FAIL: missing event types: {missing}")
+        return False
+    if not saw_done:
+        print("FAIL: no [DONE] sentinel")
+        return False
+    if "tools" in payload and not saw_tool_use:
+        print("FAIL: expected a tool_use block in streaming response")
+        return False
+    if "tools" not in payload and not text_content:
+        print("FAIL: expected text content in streaming response")
         return False
 
-# ================= MAIN =================
+    print("OK")
+    return True
 
-async def run_tests(args):
-    """Run all tests based on command-line arguments."""
-    # Track test results
-    results = {}
-    
-    # First run non-streaming tests
-    if not args.streaming_only:
-        print("\n\n=========== RUNNING NON-STREAMING TESTS ===========\n")
-        for test_name, test_data in TEST_SCENARIOS.items():
-            # Skip streaming tests
-            if test_data.get("stream"):
-                continue
-                
-            # Skip tool tests if requested
-            if args.simple and "tools" in test_data:
-                continue
-                
-            # Skip non-tool tests if tools_only
-            if args.tools_only and "tools" not in test_data:
-                continue
-                
-            # Run the test
-            check_tools = "tools" in test_data
-            result = test_request(test_name, test_data, check_tools=check_tools)
-            results[test_name] = result
-    
-    # Now run streaming tests
-    if not args.no_streaming:
-        print("\n\n=========== RUNNING STREAMING TESTS ===========\n")
-        for test_name, test_data in TEST_SCENARIOS.items():
-            # Only select streaming tests, or force streaming
-            if not test_data.get("stream") and not test_name.endswith("_stream"):
-                continue
-                
-            # Skip tool tests if requested
-            if args.simple and "tools" in test_data:
-                continue
-                
-            # Skip non-tool tests if tools_only
-            if args.tools_only and "tools" not in test_data:
-                continue
-                
-            # Run the streaming test
-            result = await test_streaming(test_name, test_data)
-            results[f"{test_name}_streaming"] = result
-    
-    # Print summary
-    print("\n\n=========== TEST SUMMARY ===========\n")
-    total = len(results)
-    passed = sum(1 for v in results.values() if v)
-    
-    for test, result in results.items():
-        print(f"{test}: {'✅ PASS' if result else '❌ FAIL'}")
-    
-    print(f"\nTotal: {passed}/{total} tests passed")
-    
-    if passed == total:
-        print("\n🎉 All tests passed!")
-        return True
-    else:
-        print(f"\n⚠️ {total - passed} tests failed")
-        return False
 
-async def main():
-    # Check that API key is set
-    if not ANTHROPIC_API_KEY:
-        print("Error: ANTHROPIC_API_KEY not set in .env file")
-        return
-    
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Test the Claude-on-OpenAI proxy")
-    parser.add_argument("--no-streaming", action="store_true", help="Skip streaming tests")
-    parser.add_argument("--streaming-only", action="store_true", help="Only run streaming tests")
-    parser.add_argument("--simple", action="store_true", help="Only run simple tests (no tools)")
-    parser.add_argument("--tools-only", action="store_true", help="Only run tool tests")
+async def run_one(name: str, payload: Dict[str, Any]) -> bool:
+    if payload.get("stream"):
+        return await run_streaming(name, payload)
+    return await run_non_streaming(name, payload)
+
+
+def filter_scenarios(scenarios: Dict[str, Dict[str, Any]], args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+    if args.simple:
+        return {k: v for k, v in scenarios.items() if "tools" not in v}
+    if args.tools:
+        return {k: v for k, v in scenarios.items() if "tools" in v}
+    return scenarios
+
+
+def discover_unit_tests() -> List[str]:
+    """Collect every top-level test_* function defined in this module."""
+    import inspect
+    return [name for name, _ in inspect.getmembers(sys.modules[__name__], inspect.isfunction)
+            if name.startswith("test_")]
+
+
+def run_unit_tests(names: List[str]) -> List[bool]:
+    """Invoke each test_* function; return one bool per test."""
+    results: List[bool] = []
+    for name in names:
+        try:
+            getattr(sys.modules[__name__], name)()
+            print(f"OK   {name}")
+            results.append(True)
+        except AssertionError as e:
+            print(f"FAIL {name}: {e}")
+            results.append(False)
+        except Exception as e:
+            print(f"ERROR {name}: {type(e).__name__}: {e}")
+            results.append(False)
+    return results
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser(description="Tests for the Anthropic → OpenAI proxy")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--unit", action="store_true", help="run unit tests only (default)")
+    mode.add_argument("--integration", action="store_true", help="run integration smoke tests")
+    mode.add_argument("--all", action="store_true", help="run unit + integration tests")
+    parser.add_argument("--simple", action="store_true", help="(integration) skip tool scenarios")
+    parser.add_argument("--tools", action="store_true", help="(integration) only tool scenarios")
     args = parser.parse_args()
-    
-    # Run tests
-    success = await run_tests(args)
-    sys.exit(0 if success else 1)
+
+    run_units = args.all or (not args.integration)
+    run_integration = args.all or args.integration
+
+    unit_results: List[bool] = []
+    if run_units:
+        names = discover_unit_tests()
+        print(f"--- unit tests ({len(names)}) ---")
+        unit_results = run_unit_tests(names)
+
+    integration_results: List[bool] = []
+    if run_integration:
+        scenarios = filter_scenarios(TEST_SCENARIOS, args)
+        print(f"\n--- integration tests ({len(scenarios)}) ---")
+        for name, payload in scenarios.items():
+            integration_results.append(await run_one(name, payload))
+
+    passed = sum(unit_results) + sum(integration_results)
+    total = len(unit_results) + len(integration_results)
+    print(f"\n{passed}/{total} tests passed")
+    return 0 if passed == total else 1
+
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    sys.exit(asyncio.run(main()))
