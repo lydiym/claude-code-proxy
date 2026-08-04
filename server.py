@@ -20,7 +20,7 @@ load_dotenv()
 # model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
-if os.getenv("TIKTOKEN_OFFLINE", "").lower() in ("true", "1", "yes", "on"):
+if os.getenv("TIKTOKEN_OFFLINE", "true").lower() not in ("false", "0", "no", "off"):
     # LiteLLM uses tiktoken for context-window checks. By default tiktoken
     # fetches cl100k_base.tiktoken from Azure blob storage on first use; on
     # an isolated network that DNS lookup fails on every request. Replace
