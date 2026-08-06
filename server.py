@@ -102,14 +102,27 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return out
 
 
+_PROVIDER_PREFIXES = ("anthropic/", "openai/", "gemini/")
+
+
+def _strip_provider_prefix(name: str) -> str:
+    """Strip a known provider prefix (case-insensitive) and lower-case."""
+    lower = name.lower()
+    for prefix in _PROVIDER_PREFIXES:
+        if lower.startswith(prefix):
+            return lower[len(prefix):]
+    return lower
+
+
 def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
-    """Parse a per-tier body (or [global]). Returns the cleaned dict; extra_body
-    is a sub-table; sampling fields are coerced via _coerce_sampling."""
+    """Parse a per-tier body (or [global]). Per-key type errors are warned and
+    skipped so one bad value doesn't drop the rest of the section."""
     out: Dict[str, Any] = {}
     for k, v in body.items():
         if k == "extra_body":
             if not isinstance(v, dict):
-                raise ValueError(f"[{section}].extra_body must be a table")
+                logger.warning(f"[{section}].extra_body must be a table; ignoring")
+                continue
             out[k] = v
         elif k in _ALLOWED_SAMPLING_KEYS:
             try:
@@ -126,8 +139,9 @@ def _load_config(path: str) -> Dict[str, Any]:
 
     Shape: ``{"proxy": {...}, "routing": {...}, "global": {...}, "tiers": {name: {...}}}``.
 
-    Fail-open on any error: returns empty sections and logs the problem. The
-    caller (``_proxy_value``) will then fall through to env vars.
+    Fail-open: every parse failure is logged and skipped, never raised. The
+    outer wrapper below catches only infrastructure errors (permission denied,
+    IsADirectoryError) and falls back to empty config.
     """
     out: Dict[str, Any] = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
     if not path:
@@ -143,11 +157,14 @@ def _load_config(path: str) -> Dict[str, Any]:
         return out
     for section, body in raw.items():
         if section not in _VALID_SECTIONS:
-            raise ValueError(
-                f"Unknown section [{section}] in {path}; valid: {sorted(_VALID_SECTIONS)}"
+            logger.warning(
+                f"Unknown section [{section}] in {path}; ignoring "
+                f"(valid: {sorted(_VALID_SECTIONS)})"
             )
+            continue
         if not isinstance(body, dict):
-            raise ValueError(f"[{section}] must be a table, got {type(body).__name__}")
+            logger.warning(f"[{section}] must be a table, got {type(body).__name__}; ignoring")
+            continue
         if section == "proxy":
             allowed = _PROXY_KEYS
             for k, v in body.items():
@@ -173,10 +190,12 @@ CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config.toml")
 try:
     CONFIG = _load_config(CONFIG_PATH)
 except Exception as e:
+    # Infrastructure error only — parse failures are handled inside _load_config.
     logger.error(f"Failed to load CONFIG_PATH={CONFIG_PATH!r}: {e}; using env vars only")
     CONFIG = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
 
-logger.info(
+# WARNING so the boot summary shows up before uvicorn installs its own handlers.
+logger.warning(
     f"Loaded config from {CONFIG_PATH!r}: "
     f"proxy={list(CONFIG['proxy'])}, routing={list(CONFIG['routing'])}, "
     f"global={'yes' if CONFIG['global'] else 'no'}, tiers={list(CONFIG['tiers'])}"
@@ -192,7 +211,7 @@ def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
     return env_val if env_val is not None else default
 
 
-def _proxy_bool(key: str, env_name: str, default: Any = True) -> bool:
+def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
     """Resolve a boolean config value. TOML bools pass through; env strings are
     parsed via the same truthy set as ``_str_to_bool``."""
     val = _proxy_value(key, env_name, default)
@@ -201,6 +220,12 @@ def _proxy_bool(key: str, env_name: str, default: Any = True) -> bool:
     if val is None:
         return default
     return _str_to_bool(val)
+
+
+def _get_tier_override(tier: str) -> Optional[str]:
+    """Per-request lookup of the per-tier routing override (e.g. HAIKU_MODEL).
+    Re-read on every call so hot-reload of CONFIG takes effect immediately."""
+    return _proxy_value(f"{tier}_model", f"{tier.upper()}_MODEL")
 
 
 # TIKTOKEN_OFFLINE: stub tiktoken unless explicitly disabled. Needed before
@@ -300,9 +325,6 @@ TIER_DEFAULT = {
     "opus": BIG_MODEL,
     "fable": BIG_MODEL,
     "mythos": BIG_MODEL,
-}
-TIER_OVERRIDE = {
-    tier: _proxy_value(f"{tier}_model", f"{tier.upper()}_MODEL") for tier in TIER_DEFAULT
 }
 
 # Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
@@ -448,11 +470,7 @@ class MessagesRequest(BaseModel):
         pre-rewrite name from ``original_model`` for tier matching."""
         if not self.original_model:
             return self
-        lower = self.original_model.lower()
-        for prefix in ("anthropic/", "openai/", "gemini/"):
-            if lower.startswith(prefix):
-                lower = lower[len(prefix):]
-                break
+        lower = _strip_provider_prefix(self.original_model)
         for tier in TIER_DEFAULT:  # insertion order = routing priority (haiku first)
             if tier in lower:
                 self.tier = tier
@@ -461,18 +479,13 @@ class MessagesRequest(BaseModel):
 
     @field_validator("model")
     def validate_model_field(cls, v):
-        # Clients may prefix with anthropic/, openai/, or gemini/ — strip so we match on the bare name.
-        clean_v = v
-        for prefix in ("anthropic/", "openai/", "gemini/"):
-            if clean_v.startswith(prefix):
-                clean_v = clean_v[len(prefix):]
-                break
+        # Strip any known provider prefix so we match on the bare name.
+        clean_v = _strip_provider_prefix(v)
 
-        lower = clean_v.lower()
         new_model = None
         for tier, default in TIER_DEFAULT.items():
-            if tier in lower:
-                chosen = TIER_OVERRIDE[tier] or default
+            if tier in clean_v:
+                chosen = _get_tier_override(tier) or default
                 new_model = f"openai/{chosen}"
                 break
         if new_model is None:
@@ -822,15 +835,11 @@ def sanitize_messages_for_openai(messages):
 
 
 def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
-    """Returns the effective per-tier config: tier-specific deep-merged over [global].
-
-    Unknown / un-typed models (tier is None) get only [global]. Missing [global]
-    returns an empty dict — convert_anthropic_to_litellm then leaves all
-    per-tier keys absent and the request's own values flow through unchanged.
-    """
+    """Return tier-specific config deep-merged over [global]. tier=None → just [global]."""
     base = CONFIG.get("global", {})
-    if request.tier and request.tier in CONFIG["tiers"]:
-        return _deep_merge(base, CONFIG["tiers"][request.tier])
+    tiers = CONFIG.get("tiers", {})
+    if request.tier and request.tier in tiers:
+        return _deep_merge(base, tiers[request.tier])
     return dict(base)
 
 
@@ -847,36 +856,24 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         if msg.role != "system":
             messages.extend(_convert_message(msg, result_ids, call_ids))
 
-    # Note: sampling fields below are populated from the request only. The
-    # CONFIG-driven override / fill happens in the per-tier block at the tail
-    # of this function, where model_fields_set tells us whether the client
-    # explicitly sent the field.
     litellm_request: Dict[str, Any] = {
         "model": anthropic_request.model,
         "messages": messages,
         "max_completion_tokens": min(anthropic_request.max_tokens, MAX_OUTPUT_TOKENS),
         "stream": anthropic_request.stream,
     }
-    if anthropic_request.temperature is not None:
-        litellm_request["temperature"] = anthropic_request.temperature
-    if anthropic_request.stop_sequences:
-        litellm_request["stop"] = anthropic_request.stop_sequences
-    if anthropic_request.top_p is not None:
-        litellm_request["top_p"] = anthropic_request.top_p
-    if anthropic_request.top_k is not None:
-        litellm_request["top_k"] = anthropic_request.top_k
     if anthropic_request.tools:
         litellm_request["tools"] = convert_tool_definitions(anthropic_request.tools)
     if anthropic_request.tool_choice:
         litellm_request["tool_choice"] = convert_tool_choice(anthropic_request.tool_choice)
 
-    # --- Apply per-tier CONFIG ---
+    # Per-tier CONFIG: config wins per key; request value preserved only when
+    # the client explicitly sent it (model_fields_set); otherwise omit so the
+    # upstream API uses its own default rather than MessagesRequest's Pydantic
+    # defaults like temperature=1.0.
     tier_cfg = _resolve_tier_config(anthropic_request)
     fields_set = anthropic_request.model_fields_set
 
-    # Sampling: config wins per key; if config omits the key, request value
-    # (which is already in litellm_request when set) is preserved. We drop
-    # request values that were never set so the upstream API uses its own defaults.
     for kw, attr in (
         ("temperature", "temperature"),
         ("top_p", "top_p"),
@@ -885,26 +882,24 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     ):
         if kw in tier_cfg:
             litellm_request[kw] = tier_cfg[kw]
-        elif attr not in fields_set:
-            litellm_request.pop(kw, None)
+        elif attr in fields_set:
+            value = getattr(anthropic_request, attr)
+            if kw == "stop" and not value:
+                continue
+            litellm_request[kw] = value
 
-    # max_completion_tokens: always set (Anthropic requires max_tokens), so
-    # config can only LOWER the ceiling. The MAX_OUTPUT_TOKENS clamp at the
-    # initial assignment above still applies as the absolute OpenAI cap.
+    # Anthropic always sends max_tokens, so config can only lower the ceiling;
+    # MAX_OUTPUT_TOKENS remains the absolute OpenAI cap.
     if "max_completion_tokens" in tier_cfg:
         litellm_request["max_completion_tokens"] = min(
             litellm_request["max_completion_tokens"],
             int(tier_cfg["max_completion_tokens"]),
         )
 
-    # Config-only fields (no Anthropic counterpart today).
     if "seed" in tier_cfg:
         litellm_request["seed"] = tier_cfg["seed"]
 
-    # extra_body: deep-merge. Config keys override request keys at each leaf;
-    # request keys not in config are preserved. Today the Anthropic request
-    # has no extra_body field, so existing is always {} — the deep-merge is
-    # forward-compatible for when the field is added to MessagesRequest.
+    # deep-merge: config keys win per leaf; unrelated request keys preserved.
     if tier_cfg.get("extra_body"):
         existing = litellm_request.get("extra_body", {}) or {}
         litellm_request["extra_body"] = _deep_merge(existing, tier_cfg["extra_body"])

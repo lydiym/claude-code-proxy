@@ -291,23 +291,17 @@ def test_validate_model_field_mythos_maps_to_big_model() -> None:
 
 
 def test_validate_model_field_sonnet_override_takes_precedence() -> None:
-    original = srv.TIER_OVERRIDE["sonnet"]
-    srv.TIER_OVERRIDE["sonnet"] = "custom-sonnet-model"
-    try:
+    with _patched_config('[routing]\nsonnet_model = "custom-sonnet-model"'):
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "hi"}],
         })
         assert req.model == "openai/custom-sonnet-model"
-    finally:
-        srv.TIER_OVERRIDE["sonnet"] = original
 
 
 def test_validate_model_field_opus_override_is_independent() -> None:
-    original_opus = srv.TIER_OVERRIDE["opus"]
-    srv.TIER_OVERRIDE["opus"] = "custom-opus-model"
-    try:
+    with _patched_config('[routing]\nopus_model = "custom-opus-model"'):
         opus_req = _make_request({
             "model": "claude-opus-5",
             "max_tokens": 100,
@@ -320,22 +314,16 @@ def test_validate_model_field_opus_override_is_independent() -> None:
             "messages": [{"role": "user", "content": "hi"}],
         })
         assert sonnet_req.model == f"openai/{srv.BIG_MODEL}"
-    finally:
-        srv.TIER_OVERRIDE["opus"] = original_opus
 
 
 def test_validate_model_field_haiku_override() -> None:
-    original = srv.TIER_OVERRIDE["haiku"]
-    srv.TIER_OVERRIDE["haiku"] = "custom-haiku-model"
-    try:
+    with _patched_config('[routing]\nhaiku_model = "custom-haiku-model"'):
         req = _make_request({
             "model": "claude-3-5-haiku-20241022",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "hi"}],
         })
         assert req.model == "openai/custom-haiku-model"
-    finally:
-        srv.TIER_OVERRIDE["haiku"] = original
 
 
 def test_validate_model_field_known_openai_model_gets_prefix() -> None:
@@ -1404,33 +1392,54 @@ def test_load_config_malformed_toml_returns_empty() -> None:
     assert cfg == {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
 
 
-def test_load_config_unknown_section_raises() -> None:
+def test_load_config_unknown_section_warns_and_skips() -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-        f.write("[bogus]\ntemperature = 0.5")
+        f.write('[bogus]\ntemperature = 0.5\n[sonnet]\ntemperature = 0.9\n')
         path = f.name
     try:
-        try:
-            srv._load_config(path)
-        except ValueError as e:
-            assert "Unknown section" in str(e)
-            assert "[bogus]" in str(e)
-        else:
-            raise AssertionError("expected ValueError for unknown section")
+        cfg = srv._load_config(path)
+        assert "bogus" not in cfg["tiers"]
+        assert cfg["tiers"]["sonnet"]["temperature"] == 0.9
     finally:
         os.unlink(path)
 
 
-def test_load_config_extra_body_must_be_table() -> None:
+def test_load_config_bad_extra_body_warns_and_skips() -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-        f.write("[sonnet]\nextra_body = true")
+        f.write('[sonnet]\nextra_body = true\ntemperature = 0.7\n')
         path = f.name
     try:
-        try:
-            srv._load_config(path)
-        except ValueError as e:
-            assert "extra_body must be a table" in str(e)
-        else:
-            raise AssertionError("expected ValueError for non-table extra_body")
+        cfg = srv._load_config(path)
+        assert "extra_body" not in cfg["tiers"]["sonnet"]
+        assert cfg["tiers"]["sonnet"]["temperature"] == 0.7
+    finally:
+        os.unlink(path)
+
+
+def test_load_config_partial_failure_isolates_sections() -> None:
+    """Bad section + bad extra_body + valid section: valid section survives."""
+    toml = """
+        [bogus]
+        temperature = 0.5
+
+        [sonnet]
+        extra_body = true
+        temperature = 0.7
+        seed = 42
+
+        [opus]
+        temperature = 0.3
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write(toml)
+        path = f.name
+    try:
+        cfg = srv._load_config(path)
+        assert "bogus" not in cfg["tiers"]
+        assert cfg["tiers"]["sonnet"]["temperature"] == 0.7
+        assert cfg["tiers"]["sonnet"]["seed"] == 42
+        assert "extra_body" not in cfg["tiers"]["sonnet"]
+        assert cfg["tiers"]["opus"]["temperature"] == 0.3
     finally:
         os.unlink(path)
 
