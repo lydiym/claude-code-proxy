@@ -68,6 +68,30 @@ These three knobs make the proxy work on isolated networks:
 
 `MAX_OUTPUT_TOKENS = 16384` is the OpenAI cap; `litellm_request["max_completion_tokens"]` is clamped to it.
 
+### Configuration (config.toml)
+
+The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PATH`) once at import time. Every key is optional and falls back to the equivalent env var — so `.env` is only needed for Docker overrides. The loader uses stdlib `tomllib` (Python ≥ 3.12).
+
+**Schema** (normalised to `CONFIG = {"proxy": ..., "routing": ..., "global": ..., "tiers": {...}}`):
+
+- `[proxy]` — `openai_api_key`, `openai_base_url`, `openai_tls_verify`, `tiktoken_offline`
+- `[routing]` — `big_model`, `small_model`, plus per-tier overrides (`haiku_model`, `sonnet_model`, `opus_model`, `fable_model`, `mythos_model`)
+- `[global]` — fallback per-tier settings (sampling + `extra_body`)
+- `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — tier-specific settings
+
+**Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy/routing setting. Lookup order per key: `CONFIG` → env var → built-in default.
+
+**Per-tier capture** happens in `MessagesRequest.derive_tier` (a `@model_validator(mode="after")`) which inspects `original_model`, strips any `anthropic/` / `openai/` / `gemini/` prefix, and substring-matches against `TIER_DEFAULT` (insertion-order priority: `haiku` first). Unknown models end up with `tier=None` and fall back to `[global]`.
+
+**Per-tier injection** at the tail of `convert_anthropic_to_litellm`:
+
+- Sampling fields (`temperature`, `top_p`, `top_k`, `stop`): config wins per key over the request; request value is preserved when config omits the key; field is **omitted from the upstream call** when neither sets it (no Anthropic defaults auto-applied).
+- `max_completion_tokens`: config can only **lower** the ceiling; the request value always wins when smaller than the config ceiling.
+- `seed`: config-only field (no Anthropic counterpart).
+- `extra_body`: deep-merged via `_deep_merge`. Config keys override request keys at each leaf; unrelated request keys are preserved. LiteLLM then merges this into the upstream OpenAI Chat Completions request body at top level (works for any OpenAI-compatible backend: llama-server, ollama, vLLM, llama.cpp).
+
+The discriminator between "client sent the field" and "Pydantic default applied" is `MessagesRequest.model_fields_set` (Pydantic v2) — an O(1) set lookup. `_patched_config` in `tests.py` is the patching helper for unit tests.
+
 ### Logging
 
 Logs go to stderr with a single timestamped format. `log_request` prints one line per request with colour-coded model names (ANSI when stderr is a TTY). `uvicorn.access` is silenced because we already log via `log_request`. The lifespan hook `_configure_logging` re-applies the format after uvicorn installs its own handlers.
@@ -83,9 +107,10 @@ Follow the convention: add a unit test by writing a `test_foo` function; it'll b
 
 ## Files to know
 
-- `server.py` — everything (proxy, models, translation, streaming, env config)
+- `server.py` — everything (proxy, models, translation, streaming, config loader)
 - `tests.py` — everything (unit + integration tests)
-- `pyproject.toml` / `uv.lock` — dependency manifest (FastAPI, uvicorn, pydantic, litellm, python-dotenv)
-- `.env.example` — documents every env var the proxy reads
+- `pyproject.toml` / `uv.lock` — dependency manifest (FastAPI, uvicorn, pydantic, litellm, python-dotenv); `requires-python = ">=3.12"` for stdlib `tomllib`
+- `config.toml.example` — reference for the TOML schema (copy to `config.toml` to use)
+- `.env.example` — documents every env var the proxy reads (env-var fallback per key)
 - `Dockerfile` — `python:latest` + uv; exposes port 8082
-- `README.md` — quick start and model mapping table
+- `README.md` — quick start, model mapping table, full config schema

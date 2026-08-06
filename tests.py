@@ -15,8 +15,11 @@ Usage:
 
 import argparse
 import asyncio
+import contextlib
 import json
+import os
 import sys
+import tempfile
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -431,7 +434,9 @@ def test_convert_anthropic_to_litellm_minimal_request() -> None:
     out = srv.convert_anthropic_to_litellm(req)
     assert out["model"] == f"openai/{srv.BIG_MODEL}"
     assert out["max_completion_tokens"] == 200
-    assert out["temperature"] == 1.0
+    # Sampling fields are omitted when neither the request nor CONFIG sets them —
+    # we don't auto-apply Anthropic defaults (temperature=1.0) on the way to upstream.
+    assert "temperature" not in out
     assert out["stream"] is False
     assert out["messages"] == [{"role": "user", "content": "Hello"}]
     assert "system" not in out["messages"][0]
@@ -1319,6 +1324,511 @@ async def test_streaming_emits_thinking_for_native_reasoning_content() -> None:
         and (e.get("content_block") or {}).get("type") == "thinking"
     ]
     assert len(thinking_starts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-tier CONFIG (TOML) tests
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _patched_config(toml_text: str):
+    """Write toml_text to a temp file, load it via srv._load_config, patch
+    srv.CONFIG and srv.CONFIG_PATH for the duration of the test, then restore.
+    Mirrors the try/finally patching idiom used elsewhere in this file."""
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write(toml_text)
+        path = f.name
+    original = (srv.CONFIG, srv.CONFIG_PATH)
+    srv.CONFIG = srv._load_config(path)
+    srv.CONFIG_PATH = path
+    try:
+        yield
+    finally:
+        srv.CONFIG, srv.CONFIG_PATH = original
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def _patched_empty_config():
+    """Force an empty CONFIG (no proxy/routing/global/tiers) without touching disk."""
+    original = srv.CONFIG
+    srv.CONFIG = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+    try:
+        yield
+    finally:
+        srv.CONFIG = original
+
+
+# --- Loader ---
+
+def test_load_config_happy_path() -> None:
+    with _patched_config("""
+        [proxy]
+        openai_api_key = "sk-test"
+
+        [routing]
+        big_model = "my-big"
+
+        [global]
+        temperature = 0.7
+
+        [sonnet]
+        extra_body = { cache_prompt = true }
+    """):
+        assert srv.CONFIG["proxy"]["openai_api_key"] == "sk-test"
+        assert srv.CONFIG["routing"]["big_model"] == "my-big"
+        assert srv.CONFIG["global"]["temperature"] == 0.7
+        assert srv.CONFIG["tiers"]["sonnet"]["extra_body"] == {"cache_prompt": True}
+
+
+def test_load_config_empty_path_is_noop() -> None:
+    cfg = srv._load_config("")
+    assert cfg == {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+
+
+def test_load_config_missing_file_returns_empty() -> None:
+    cfg = srv._load_config("/nonexistent/config.toml")
+    assert cfg == {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+
+
+def test_load_config_malformed_toml_returns_empty() -> None:
+    # unclosed array — must not crash; the loader fail-opens and returns empty.
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[sonnet\ntemperature = 0.5")
+        path = f.name
+    try:
+        cfg = srv._load_config(path)
+    finally:
+        os.unlink(path)
+    assert cfg == {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+
+
+def test_load_config_unknown_section_raises() -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[bogus]\ntemperature = 0.5")
+        path = f.name
+    try:
+        try:
+            srv._load_config(path)
+        except ValueError as e:
+            assert "Unknown section" in str(e)
+            assert "[bogus]" in str(e)
+        else:
+            raise AssertionError("expected ValueError for unknown section")
+    finally:
+        os.unlink(path)
+
+
+def test_load_config_extra_body_must_be_table() -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[sonnet]\nextra_body = true")
+        path = f.name
+    try:
+        try:
+            srv._load_config(path)
+        except ValueError as e:
+            assert "extra_body must be a table" in str(e)
+        else:
+            raise AssertionError("expected ValueError for non-table extra_body")
+    finally:
+        os.unlink(path)
+
+
+def test_load_config_drops_unknown_sampling_keys() -> None:
+    with _patched_config("""
+        [sonnet]
+        temperature = 0.5
+        mystery = 1
+    """):
+        assert "temperature" in srv.CONFIG["tiers"]["sonnet"]
+        assert "mystery" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_load_config_drops_bad_sampling_value() -> None:
+    with _patched_config("""
+        [sonnet]
+        temperature = "warm"
+    """):
+        # "warm" is not coercible to float — key dropped, not crashed.
+        assert "temperature" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_load_config_coerces_int_to_float_for_temperature() -> None:
+    with _patched_config("""
+        [sonnet]
+        temperature = 0
+    """):
+        assert srv.CONFIG["tiers"]["sonnet"]["temperature"] == 0.0
+        assert isinstance(srv.CONFIG["tiers"]["sonnet"]["temperature"], float)
+
+
+def test_load_config_stop_must_be_list() -> None:
+    with _patched_config("""
+        [sonnet]
+        stop = "END"
+    """):
+        # scalar stop is rejected with a warning; key dropped.
+        assert "stop" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+# --- Deep merge ---
+
+def test_deep_merge_config_wins_per_leaf() -> None:
+    merged = srv._deep_merge({"a": 1, "b": 2}, {"b": 99, "c": 3})
+    assert merged == {"a": 1, "b": 99, "c": 3}
+
+
+def test_deep_merge_recurses_into_nested_dicts() -> None:
+    base = {"extra_body": {"cache_prompt": False, "foo": 1}}
+    override = {"extra_body": {"cache_prompt": True, "bar": 2}}
+    merged = srv._deep_merge(base, override)
+    assert merged == {"extra_body": {"cache_prompt": True, "foo": 1, "bar": 2}}
+
+
+def test_deep_merge_replaces_non_dict_with_dict() -> None:
+    merged = srv._deep_merge({"a": 1}, {"a": {"x": 1}})
+    assert merged == {"a": {"x": 1}}
+
+
+def test_deep_merge_does_not_mutate_inputs() -> None:
+    base = {"a": {"b": 1}}
+    override = {"a": {"b": 2}}
+    srv._deep_merge(base, override)
+    assert base == {"a": {"b": 1}}
+    assert override == {"a": {"b": 2}}
+
+
+# --- Env-var fallback resolver ---
+
+def test_proxy_value_picks_config_over_env() -> None:
+    original_env = os.environ.pop("BIG_MODEL", None)
+    os.environ["BIG_MODEL"] = "env-model"
+    try:
+        with _patched_config('[routing]\nbig_model = "toml-model"'):
+            assert srv._proxy_value("big_model", "BIG_MODEL", "default") == "toml-model"
+    finally:
+        if original_env is not None:
+            os.environ["BIG_MODEL"] = original_env
+        else:
+            os.environ.pop("BIG_MODEL", None)
+
+
+def test_proxy_value_falls_back_to_env_when_config_missing() -> None:
+    with _patched_config(""):
+        original = os.environ.pop("BIG_MODEL", None)
+        os.environ["BIG_MODEL"] = "env-model"
+        try:
+            assert srv._proxy_value("big_model", "BIG_MODEL", "default") == "env-model"
+        finally:
+            if original is not None:
+                os.environ["BIG_MODEL"] = original
+            else:
+                os.environ.pop("BIG_MODEL", None)
+
+
+def test_proxy_value_falls_back_to_default_when_both_missing() -> None:
+    with _patched_config(""):
+        original = os.environ.pop("BIG_MODEL", None)
+        os.environ.pop("BIG_MODEL", None)
+        try:
+            assert srv._proxy_value("big_model", "BIG_MODEL", "default-model") == "default-model"
+        finally:
+            if original is not None:
+                os.environ["BIG_MODEL"] = original
+
+
+def test_proxy_bool_passes_through_toml_bool() -> None:
+    with _patched_config('[proxy]\nopenai_tls_verify = false'):
+        assert srv._proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True) is False
+
+
+# --- Tier capture ---
+
+def test_derive_tier_sets_tier_for_each_known_substring() -> None:
+    expected = {
+        "claude-3-5-haiku-20241022": "haiku",
+        "claude-3-5-sonnet-20241022": "sonnet",
+        "claude-opus-5": "opus",
+        "claude-fable-5": "fable",
+        "claude-mythos-5": "mythos",
+    }
+    for model, tier in expected.items():
+        req = _make_request({"model": model, "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert req.tier == tier, f"model={model!r} expected tier={tier!r}, got {req.tier!r}"
+
+
+def test_derive_tier_is_none_for_unknown_model() -> None:
+    req = _make_request({"model": "my-local-llama", "max_tokens": 100,
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert req.tier is None
+
+
+def test_derive_tier_strips_anthropic_prefix() -> None:
+    req = _make_request({"model": "anthropic/claude-3-5-haiku-20241022",
+                          "max_tokens": 100,
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert req.tier == "haiku"
+
+
+def test_derive_tier_strips_gemini_prefix() -> None:
+    req = _make_request({"model": "gemini/claude-3-5-sonnet-20241022",
+                          "max_tokens": 100,
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert req.tier == "sonnet"
+
+
+# --- Per-tier lookup ---
+
+def test_resolve_tier_config_prefers_tier_over_global() -> None:
+    with _patched_config("""
+        [global]
+        temperature = 0.1
+
+        [sonnet]
+        temperature = 0.9
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg["temperature"] == 0.9
+
+
+def test_resolve_tier_config_falls_back_to_global_when_tier_missing() -> None:
+    with _patched_config("""
+        [global]
+        temperature = 0.5
+    """):
+        req = _make_request({"model": "claude-3-5-haiku-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg["temperature"] == 0.5
+
+
+def test_resolve_tier_config_falls_back_to_global_when_tier_none() -> None:
+    with _patched_config("""
+        [global]
+        temperature = 0.4
+    """):
+        req = _make_request({"model": "my-local-llama",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg["temperature"] == 0.4
+
+
+def test_resolve_tier_config_deep_merges_extra_body_over_global() -> None:
+    with _patched_config("""
+        [global]
+        extra_body = { cache_prompt = true, foo = 1 }
+
+        [sonnet]
+        extra_body = { chat_template_kwargs = { enable_thinking = false }, foo = 2 }
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg["extra_body"]["cache_prompt"] is True  # from global
+        assert cfg["extra_body"]["foo"] == 2  # tier overrides global
+        assert cfg["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}  # from tier
+
+
+def test_resolve_tier_config_empty_when_nothing_loaded() -> None:
+    with _patched_empty_config():
+        req = _make_request({"model": "claude-3-5-haiku-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg == {}
+
+
+# --- Injection: sampling ---
+
+def test_convert_config_overrides_request_sampling() -> None:
+    """When both request and config set a key, config wins (per-key override)."""
+    with _patched_config("""
+        [sonnet]
+        temperature = 0.2
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}],
+                              "temperature": 0.9})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["temperature"] == 0.2
+
+
+def test_convert_request_sampling_preserved_when_config_omits_key() -> None:
+    """Request value flows through unchanged when config doesn't touch the key."""
+    with _patched_config(""):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}],
+                              "temperature": 0.42})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["temperature"] == 0.42
+
+
+def test_convert_sampling_field_omitted_when_neither_set() -> None:
+    """No defaults applied: when neither request nor config sets temperature,
+    the upstream call doesn't include it (was previously always set to 1.0)."""
+    with _patched_empty_config():
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "temperature" not in out
+        assert "top_p" not in out
+        assert "top_k" not in out
+
+
+def test_convert_clamps_max_completion_tokens_against_config() -> None:
+    """Config can only LOWER the ceiling; the request's max_tokens is honored
+    when smaller than the config ceiling."""
+    with _patched_config("""
+        [sonnet]
+        max_completion_tokens = 500
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 1000,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["max_completion_tokens"] == 500
+
+
+def test_convert_max_completion_tokens_unaffected_when_request_smaller() -> None:
+    with _patched_config("""
+        [sonnet]
+        max_completion_tokens = 5000
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 200,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["max_completion_tokens"] == 200
+
+
+def test_convert_config_only_seed_field() -> None:
+    """Config-only fields (no Anthropic counterpart) pass through."""
+    with _patched_config("""
+        [sonnet]
+        seed = 42
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["seed"] == 42
+
+
+def test_convert_global_extra_body_applies_to_unmapped_tier() -> None:
+    """[global] settings apply to requests whose model doesn't match a known tier."""
+    with _patched_config("""
+        [global]
+        extra_body = { cache_prompt = true }
+    """):
+        req = _make_request({"model": "my-local-llama",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["extra_body"] == {"cache_prompt": True}
+
+
+# --- Injection: extra_body ---
+
+def test_convert_merges_extra_body_from_config() -> None:
+    with _patched_config("""
+        [sonnet]
+        extra_body = { cache_prompt = true, n_predict = 1024 }
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["extra_body"]["cache_prompt"] is True
+        assert out["extra_body"]["n_predict"] == 1024
+
+
+def test_convert_extra_body_deep_merges_nested_dicts() -> None:
+    with _patched_config("""
+        [sonnet]
+        extra_body = { chat_template_kwargs = { enable_thinking = false }, n_predict = 256 }
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert out["extra_body"]["n_predict"] == 256
+
+
+def test_convert_global_extra_body_preserved_when_tier_section_has_no_extra_body() -> None:
+    with _patched_config("""
+        [global]
+        extra_body = { cache_prompt = true }
+
+        [sonnet]
+        temperature = 0.7
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["extra_body"] == {"cache_prompt": True}
+
+
+def test_convert_tier_extra_body_overrides_global() -> None:
+    """At the leaf level: config-tier wins over config-global."""
+    with _patched_config("""
+        [global]
+        extra_body = { cache_prompt = true }
+
+        [sonnet]
+        extra_body = { cache_prompt = false }
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["extra_body"]["cache_prompt"] is False
+
+
+# --- End-to-end: realistic llama-server config ---
+
+def test_convert_with_full_llama_server_config() -> None:
+    with _patched_config("""
+        [global]
+        extra_body = { cache_prompt = true }
+
+        [haiku]
+        temperature = 0.3
+
+        [haiku.extra_body]
+        cache_prompt = true
+        n_predict = 4096
+
+        [haiku.extra_body.chat_template_kwargs]
+        enable_thinking = false
+
+        [sonnet]
+        extra_body = { chat_template_kwargs = { enable_thinking = false } }
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022",
+                              "max_tokens": 256,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        # No temperature in request → not set (no defaults applied).
+        assert "temperature" not in out
+        # extra_body: chat_template_kwargs from tier; cache_prompt from global.
+        assert out["extra_body"]["cache_prompt"] is True
+        assert out["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+        # Anthropic required field present.
+        assert out["max_completion_tokens"] == 256
+        assert out["stream"] is False
 
 
 # ---------------------------------------------------------------------------

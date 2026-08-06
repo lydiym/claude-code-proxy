@@ -9,6 +9,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
 ### Prerequisites
 
 - An OpenAI API key, or a key for any OpenAI-compatible endpoint 🔑
+- Python ≥ 3.12 🐍
 - [uv](https://github.com/astral-sh/uv) installed
 
 ### Setup 🛠️
@@ -21,16 +22,13 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
    cd claude-code-proxy
    ```
 
-2. **Configure environment variables:**
+2. **Configure the proxy.** You have two equivalent options — pick whichever fits your workflow:
+   - **`config.toml`** (recommended): copy `config.toml.example` to `config.toml`, then edit. See [Configuration](#configuration) below for the full schema.
+   - **`.env`** (for Docker / simple setups): copy `.env.example` to `.env`, then edit. Every key in `.env` has a TOML equivalent in `[proxy]` / `[routing]`.
+
    ```bash
-   cp .env.example .env
+   cp config.toml.example config.toml   # or: cp .env.example .env
    ```
-   Then edit `.env`:
-   - `OPENAI_API_KEY`: your OpenAI (or compatible) API key
-   - `OPENAI_BASE_URL` (optional): override the endpoint, e.g. `https://api.your-provider.com/v1`
-   - `BIG_MODEL` / `SMALL_MODEL` (optional): target models for `sonnet` / `haiku` requests. Defaults: `gpt-4.1` / `gpt-4.1-mini`.
-   - `OPENAI_TLS_VERIFY` (optional): set to `false` to skip TLS certificate validation — useful when `OPENAI_BASE_URL` points at a self-signed HTTPS endpoint on your local network. Default: `true`.
-   - `TIKTOKEN_OFFLINE` (optional): stub out tiktoken and skip its network fetch of `cl100k_base.tiktoken` from Azure blob storage. Default: `true`. Set to `false` to let tiktoken fetch the real BPE file on first use (only useful if you want accurate tiktoken-based counts; the proxy reads the real counts from the upstream response's `usage` field either way).
 
 3. **Run the server:**
    ```bash
@@ -69,6 +67,89 @@ OPENAI_BASE_URL="https://api.your-provider.com/v1"
 BIG_MODEL="your-model-name"
 SMALL_MODEL="your-model-name"
 ```
+
+## Configuration ⚙️
+
+The proxy has a single TOML config file (`config.toml`, defaulting to `./config.toml` next to `server.py`) as the primary source for every setting. Env vars and `.env` work as fallback for each key — useful for Docker overrides. **You don't need `.env` if `config.toml` exists**, but you can mix both.
+
+### Schema
+
+```toml
+[proxy]
+openai_api_key     = "sk-..."                       # env: OPENAI_API_KEY
+openai_base_url    = "http://localhost:8081/v1"     # env: OPENAI_BASE_URL (optional)
+openai_tls_verify  = true                           # env: OPENAI_TLS_VERIFY
+tiktoken_offline   = true                           # env: TIKTOKEN_OFFLINE
+
+[routing]
+big_model      = "gpt-4.1"        # env: BIG_MODEL
+small_model    = "gpt-4.1-mini"   # env: SMALL_MODEL
+haiku_model    = "qwen3.5"        # env: HAIKU_MODEL   (optional)
+sonnet_model   = "qwen3.5"        # env: SONNET_MODEL  (optional)
+# opus_model / fable_model / mythos_model all optional
+
+# Per-tier settings. [global] applies to every tier that has no explicit
+# section; a tier-specific section deep-merges over [global] at each leaf.
+
+[global]
+# extra_body = { cache_prompt = true }
+
+[haiku]
+temperature = 0.3
+top_p       = 0.9
+top_k       = 40
+
+[haiku.extra_body]
+cache_prompt = true
+n_predict    = 4096
+
+[haiku.extra_body.chat_template_kwargs]
+enable_thinking = false
+
+[sonnet]
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+# temperature inherits from [global] if unset here
+```
+
+### Lookup order
+
+For each setting, the proxy uses the first non-empty value from this list:
+
+1. `config.toml` (the matching `[proxy]` / `[routing]` / `[global]` / `[tier]` section)
+2. Environment variable (e.g. `OPENAI_API_KEY`)
+3. Built-in default (e.g. `BIG_MODEL` → `gpt-4.1`)
+
+### Per-tier merge semantics
+
+- **Sampling fields** (`temperature`, `top_p`, `top_k`, `max_completion_tokens`, `stop`, `seed`): when both config and the request set the same key, **config wins** at the leaf. When neither config nor the request sets the key, it is **omitted from the upstream call** (we don't auto-apply Anthropic defaults like `temperature=1.0`).
+- **`extra_body`**: deep-merged. Config keys override request keys at each leaf; unrelated request keys are preserved. LiteLLM merges this into the upstream OpenAI Chat Completions request body at top level — pass any backend-specific knob (`cache_prompt`, `n_predict`, `chat_template_kwargs`, …).
+- **`max_completion_tokens`**: config can only **lower** the ceiling. The OpenAI-side cap (`MAX_OUTPUT_TOKENS = 16384`) remains the absolute maximum.
+
+### Targeting llama-server / ollama / vLLM
+
+These backends ignore standard OpenAI sampling params but accept a `chat_template_kwargs` knob to disable thinking-mode artefacts (critical for Qwen3.5+):
+
+```toml
+[proxy]
+openai_api_key  = "no-key"
+openai_base_url = "http://localhost:8081/v1"
+
+[routing]
+big_model   = "qwen3.5"
+small_model = "qwen3.5"
+
+[haiku]
+temperature = 0.3
+
+[haiku.extra_body]
+cache_prompt = true
+n_predict    = 4096
+
+[haiku.extra_body.chat_template_kwargs]
+enable_thinking = false
+```
+
+Inspect your upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, and the rest land in the request body.
 
 ## How It Works 🧩
 

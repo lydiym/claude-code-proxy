@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+import tomllib
 import uuid
 from dotenv import load_dotenv
 from fastapi.responses import StreamingResponse
@@ -18,7 +19,195 @@ load_dotenv()
 # model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
-if os.getenv("TIKTOKEN_OFFLINE", "true").lower() not in ("false", "0", "no", "off"):
+# basicConfig must run before the config loader uses logger.warning/error.
+# The lifespan hook re-applies the same format after uvicorn installs its own handlers.
+_LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
+_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+logging.basicConfig(
+    level=logging.WARN,
+    format=_LOG_FORMAT,
+    datefmt=_DATE_FORMAT,
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
+# ---------------------------------------------------------------------------
+
+def _str_to_bool(value, *, default=False):
+    """Parse an env-style boolean string. TOML bools pass through unchanged.
+
+    Truthy: 1/true/yes/on (case-insensitive). Anything else returns ``default``;
+    we don't raise on garbage because bad config shouldn't crash the proxy on
+    import — the caller decides what to do with the value.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Kept in sync with TIER_DEFAULT below — re-validated at the end of the file.
+_VALID_TIERS = {"haiku", "sonnet", "opus", "fable", "mythos"}
+_ALLOWED_SAMPLING_KEYS = {
+    "temperature", "top_p", "top_k",
+    "max_completion_tokens", "stop", "seed",
+}
+_PROXY_KEYS = {
+    "openai_api_key", "openai_base_url",
+    "openai_tls_verify", "tiktoken_offline",
+}
+_ROUTING_KEYS = {
+    "big_model", "small_model",
+    "haiku_model", "sonnet_model", "opus_model", "fable_model", "mythos_model",
+}
+_VALID_SECTIONS = {"proxy", "routing", "global"} | _VALID_TIERS
+
+
+def _coerce_sampling(key, value):
+    """Coerce a TOML value into the expected Python type for a sampling field.
+    Raises ValueError on bad type. TOML ints already come through as Python int,
+    floats as float, strings as str, lists as list."""
+    if key in ("temperature", "top_p"):
+        # TOML ints/floats both acceptable; bool is rejected (bool ⊂ int in Python).
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"must be a number, got {type(value).__name__}")
+        return float(value)
+    if key in ("top_k", "max_completion_tokens", "seed"):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"must be an integer, got {type(value).__name__}")
+        return int(value)
+    if key == "stop":
+        if isinstance(value, str):
+            raise ValueError("must be a list of strings, got a single string")
+        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+            raise ValueError("must be a list of strings")
+        return list(value)
+    return value  # unknown keys handled by caller
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursive dict merge: base + override, where override wins per leaf.
+
+    Used both at config-load time (tier over global) and at request time
+    (request extra_body merged with config extra_body)."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
+    """Parse a per-tier body (or [global]). Returns the cleaned dict; extra_body
+    is a sub-table; sampling fields are coerced via _coerce_sampling."""
+    out: Dict[str, Any] = {}
+    for k, v in body.items():
+        if k == "extra_body":
+            if not isinstance(v, dict):
+                raise ValueError(f"[{section}].extra_body must be a table")
+            out[k] = v
+        elif k in _ALLOWED_SAMPLING_KEYS:
+            try:
+                out[k] = _coerce_sampling(k, v)
+            except ValueError as e:
+                logger.warning(f"[{section}].{k}: {e}; ignoring")
+        else:
+            logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+    return out
+
+
+def _load_config(path: str) -> Dict[str, Any]:
+    """Parse TOML at path and return a normalised config dict.
+
+    Shape: ``{"proxy": {...}, "routing": {...}, "global": {...}, "tiers": {name: {...}}}``.
+
+    Fail-open on any error: returns empty sections and logs the problem. The
+    caller (``_proxy_value``) will then fall through to env vars.
+    """
+    out: Dict[str, Any] = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+    if not path:
+        return out
+    if not os.path.isfile(path):
+        logger.info(f"CONFIG_PATH={path!r} not found; using env vars only")
+        return out
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        logger.error(f"Malformed TOML in {path}: {e}; falling back to env vars")
+        return out
+    for section, body in raw.items():
+        if section not in _VALID_SECTIONS:
+            raise ValueError(
+                f"Unknown section [{section}] in {path}; valid: {sorted(_VALID_SECTIONS)}"
+            )
+        if not isinstance(body, dict):
+            raise ValueError(f"[{section}] must be a table, got {type(body).__name__}")
+        if section == "proxy":
+            allowed = _PROXY_KEYS
+            for k, v in body.items():
+                if k not in allowed:
+                    logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+                    continue
+                out["proxy"][k] = v
+        elif section == "routing":
+            allowed = _ROUTING_KEYS
+            for k, v in body.items():
+                if k not in allowed:
+                    logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+                    continue
+                out["routing"][k] = v
+        elif section == "global":
+            out["global"] = _parse_tier_section(body, section)
+        else:  # per-tier section
+            out["tiers"][section] = _parse_tier_section(body, section)
+    return out
+
+
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config.toml")
+try:
+    CONFIG = _load_config(CONFIG_PATH)
+except Exception as e:
+    logger.error(f"Failed to load CONFIG_PATH={CONFIG_PATH!r}: {e}; using env vars only")
+    CONFIG = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+
+logger.info(
+    f"Loaded config from {CONFIG_PATH!r}: "
+    f"proxy={list(CONFIG['proxy'])}, routing={list(CONFIG['routing'])}, "
+    f"global={'yes' if CONFIG['global'] else 'no'}, tiers={list(CONFIG['tiers'])}"
+)
+
+
+def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
+    """Resolve a config value: CONFIG[proxy|routing][key] → env var → default."""
+    section = "proxy" if key in _PROXY_KEYS else "routing"
+    if key in CONFIG[section]:
+        return CONFIG[section][key]
+    env_val = os.environ.get(env_name)
+    return env_val if env_val is not None else default
+
+
+def _proxy_bool(key: str, env_name: str, default: Any = True) -> bool:
+    """Resolve a boolean config value. TOML bools pass through; env strings are
+    parsed via the same truthy set as ``_str_to_bool``."""
+    val = _proxy_value(key, env_name, default)
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    return _str_to_bool(val)
+
+
+# TIKTOKEN_OFFLINE: stub tiktoken unless explicitly disabled. Needed before
+# litellm imports anything that pulls in tiktoken for token counting.
+TIKTOKEN_OFFLINE = _proxy_bool("tiktoken_offline", "TIKTOKEN_OFFLINE", True)
+
+if TIKTOKEN_OFFLINE:
     # Stub tiktoken: skip the Azure blob fetch of cl100k_base.tiktoken.
     # Token counts are approximate; real counts come from upstream usage.
     import tiktoken
@@ -44,18 +233,6 @@ if os.getenv("TIKTOKEN_OFFLINE", "true").lower() not in ("false", "0", "no", "of
 
 import litellm
 import uvicorn
-
-# basicConfig covers plain `import server`; the lifespan hook re-applies it
-# after uvicorn installs its own handlers.
-_LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
-_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-logging.basicConfig(
-    level=logging.WARN,
-    format=_LOG_FORMAT,
-    datefmt=_DATE_FORMAT,
-)
-logger = logging.getLogger(__name__)
 
 
 class Colors:
@@ -110,24 +287,12 @@ async def _configure_logging(app: FastAPI):
 app = FastAPI(lifespan=_configure_logging)
 
 
-def _str_to_bool(value, *, default=False):
-    """Parse an env-style boolean string.
+OPENAI_API_KEY = _proxy_value("openai_api_key", "OPENAI_API_KEY")
+OPENAI_BASE_URL = _proxy_value("openai_base_url", "OPENAI_BASE_URL")
+BIG_MODEL = _proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
+SMALL_MODEL = _proxy_value("small_model", "SMALL_MODEL", "gpt-4.1-mini")
 
-    Truthy: 1/true/yes/on (case-insensitive). Anything else returns ``default``;
-    we don't raise on garbage because bad config shouldn't crash the proxy on
-    import — the caller decides what to do with the value.
-    """
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
-BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
-
-# Per-tier default; the matching TIERNAME_MODEL env var overrides it (None = use default).
+# Per-tier default; the matching TIERNAME_MODEL config (or env var) overrides it.
 # Insertion order is the routing priority: haiku is checked first so it wins over big tiers.
 TIER_DEFAULT = {
     "haiku": SMALL_MODEL,
@@ -137,11 +302,11 @@ TIER_DEFAULT = {
     "mythos": BIG_MODEL,
 }
 TIER_OVERRIDE = {
-    tier: os.environ.get(f"{tier.upper()}_MODEL") for tier in TIER_DEFAULT
+    tier: _proxy_value(f"{tier}_model", f"{tier.upper()}_MODEL") for tier in TIER_DEFAULT
 }
 
 # Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
-OPENAI_TLS_VERIFY = _str_to_bool(os.environ.get("OPENAI_TLS_VERIFY", "true"))
+OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True)
 litellm.ssl_verify = OPENAI_TLS_VERIFY
 if not OPENAI_TLS_VERIFY:
     logger.warning("OPENAI_TLS_VERIFY=false — TLS certificate validation is disabled. Do not use this in production.")
@@ -263,6 +428,9 @@ class MessagesRequest(BaseModel):
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Dict[str, Any]] = None
     original_model: Optional[str] = None
+    # Populated by `derive_tier` (model_validator below); used by
+    # convert_anthropic_to_litellm to look up per-tier CONFIG settings.
+    tier: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -271,6 +439,25 @@ class MessagesRequest(BaseModel):
             data = dict(data)
             data["original_model"] = data["model"]
         return data
+
+    @model_validator(mode="after")
+    def derive_tier(self) -> "MessagesRequest":
+        """Identify the Anthropic tier from the original model name so per-tier
+        CONFIG sections can be applied. Runs after ``validate_model_field``
+        because that validator only rewrites ``model`` — we still want the
+        pre-rewrite name from ``original_model`` for tier matching."""
+        if not self.original_model:
+            return self
+        lower = self.original_model.lower()
+        for prefix in ("anthropic/", "openai/", "gemini/"):
+            if lower.startswith(prefix):
+                lower = lower[len(prefix):]
+                break
+        for tier in TIER_DEFAULT:  # insertion order = routing priority (haiku first)
+            if tier in lower:
+                self.tier = tier
+                return self
+        return self  # tier stays None → falls back to [global] in lookup
 
     @field_validator("model")
     def validate_model_field(cls, v):
@@ -634,6 +821,19 @@ def sanitize_messages_for_openai(messages):
             msg["content"] = "..."
 
 
+def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
+    """Returns the effective per-tier config: tier-specific deep-merged over [global].
+
+    Unknown / un-typed models (tier is None) get only [global]. Missing [global]
+    returns an empty dict — convert_anthropic_to_litellm then leaves all
+    per-tier keys absent and the request's own values flow through unchanged.
+    """
+    base = CONFIG.get("global", {})
+    if request.tier and request.tier in CONFIG["tiers"]:
+        return _deep_merge(base, CONFIG["tiers"][request.tier])
+    return dict(base)
+
+
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     call_ids, result_ids = collect_tool_ids(anthropic_request.messages)
 
@@ -647,24 +847,67 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         if msg.role != "system":
             messages.extend(_convert_message(msg, result_ids, call_ids))
 
-    litellm_request = {
+    # Note: sampling fields below are populated from the request only. The
+    # CONFIG-driven override / fill happens in the per-tier block at the tail
+    # of this function, where model_fields_set tells us whether the client
+    # explicitly sent the field.
+    litellm_request: Dict[str, Any] = {
         "model": anthropic_request.model,
         "messages": messages,
         "max_completion_tokens": min(anthropic_request.max_tokens, MAX_OUTPUT_TOKENS),
-        "temperature": anthropic_request.temperature,
         "stream": anthropic_request.stream,
     }
-
+    if anthropic_request.temperature is not None:
+        litellm_request["temperature"] = anthropic_request.temperature
     if anthropic_request.stop_sequences:
         litellm_request["stop"] = anthropic_request.stop_sequences
-    if anthropic_request.top_p:
+    if anthropic_request.top_p is not None:
         litellm_request["top_p"] = anthropic_request.top_p
-    if anthropic_request.top_k:
+    if anthropic_request.top_k is not None:
         litellm_request["top_k"] = anthropic_request.top_k
     if anthropic_request.tools:
         litellm_request["tools"] = convert_tool_definitions(anthropic_request.tools)
     if anthropic_request.tool_choice:
         litellm_request["tool_choice"] = convert_tool_choice(anthropic_request.tool_choice)
+
+    # --- Apply per-tier CONFIG ---
+    tier_cfg = _resolve_tier_config(anthropic_request)
+    fields_set = anthropic_request.model_fields_set
+
+    # Sampling: config wins per key; if config omits the key, request value
+    # (which is already in litellm_request when set) is preserved. We drop
+    # request values that were never set so the upstream API uses its own defaults.
+    for kw, attr in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("stop", "stop_sequences"),
+    ):
+        if kw in tier_cfg:
+            litellm_request[kw] = tier_cfg[kw]
+        elif attr not in fields_set:
+            litellm_request.pop(kw, None)
+
+    # max_completion_tokens: always set (Anthropic requires max_tokens), so
+    # config can only LOWER the ceiling. The MAX_OUTPUT_TOKENS clamp at the
+    # initial assignment above still applies as the absolute OpenAI cap.
+    if "max_completion_tokens" in tier_cfg:
+        litellm_request["max_completion_tokens"] = min(
+            litellm_request["max_completion_tokens"],
+            int(tier_cfg["max_completion_tokens"]),
+        )
+
+    # Config-only fields (no Anthropic counterpart today).
+    if "seed" in tier_cfg:
+        litellm_request["seed"] = tier_cfg["seed"]
+
+    # extra_body: deep-merge. Config keys override request keys at each leaf;
+    # request keys not in config are preserved. Today the Anthropic request
+    # has no extra_body field, so existing is always {} — the deep-merge is
+    # forward-compatible for when the field is added to MessagesRequest.
+    if tier_cfg.get("extra_body"):
+        existing = litellm_request.get("extra_body", {}) or {}
+        litellm_request["extra_body"] = _deep_merge(existing, tier_cfg["extra_body"])
 
     return litellm_request
 
@@ -922,15 +1165,17 @@ def _translate_parser_events(
             yield tracker.delta({"type": "text_delta", "text": value})
 
 
-def log_request(method, path, source_model, target_model, num_messages, num_tools, status_code):
+def log_request(method, path, source_model, target_model, tier, num_messages, num_tools, status_code):
     endpoint = path.split("?", 1)[0] if "?" in path else path
     status_color = Colors.GREEN if status_code == 200 else Colors.RED
+    tier_str = f" tier={_color(Colors.YELLOW, tier)}" if tier else ""
     line = (
         f"{_color(Colors.BOLD, method)} {_color(Colors.BOLD, endpoint)} "
         f"{_color(status_color, status_code)} "
         f"{_color(Colors.CYAN, short_model(source_model))} "
         f"{_color(Colors.BOLD, '→')} "
-        f"{_color(Colors.GREEN, short_model(target_model))} "
+        f"{_color(Colors.GREEN, short_model(target_model))}"
+        f"{tier_str} "
         f"({_color(Colors.MAGENTA, f'{num_tools} tools')}, "
         f"{_color(Colors.BLUE, f'{num_messages} messages')})"
     )
@@ -1079,11 +1324,18 @@ async def create_message(request: MessagesRequest):
 
         sanitize_messages_for_openai(litellm_request["messages"])
 
+        # Surface which extra_body keys landed so operators can verify
+        # backend-specific knobs (cache_prompt, chat_template_kwargs, etc.)
+        # are actually reaching the upstream.
+        if extra_body := litellm_request.get("extra_body"):
+            logger.debug(f"extra_body keys: {sorted(extra_body.keys())}")
+
         log_request(
             "POST",
             "/v1/messages",
             request.original_model or "unknown",
             litellm_request.get("model"),
+            request.tier,
             len(litellm_request["messages"]),
             len(request.tools) if request.tools else 0,
             200,
