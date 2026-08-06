@@ -414,32 +414,34 @@ def test_sanitize_messages_for_openai_keeps_allowed_keys() -> None:
 # --- Request conversion ---
 
 def test_convert_anthropic_to_litellm_minimal_request() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 200,
-        "messages": [{"role": "user", "content": "Hello"}],
-    })
-    out = srv.convert_anthropic_to_litellm(req)
-    assert out["model"] == f"openai/{srv.BIG_MODEL}"
-    assert out["max_completion_tokens"] == 200
-    # Sampling fields are omitted when neither the request nor CONFIG sets them —
-    # we don't auto-apply Anthropic defaults (temperature=1.0) on the way to upstream.
-    assert "temperature" not in out
-    assert out["stream"] is False
-    assert out["messages"] == [{"role": "user", "content": "Hello"}]
-    assert "system" not in out["messages"][0]
-    assert "tools" not in out
-    assert "tool_choice" not in out
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["model"] == f"openai/{srv.BIG_MODEL}"
+        assert out["max_completion_tokens"] == 200
+        # Sampling fields are omitted when neither the request nor CONFIG sets them —
+        # we don't auto-apply Anthropic defaults (temperature=1.0) on the way to upstream.
+        assert "temperature" not in out
+        assert out["stream"] is False
+        assert out["messages"] == [{"role": "user", "content": "Hello"}]
+        assert "system" not in out["messages"][0]
+        assert "tools" not in out
+        assert "tool_choice" not in out
 
 
 def test_convert_anthropic_to_litellm_clamps_max_tokens() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": srv.MAX_OUTPUT_TOKENS + 1000,
-        "messages": [{"role": "user", "content": "Hello"}],
-    })
-    out = srv.convert_anthropic_to_litellm(req)
-    assert out["max_completion_tokens"] == srv.MAX_OUTPUT_TOKENS
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": srv.MAX_OUTPUT_TOKENS + 1000,
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["max_completion_tokens"] == srv.MAX_OUTPUT_TOKENS
 
 
 def test_convert_anthropic_to_litellm_with_string_system() -> None:
@@ -1479,6 +1481,77 @@ def test_load_config_stop_must_be_list() -> None:
     """):
         # scalar stop is rejected with a warning; key dropped.
         assert "stop" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_load_config_rejects_nonpositive_max_completion_tokens() -> None:
+    with _patched_config("""
+        [sonnet]
+        max_completion_tokens = 0
+    """):
+        assert "max_completion_tokens" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_proxy_value_none_in_config_falls_through_to_env() -> None:
+    """Explicit None in CONFIG must not shadow env var (regression for #2)."""
+    with _patched_empty_config():
+        os.environ["OPENAI_API_KEY"] = "sk-from-env"
+        srv.CONFIG["proxy"]["openai_api_key"] = None
+        try:
+            assert srv._proxy_value("openai_api_key", "OPENAI_API_KEY") == "sk-from-env"
+        finally:
+            del os.environ["OPENAI_API_KEY"]
+
+
+def test_convert_request_explicit_none_top_p_is_dropped() -> None:
+    """Explicit top_p=null in request is in fields_set but must NOT be forwarded
+    to upstream — OpenAI-compatible backends reject null with 400."""
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        # bypass the validator to inject top_p=None into fields_set
+        object.__setattr__(req, "top_p", None)
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "top_p" not in out
+
+
+def test_convert_config_empty_stop_is_dropped() -> None:
+    """Config-side stop = [] must not flow downstream (regression for #3)."""
+    with _patched_config("""
+        [sonnet]
+        stop = []
+    """):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "stop" not in out
+
+
+def test_resolve_tier_config_does_not_share_nested_dicts() -> None:
+    """Mutating the resolved tier config's nested dicts must not corrupt CONFIG."""
+    with _patched_config("""
+        [global]
+        extra_body = { chat_template_kwargs = { enable_thinking = false } }
+    """):
+        req = _make_request({
+            "model": "claude-3-5-haiku-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        resolved = srv._resolve_tier_config(req)
+        resolved["extra_body"]["chat_template_kwargs"]["enable_thinking"] = True
+        resolved["extra_body"]["new_key"] = 1
+        # CONFIG is unchanged
+        assert (
+            srv.CONFIG["global"]["extra_body"]["chat_template_kwargs"]["enable_thinking"]
+            is False
+        )
+        assert "new_key" not in srv.CONFIG["global"]["extra_body"]
 
 
 # --- Deep merge ---

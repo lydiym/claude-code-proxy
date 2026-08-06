@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator, model_validator
@@ -78,6 +79,8 @@ def _coerce_sampling(key, value):
     if key in ("top_k", "max_completion_tokens", "seed"):
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"must be an integer, got {type(value).__name__}")
+        if key == "max_completion_tokens" and value <= 0:
+            raise ValueError(f"must be positive, got {value}")
         return int(value)
     if key == "stop":
         if isinstance(value, str):
@@ -203,10 +206,13 @@ logger.warning(
 
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
-    """Resolve a config value: CONFIG[proxy|routing][key] → env var → default."""
+    """Resolve a config value: CONFIG[proxy|routing][key] → env var → default.
+    Explicit None in CONFIG falls through to env (so a programmatic None
+    override doesn't break the lookup chain)."""
     section = "proxy" if key in _PROXY_KEYS else "routing"
-    if key in CONFIG[section]:
-        return CONFIG[section][key]
+    val = CONFIG[section].get(key)
+    if val is not None:
+        return val
     env_val = os.environ.get(env_name)
     return env_val if env_val is not None else default
 
@@ -835,12 +841,13 @@ def sanitize_messages_for_openai(messages):
 
 
 def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
-    """Return tier-specific config deep-merged over [global]. tier=None → just [global]."""
+    """Return tier-specific config deep-merged over [global]. tier=None → just [global].
+    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts."""
     base = CONFIG.get("global", {})
     tiers = CONFIG.get("tiers", {})
     if request.tier and request.tier in tiers:
-        return _deep_merge(base, tiers[request.tier])
-    return dict(base)
+        return _deep_merge(deepcopy(base), deepcopy(tiers[request.tier]))
+    return deepcopy(base)
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
@@ -880,11 +887,13 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         ("top_k", "top_k"),
         ("stop", "stop_sequences"),
     ):
-        if kw in tier_cfg:
+        if kw in tier_cfg and tier_cfg[kw]:
+            # Config-side `stop = []` is treated as absent; llama-server / ollama / vLLM
+            # reject empty stop with 400. Same for None-valued sampling fields.
             litellm_request[kw] = tier_cfg[kw]
         elif attr in fields_set:
             value = getattr(anthropic_request, attr)
-            if kw == "stop" and not value:
+            if value is None or (kw == "stop" and not value):
                 continue
             litellm_request[kw] = value
 
