@@ -37,14 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _str_to_bool(value, *, default=False):
-    """Parse an env-style boolean string. TOML bools pass through unchanged.
-
-    Truthy: 1/true/yes/on (case-insensitive). Unrecognised strings fall back to
-    ``default`` so a typo doesn't silently flip a security-sensitive setting
-    (e.g. ``OPENAI_TLS_VERIFY=garbage`` → True, not False). We don't raise on
-    garbage because bad config shouldn't crash the proxy on import — the caller
-    decides what to do with the value.
-    """
+    """Parse an env-style boolean; unrecognised strings fall back to ``default``."""
     if isinstance(value, bool):
         return value
     if value is None:
@@ -82,6 +75,13 @@ def _coerce_sampling(key, value):
         # TOML ints/floats both acceptable; bool is rejected (bool ⊂ int in Python).
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"must be a number, got {type(value).__name__}")
+        # OpenAI spec: temperature ∈ [0, 2], top_p ∈ [0, 1]. We enforce the
+        # universally-rejected bounds (negatives, top_p > 1) and leave the
+        # upper temperature bound permissive (some backends allow > 2).
+        if value < 0:
+            raise ValueError(f"must be non-negative, got {value}")
+        if key == "top_p" and value > 1:
+            raise ValueError(f"must be ≤ 1, got {value}")
         return float(value)
     if key in ("top_k", "max_completion_tokens", "seed"):
         if isinstance(value, bool) or not isinstance(value, int):
@@ -123,12 +123,21 @@ _PROVIDER_PREFIXES = ("anthropic/", "openai/", "gemini/")
 
 
 def _strip_provider_prefix(name: str) -> str:
-    """Strip a known provider prefix (case-insensitive) and lower-case."""
-    lower = name.lower()
+    """Strip a known provider prefix (case-insensitive). Bare-name case preserved."""
     for prefix in _PROVIDER_PREFIXES:
-        if lower.startswith(prefix):
-            return lower[len(prefix):]
-    return lower
+        if name.lower().startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _match_tier(name: str) -> Optional[str]:
+    """First TIER_KEYS substring that appears in the lower-cased name.
+    Returns None when no tier matches."""
+    lower = name.lower()
+    for tier in TIER_KEYS:  # insertion order = routing priority (haiku first)
+        if tier in lower:
+            return tier
+    return None
 
 
 def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
@@ -140,7 +149,7 @@ def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
             if not isinstance(v, dict):
                 logger.warning(f"[{section}].extra_body must be a table; ignoring")
                 continue
-            out[k] = v
+            out[k] = deepcopy(v)
         elif k in _ALLOWED_SAMPLING_KEYS:
             try:
                 out[k] = _coerce_sampling(k, v)
@@ -152,14 +161,7 @@ def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
 
 
 def _load_config(path: str) -> Dict[str, Any]:
-    """Parse TOML at path and return a normalised config dict.
-
-    Shape: ``{"proxy": {...}, "routing": {...}, "global": {...}, "tiers": {name: {...}}}``.
-
-    Fail-open: every parse failure is logged and skipped, never raised. The
-    outer wrapper below catches only infrastructure errors (permission denied,
-    IsADirectoryError) and falls back to empty config.
-    """
+    """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
     out: Dict[str, Any] = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
     if not path:
         return out
@@ -220,11 +222,13 @@ logger.warning(
 
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
-    """Resolve a config value: CONFIG[proxy|routing][key] → env var → default.
-    None / "" in either CONFIG or the env var fall through (so an unset or
-    empty TOML slot, or an accidentally-exported empty env var, doesn't
-    shadow a later fallback)."""
-    section = "proxy" if key in _PROXY_KEYS else "routing"
+    """CONFIG[proxy|routing][key] → env var → default. None / "" fall through."""
+    if key in _PROXY_KEYS:
+        section = "proxy"
+    elif key in _ROUTING_KEYS:
+        section = "routing"
+    else:
+        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy/routing key")
     val = CONFIG[section].get(key)
     if val not in (None, ""):
         return val
@@ -235,10 +239,7 @@ def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
 
 
 def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
-    """Resolve a boolean config value. TOML bools pass through; env strings are
-    parsed via the same truthy set as ``_str_to_bool``. Unrecognised strings
-    fall back to ``default`` rather than hardcoded False, so a typo like
-    ``OPENAI_TLS_VERIFY=garbage`` keeps TLS verification enabled."""
+    """Resolve a boolean config value; unrecognised strings keep ``default``."""
     val = _proxy_value(key, env_name, default)
     if isinstance(val, bool):
         return val
@@ -255,9 +256,12 @@ def _get_tier_override(tier: str) -> Optional[str]:
 
 
 def _default_for_tier(tier: str) -> str:
-    """Fallback model for a tier when no per-tier override is set: SMALL_MODEL
-    for haiku, BIG_MODEL for everything else."""
-    return SMALL_MODEL if tier == "haiku" else BIG_MODEL
+    """Fallback model for a tier when no per-tier override is set.
+    Re-reads per call so edits to [routing].big_model / small_model take
+    effect without restart."""
+    if tier == "haiku":
+        return _proxy_value("small_model", "SMALL_MODEL", "gpt-4.1-mini")
+    return _proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
 
 
 # TIKTOKEN_OFFLINE: stub tiktoken unless explicitly disabled. Needed before
@@ -495,39 +499,27 @@ class MessagesRequest(BaseModel):
 
     @model_validator(mode="after")
     def derive_tier(self) -> "MessagesRequest":
-        """Identify the Anthropic tier from the original model name so per-tier
-        CONFIG sections can be applied. Runs after ``validate_model_field``
-        because that validator only rewrites ``model`` — we still want the
-        pre-rewrite name from ``original_model`` for tier matching."""
-        if not self.original_model:
-            return self
-        lower = _strip_provider_prefix(self.original_model)
-        for tier in TIER_KEYS:  # insertion order = routing priority (haiku first)
-            if tier in lower:
-                self.tier = tier
-                return self
+        """Identify the Anthropic tier from the pre-rewrite original_model."""
+        if self.original_model:
+            self.tier = _match_tier(self.original_model)
         return self  # tier stays None → falls back to [global] in lookup
 
     @field_validator("model")
     def validate_model_field(cls, v):
-        # Strip any known provider prefix so we match on the bare name.
-        clean_v = _strip_provider_prefix(v)
+        clean_v = _strip_provider_prefix(v)  # case preserved
 
         new_model = None
-        for tier in TIER_KEYS:
-            if tier in clean_v:
-                chosen = _get_tier_override(tier) or _default_for_tier(tier)
-                new_model = f"openai/{chosen}"
-                break
-        if new_model is None:
-            if clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-            elif v.startswith("openai/"):
-                new_model = v
-            else:
-                # Custom endpoint: pass the bare name through with the openai/ prefix.
-                logger.debug(f"No mapping rule for model '{v}', passing through")
-                new_model = f"openai/{clean_v}"
+        if tier := _match_tier(v):
+            chosen = _get_tier_override(tier) or _default_for_tier(tier)
+            new_model = f"openai/{chosen}"
+        elif clean_v.lower() in OPENAI_MODELS and not v.lower().startswith("openai/"):
+            new_model = f"openai/{clean_v}"
+        elif v.lower().startswith("openai/"):
+            new_model = v  # already-prefixed passthrough (case-insensitive)
+        else:
+            # Custom endpoint: pass the bare name through with the openai/ prefix.
+            logger.debug(f"No mapping rule for model '{v}', passing through")
+            new_model = f"openai/{clean_v}"
 
         logger.debug(f"MODEL MAPPING: '{v}' -> '{new_model}'")
 
@@ -866,22 +858,20 @@ def sanitize_messages_for_openai(messages):
 
 
 def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
-    """Return tier-specific config deep-merged over [global]. tier=None → just [global].
+    """Tier-specific config deep-merged over [global]; tier=None → just [global].
     Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts.
-    None guards on global/tiers so a partially-patched CONFIG doesn't crash."""
+    None guards on global/tiers/tier itself so a partially-patched CONFIG doesn't crash."""
     base = CONFIG.get("global") or {}
     tiers = CONFIG.get("tiers") or {}
-    if request.tier and request.tier in tiers:
-        return _deep_merge(deepcopy(base), deepcopy(tiers[request.tier]))
+    if request.tier:
+        tier_cfg = tiers.get(request.tier)
+        if tier_cfg is not None:
+            return deepcopy(_deep_merge(base, tier_cfg))
     return deepcopy(base)
 
 
 def _is_skip_sampling(key: str, value: Any) -> bool:
-    """True when a sampling value should be treated as absent.
-    None is always skipped; ``stop`` is also skipped when it's an empty list
-    or contains an empty string — both are rejected by llama-server / ollama /
-    vLLM. Empty-string entries in a config stop list are rejected at load,
-    so the second case here only fires for in-band request values."""
+    """True when a sampling value should be treated as absent (None or empty stop)."""
     if value is None:
         return True
     if key == "stop" and isinstance(value, list) and (not value or any(s == "" for s in value)):
@@ -946,9 +936,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         litellm_request["seed"] = tier_cfg["seed"]
 
     # deep-merge: config keys win per leaf; unrelated request keys preserved.
-    if tier_cfg.get("extra_body"):
+    # isinstance guard handles runtime-patched CONFIG that bypassed the loader.
+    cfg_extra = tier_cfg.get("extra_body")
+    if isinstance(cfg_extra, dict) and cfg_extra:
         litellm_request["extra_body"] = _deep_merge(
-            litellm_request.get("extra_body", {}), tier_cfg["extra_body"]
+            litellm_request.get("extra_body", {}), cfg_extra
         )
 
     return litellm_request

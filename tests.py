@@ -1865,6 +1865,117 @@ def test_is_skip_sampling_accepts_real_values() -> None:
     assert srv._is_skip_sampling("top_p", 0) is False
 
 
+def test_resolve_tier_config_handles_none_tier_value() -> None:
+    """If CONFIG['tiers'][tier] is patched to None, must not crash on
+    ``_deep_merge(base, None)`` (regression — inner None guard added)."""
+    with _patched_empty_config():
+        srv.CONFIG["tiers"] = {"haiku": None}
+        req = _make_request({"model": "claude-3-5-haiku-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg == {}
+
+
+def test_convert_extra_body_non_dict_is_skipped() -> None:
+    """If extra_body is a non-dict (runtime patch or future bug), must not
+    crash in _deep_merge (regression — isinstance guard added)."""
+    with _patched_empty_config():
+        srv.CONFIG["tiers"] = {"haiku": {"extra_body": "not-a-dict"}}
+        req = _make_request({"model": "claude-3-5-haiku-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "extra_body" not in out
+
+
+def test_load_config_rejects_negative_temperature() -> None:
+    """temperature=-0.5 is nonsensical and would be rejected by every backend."""
+    with _patched_config("""
+        [sonnet]
+        temperature = -0.5
+    """):
+        assert "temperature" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_load_config_rejects_top_p_above_one() -> None:
+    """top_p > 1 is universally rejected (nucleus sampling)."""
+    with _patched_config("""
+        [sonnet]
+        top_p = 1.5
+    """):
+        assert "top_p" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_default_for_tier_re_reads_per_call() -> None:
+    """Edits to [routing].big_model / small_model take effect without restart."""
+    with _patched_empty_config():
+        assert srv._default_for_tier("sonnet") == srv._proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
+        srv.CONFIG["routing"]["big_model"] = "new-big"
+        assert srv._default_for_tier("sonnet") == "new-big"
+
+
+def test_validate_model_field_preserves_bare_name_case() -> None:
+    """Custom (non-OpenAI) model names must keep their original case in the
+    rewritten upstream model."""
+    req = _make_request({
+        "model": "MyModel-V1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/MyModel-V1"
+
+
+def test_validate_model_field_openai_prefix_is_case_insensitive() -> None:
+    """``OpenAI/MyModel-V1`` should pass through unchanged (any-case prefix)."""
+    req = _make_request({
+        "model": "OpenAI/MyModel-V1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "OpenAI/MyModel-V1"
+
+
+def test_validate_model_field_anthropic_prefix_preserves_case() -> None:
+    """anthropic/Claude-3-5-Sonnet should match the sonnet tier but the
+    rewritten upstream model must use the chosen BIG_MODEL (lowercased
+    because it's a known OpenAI model)."""
+    req = _make_request({
+        "model": "anthropic/Claude-3-5-Sonnet",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.tier == "sonnet"
+    assert req.model == f"openai/{srv.BIG_MODEL}"
+
+
+def test_proxy_value_raises_on_unknown_key() -> None:
+    """A typo'd key (not in _PROXY_KEYS or _ROUTING_KEYS) must raise immediately
+    instead of silently falling through to env."""
+    with _patched_empty_config():
+        raised = False
+        try:
+            srv._proxy_value("big_mdel", "BIG_MODEL", "default")
+        except ValueError as e:
+            raised = "not a recognised proxy/routing key" in str(e)
+        assert raised, "_proxy_value should raise on unknown key"
+
+
+def test_extra_body_is_deep_copied_from_raw_toml() -> None:
+    """Mutating CONFIG['tiers'][tier]['extra_body'] must not corrupt the
+    underlying tomllib dict (loader now deep-copies)."""
+    with _patched_config("""
+        [sonnet]
+        extra_body = { cache_prompt = true, n_predict = 4096 }
+    """):
+        # Mutate the loaded CONFIG nested dict.
+        srv.CONFIG["tiers"]["sonnet"]["extra_body"]["n_predict"] = 9999
+        # A fresh load returns the original TOML value, proving the source
+        # dict wasn't shared.
+        fresh = srv._load_config(srv.CONFIG_PATH)
+        assert fresh["tiers"]["sonnet"]["extra_body"]["n_predict"] == 4096
+
+
 # --- Injection: sampling ---
 
 def test_convert_config_overrides_request_sampling() -> None:
