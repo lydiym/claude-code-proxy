@@ -304,7 +304,7 @@ async def _configure_logging(app: FastAPI):
     handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     root.addHandler(handler)
 
-    logger.setLevel(logging.INFO)
+    logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
     for noisy in ("LiteLLM", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -1328,11 +1328,19 @@ async def create_message(request: MessagesRequest):
 
         sanitize_messages_for_openai(litellm_request["messages"])
 
-        # Surface which extra_body keys landed so operators can verify
-        # backend-specific knobs (cache_prompt, chat_template_kwargs, etc.)
-        # are actually reaching the upstream.
-        if extra_body := litellm_request.get("extra_body"):
-            logger.debug(f"extra_body keys: {sorted(extra_body.keys())}")
+        # Dump the effective sampling params + extra_body that will reach
+        # upstream so operators can confirm config values (or request values)
+        # are landing on the wire — including backend knobs like cache_prompt
+        # or chat_template_kwargs that don't show up in OpenAI's standard
+        # sampling fields. Honours LOG_LEVEL=DEBUG.
+        if logger.isEnabledFor(logging.DEBUG):
+            debug = {"model": litellm_request.get("model")}
+            for k in ("temperature", "top_p", "top_k", "stop", "max_completion_tokens", "seed"):
+                if k in litellm_request:
+                    debug[k] = litellm_request[k]
+            if eb := litellm_request.get("extra_body"):
+                debug["extra_body"] = eb
+            logger.debug(f"upstream params: {debug}")
 
         log_request(
             "POST",

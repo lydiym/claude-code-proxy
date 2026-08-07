@@ -149,7 +149,7 @@ n_predict    = 4096
 enable_thinking = false
 ```
 
-Inspect your upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, and the rest land in the request body.
+Inspect your upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, and the rest land in the request body. For a quick offline check, set `LOG_LEVEL=DEBUG` and the proxy logs the effective upstream body params per request (sampling fields + `extra_body`), regardless of whether they came from the request or `[tier]` config.
 
 ## How It Works 🧩
 
