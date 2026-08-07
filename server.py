@@ -39,20 +39,26 @@ logger = logging.getLogger(__name__)
 def _str_to_bool(value, *, default=False):
     """Parse an env-style boolean string. TOML bools pass through unchanged.
 
-    Truthy: 1/true/yes/on (case-insensitive). Anything else returns ``default``;
-    we don't raise on garbage because bad config shouldn't crash the proxy on
-    import — the caller decides what to do with the value.
+    Truthy: 1/true/yes/on (case-insensitive). Unrecognised strings fall back to
+    ``default`` so a typo doesn't silently flip a security-sensitive setting
+    (e.g. ``OPENAI_TLS_VERIFY=garbage`` → True, not False). We don't raise on
+    garbage because bad config shouldn't crash the proxy on import — the caller
+    decides what to do with the value.
     """
     if isinstance(value, bool):
         return value
     if value is None:
         return default
+    if str(value).strip().lower() not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        return default
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Tier names accepted as TOML section headers. Subset of TIER_DEFAULT's keys;
-# adding to one requires adding to the other.
-_VALID_TIERS = {"haiku", "sonnet", "opus", "fable", "mythos"}
+# Tier names. Insertion order is the routing priority (haiku is checked first so
+# it wins over big tiers in substring matches). Single source of truth — the
+# TOML-loader section validator and the per-request tier lookup both read this.
+TIER_KEYS = ("haiku", "sonnet", "opus", "fable", "mythos")
+_VALID_TIERS = set(TIER_KEYS)
 _ALLOWED_SAMPLING_KEYS = {
     "temperature", "top_p", "top_k",
     "max_completion_tokens", "stop", "seed",
@@ -80,14 +86,22 @@ def _coerce_sampling(key, value):
     if key in ("top_k", "max_completion_tokens", "seed"):
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"must be an integer, got {type(value).__name__}")
+        # max_completion_tokens=0 is nonsensical (asking for zero tokens);
+        # top_k=0 / seed=0 are valid sentinels some backends accept.
         if key == "max_completion_tokens" and value <= 0:
             raise ValueError(f"must be positive, got {value}")
+        if value < 0:
+            raise ValueError(f"must be non-negative, got {value}")
         return int(value)
     if key == "stop":
         if isinstance(value, str):
             raise ValueError("must be a list of strings, got a single string")
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
             raise ValueError("must be a list of strings")
+        # backends reject "" as a stop string; warn + drop so an empty entry
+        # in [tier].stop = ["foo", ""] doesn't break the upstream call.
+        if any(x == "" for x in value):
+            raise ValueError("must not contain empty strings")
         return list(value)
     return value  # unknown keys handled by caller
 
@@ -207,32 +221,43 @@ logger.warning(
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
     """Resolve a config value: CONFIG[proxy|routing][key] → env var → default.
-    None / "" in CONFIG fall through to env (so an unset or empty TOML slot
-    doesn't shadow the env-var fallback)."""
+    None / "" in either CONFIG or the env var fall through (so an unset or
+    empty TOML slot, or an accidentally-exported empty env var, doesn't
+    shadow a later fallback)."""
     section = "proxy" if key in _PROXY_KEYS else "routing"
     val = CONFIG[section].get(key)
     if val not in (None, ""):
         return val
     env_val = os.environ.get(env_name)
-    return env_val if env_val is not None else default
+    if env_val not in (None, ""):
+        return env_val
+    return default
 
 
 def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
     """Resolve a boolean config value. TOML bools pass through; env strings are
-    parsed via the same truthy set as ``_str_to_bool``."""
+    parsed via the same truthy set as ``_str_to_bool``. Unrecognised strings
+    fall back to ``default`` rather than hardcoded False, so a typo like
+    ``OPENAI_TLS_VERIFY=garbage`` keeps TLS verification enabled."""
     val = _proxy_value(key, env_name, default)
     if isinstance(val, bool):
         return val
     if val is None:
         return default
-    return _str_to_bool(val)
+    return _str_to_bool(val, default=default)
 
 
 def _get_tier_override(tier: str) -> Optional[str]:
     """Per-request lookup of the per-tier routing override (e.g. HAIKU_MODEL).
     Re-read each call so CONFIG edits to [routing] take effect without restart;
-    the BIG/SMALL fallback is captured at import (see TIER_DEFAULT)."""
+    the BIG/SMALL fallback is captured at import (see _default_for_tier)."""
     return _proxy_value(f"{tier}_model", f"{tier.upper()}_MODEL")
+
+
+def _default_for_tier(tier: str) -> str:
+    """Fallback model for a tier when no per-tier override is set: SMALL_MODEL
+    for haiku, BIG_MODEL for everything else."""
+    return SMALL_MODEL if tier == "haiku" else BIG_MODEL
 
 
 # TIKTOKEN_OFFLINE: stub tiktoken unless explicitly disabled. Needed before
@@ -330,14 +355,8 @@ BIG_MODEL = _proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = _proxy_value("small_model", "SMALL_MODEL", "gpt-4.1-mini")
 
 # Per-tier default; the matching TIERNAME_MODEL config (or env var) overrides it.
-# Insertion order is the routing priority: haiku is checked first so it wins over big tiers.
-TIER_DEFAULT = {
-    "haiku": SMALL_MODEL,
-    "sonnet": BIG_MODEL,
-    "opus": BIG_MODEL,
-    "fable": BIG_MODEL,
-    "mythos": BIG_MODEL,
-}
+# TIER_KEYS (defined near the top) is the canonical tier list; _default_for_tier
+# maps each tier to SMALL_MODEL (haiku) or BIG_MODEL (everything else).
 
 # Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
 OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True)
@@ -483,7 +502,7 @@ class MessagesRequest(BaseModel):
         if not self.original_model:
             return self
         lower = _strip_provider_prefix(self.original_model)
-        for tier in TIER_DEFAULT:  # insertion order = routing priority (haiku first)
+        for tier in TIER_KEYS:  # insertion order = routing priority (haiku first)
             if tier in lower:
                 self.tier = tier
                 return self
@@ -495,9 +514,9 @@ class MessagesRequest(BaseModel):
         clean_v = _strip_provider_prefix(v)
 
         new_model = None
-        for tier, default in TIER_DEFAULT.items():
+        for tier in TIER_KEYS:
             if tier in clean_v:
-                chosen = _get_tier_override(tier) or default
+                chosen = _get_tier_override(tier) or _default_for_tier(tier)
                 new_model = f"openai/{chosen}"
                 break
         if new_model is None:
@@ -848,12 +867,26 @@ def sanitize_messages_for_openai(messages):
 
 def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
     """Return tier-specific config deep-merged over [global]. tier=None → just [global].
-    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts."""
-    base = CONFIG.get("global", {})
-    tiers = CONFIG.get("tiers", {})
+    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts.
+    None guards on global/tiers so a partially-patched CONFIG doesn't crash."""
+    base = CONFIG.get("global") or {}
+    tiers = CONFIG.get("tiers") or {}
     if request.tier and request.tier in tiers:
         return _deep_merge(deepcopy(base), deepcopy(tiers[request.tier]))
     return deepcopy(base)
+
+
+def _is_skip_sampling(key: str, value: Any) -> bool:
+    """True when a sampling value should be treated as absent.
+    None is always skipped; ``stop`` is also skipped when it's an empty list
+    or contains an empty string — both are rejected by llama-server / ollama /
+    vLLM. Empty-string entries in a config stop list are rejected at load,
+    so the second case here only fires for in-band request values."""
+    if value is None:
+        return True
+    if key == "stop" and isinstance(value, list) and (not value or any(s == "" for s in value)):
+        return True
+    return False
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
@@ -893,14 +926,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         ("top_k", "top_k"),
         ("stop", "stop_sequences"),
     ):
-        if kw in tier_cfg and tier_cfg[kw] is not None:
-            # stop=[] is rejected by llama-server / ollama / vLLM — treat as absent.
-            if kw == "stop" and not tier_cfg[kw]:
-                continue
+        if kw in tier_cfg and not _is_skip_sampling(kw, tier_cfg[kw]):
             litellm_request[kw] = tier_cfg[kw]
         elif attr in fields_set:
             value = getattr(anthropic_request, attr)
-            if value is None or (kw == "stop" and not value):
+            if _is_skip_sampling(kw, value):
                 continue
             litellm_request[kw] = value
 
@@ -1339,7 +1369,7 @@ async def create_message(request: MessagesRequest):
         # DEBUG: dump effective upstream params (request or config source).
         if logger.isEnabledFor(logging.DEBUG):
             debug = {"model": litellm_request.get("model")}
-            for k in ("temperature", "top_p", "top_k", "stop", "max_completion_tokens", "seed"):
+            for k in _ALLOWED_SAMPLING_KEYS:
                 if k in litellm_request:
                     debug[k] = litellm_request[k]
             if eb := litellm_request.get("extra_body"):
