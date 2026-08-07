@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
+# Pre-import: tiktoken stub before `import litellm`. Resolver is standalone
+# so the main loader sits below.
 # ---------------------------------------------------------------------------
 
 def _str_to_bool(value, *, default=False):
@@ -47,6 +48,58 @@ def _str_to_bool(value, *, default=False):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_tiktoken_offline() -> bool:
+    """[proxy].tiktoken_offline from CONFIG_PATH, TIKTOKEN_OFFLINE env, then True."""
+    path = os.environ.get("CONFIG_PATH", "./config.toml")
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "rb") as f:
+                raw = tomllib.load(f)
+            cfg = raw.get("proxy", {})
+            if isinstance(cfg, dict) and "tiktoken_offline" in cfg:
+                return _str_to_bool(cfg["tiktoken_offline"], default=True)
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+    env = os.environ.get("TIKTOKEN_OFFLINE")
+    if env not in (None, ""):
+        return _str_to_bool(env, default=True)
+    return True
+
+
+TIKTOKEN_OFFLINE = _resolve_tiktoken_offline()
+
+if TIKTOKEN_OFFLINE:
+    # Stub tiktoken: skip the Azure blob fetch of cl100k_base.tiktoken.
+    # Token counts are approximate; real counts come from upstream usage.
+    import tiktoken
+
+    class _OfflineEncoding:
+        def encode(self, text, *args, **kwargs):
+            return [1] * max(1, len(text) // 4)
+
+        def encode_ordinary(self, text, *args, **kwargs):
+            return self.encode(text, *args, **kwargs)
+
+        def encode_single_token(self, token, *args, **kwargs):
+            return [1]
+
+        def decode(self, tokens, *args, **kwargs):
+            return ""
+
+        def decode_single_token_bytes(self, token):
+            return b""
+
+    tiktoken.get_encoding = lambda name: _OfflineEncoding()
+    tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
+
+import litellm
+import uvicorn
+
+
+# ---------------------------------------------------------------------------
+# Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
+# ---------------------------------------------------------------------------
+
 # Tier names. Insertion order is the routing priority (haiku is checked first so
 # it wins over big tiers in substring matches). Single source of truth — the
 # TOML-loader section validator and the per-request tier lookup both read this.
@@ -58,7 +111,7 @@ _ALLOWED_SAMPLING_KEYS = {
 }
 _PROXY_KEYS = {
     "openai_api_key", "openai_base_url",
-    "openai_tls_verify", "tiktoken_offline",
+    "openai_tls_verify",
 }
 _ROUTING_KEYS = {
     "big_model", "small_model",
@@ -262,38 +315,6 @@ def _default_for_tier(tier: str) -> str:
     if tier == "haiku":
         return _proxy_value("small_model", "SMALL_MODEL", "gpt-4.1-mini")
     return _proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
-
-
-# TIKTOKEN_OFFLINE: stub tiktoken unless explicitly disabled. Needed before
-# litellm imports anything that pulls in tiktoken for token counting.
-TIKTOKEN_OFFLINE = _proxy_bool("tiktoken_offline", "TIKTOKEN_OFFLINE", True)
-
-if TIKTOKEN_OFFLINE:
-    # Stub tiktoken: skip the Azure blob fetch of cl100k_base.tiktoken.
-    # Token counts are approximate; real counts come from upstream usage.
-    import tiktoken
-
-    class _OfflineEncoding:
-        def encode(self, text, *args, **kwargs):
-            return [1] * max(1, len(text) // 4)
-
-        def encode_ordinary(self, text, *args, **kwargs):
-            return self.encode(text, *args, **kwargs)
-
-        def encode_single_token(self, token, *args, **kwargs):
-            return [1]
-
-        def decode(self, tokens, *args, **kwargs):
-            return ""
-
-        def decode_single_token_bytes(self, token):
-            return b""
-
-    tiktoken.get_encoding = lambda name: _OfflineEncoding()
-    tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
-
-import litellm
-import uvicorn
 
 
 class Colors:

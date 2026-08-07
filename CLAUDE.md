@@ -62,7 +62,7 @@ Native `delta.reasoning_content` from the upstream is honoured before falling ba
 
 These three knobs make the proxy work on isolated networks:
 
-- `TIKTOKEN_OFFLINE` (default `true`) — stubs `tiktoken.get_encoding` and `encoding_for_model` with a fake encoding that returns 1-token-per-4-chars. Real counts come from upstream's `usage`. Set to `false` to let tiktoken fetch `cl100k_base.tiktoken` from Azure.
+- `TIKTOKEN_OFFLINE` (default `true`) — stubs `tiktoken.get_encoding` and `encoding_for_model` with a fake encoding that returns 1-token-per-4-chars. Real counts come from upstream's `usage`. Set to `false` to let tiktoken fetch `cl100k_base.tiktoken` from Azure. Resolved standalone (reads `[proxy].tiktoken_offline`, then the env var) so it can run before `import litellm`.
 - `LITELLM_LOCAL_MODEL_COST_MAP=True` — set before importing litellm so it doesn't try to refresh the model cost map from GitHub.
 - `OPENAI_TLS_VERIFY=false` — disables TLS verification for `OPENAI_BASE_URL` endpoints with self-signed certs.
 
@@ -74,7 +74,7 @@ The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PAT
 
 **Schema** (normalised to `CONFIG = {"proxy": ..., "routing": ..., "global": ..., "tiers": {...}}`):
 
-- `[proxy]` — `openai_api_key`, `openai_base_url`, `openai_tls_verify`, `tiktoken_offline`
+- `[proxy]` — `openai_api_key`, `openai_base_url`, `openai_tls_verify`. `tiktoken_offline` is parsed by the standalone resolver above (not part of the main loader schema).
 - `[routing]` — `big_model`, `small_model`, plus per-tier overrides (`haiku_model`, `sonnet_model`, `opus_model`, `fable_model`, `mythos_model`)
 - `[global]` — fallback per-tier settings (sampling + `extra_body`)
 - `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — tier-specific settings

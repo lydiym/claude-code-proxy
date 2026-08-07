@@ -1,14 +1,4 @@
-# config.toml — single source of truth for the proxy.
-# Every key is optional. Missing keys fall back to the equivalent env var
-# (OPENAI_API_KEY, OPENAI_BASE_URL, BIG_MODEL, HAIKU_MODEL, etc.) — useful for
-# Docker, where env vars override baked-in defaults at runtime.
-#
-# Lookup order per key: [proxy]/[routing] entry → env var → inline default.
-# Place this file next to server.py or point CONFIG_PATH at it.
-#
-# Note: LOG_LEVEL is env-only (no [logging] section). Set LOG_LEVEL=DEBUG to
-# dump effective upstream sampling params + extra_body per request — handy for
-# confirming cache_prompt / chat_template_kwargs / etc. reach the backend.
+# Single source of truth. Every key optional; lookup: config → env → default. LOG_LEVEL is env-only.
 
 [proxy]
 # openai_api_key    = "sk-..."                      # env: OPENAI_API_KEY
@@ -25,19 +15,9 @@
 # fable_model    = "gpt-4.1"     # env: FABLE_MODEL    (optional; defaults to big_model)
 # mythos_model   = "gpt-4.1"     # env: MYTHOS_MODEL   (optional; defaults to big_model)
 
-# --- Per-tier settings (the actual feature) ---
-# Sections: [global], [haiku], [sonnet], [opus], [fable], [mythos].
-# [global] applies to every tier that has no explicit section. A tier-specific
-# section deep-merges over [global] at each leaf — tier keys win where they
-# overlap, unrelated keys from [global] are preserved.
-#
-# Sampling fields: config value wins over the request value at the key level.
-# When neither config nor the request sets a key, it is OMITTED from the
-# upstream call (we never auto-apply Anthropic defaults like temperature=1.0).
-#
-# extra_body: passed through to LiteLLM, which merges it into the upstream
-# request body at top level. Use it for backend-specific knobs that aren't
-# standard OpenAI params: cache_prompt, n_predict, chat_template_kwargs, etc.
+# --- Per-tier settings ---
+# [global] is fallback; tier sections deep-merge over it. Config wins per leaf.
+# Sampling: config wins per key; omitted when neither sets it. extra_body → upstream backend knobs.
 
 [global]
 # extra_body = { cache_prompt = true }
