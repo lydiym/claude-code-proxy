@@ -20,8 +20,8 @@ load_dotenv()
 # model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
-# basicConfig must run before the config loader uses logger.warning/error.
-# The lifespan hook re-applies the same format after uvicorn installs its own handlers.
+# basicConfig formats import-time logs (litellm, uvicorn, _load_config).
+# _configure_logging re-applies it after uvicorn installs its handlers.
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(
