@@ -94,7 +94,11 @@ The discriminator between "client sent the field" and "Pydantic default applied"
 
 ### Logging
 
-Logs go to stderr with a single timestamped format. `log_request` prints one line per request with colour-coded model names (ANSI when stderr is a TTY). `uvicorn.access` is silenced because we already log via `log_request`. The lifespan hook `_configure_logging` re-applies the format after uvicorn installs its own handlers.
+Logs go to stderr with a single timestamped format. `log_request` prints one line per request with colour-coded model names (ANSI when stderr is a TTY). `uvicorn.access` is silenced because we already log via `log_request`. The lifespan hook `_configure_logging` re-applies the format after uvicorn installs its own handlers, and reads `LOG_LEVEL` (default `INFO`). At `DEBUG` level, the request handler dumps the effective upstream sampling params + `extra_body` (whether sourced from request or `[tier]` config) so operators can verify backend knobs without attaching mitmproxy.
+
+### Comments
+
+Comments are for non-obvious things only. Laconic, direct, concise — one line when possible. No prose explanations of what the code obviously does. No "what I changed and why" history in the diff itself (commit messages carry that).
 
 ## Tests
 
