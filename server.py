@@ -50,7 +50,8 @@ def _str_to_bool(value, *, default=False):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Kept in sync with TIER_DEFAULT below — re-validated at the end of the file.
+# Tier names accepted as TOML section headers. Subset of TIER_DEFAULT's keys;
+# adding to one requires adding to the other.
 _VALID_TIERS = {"haiku", "sonnet", "opus", "fable", "mythos"}
 _ALLOWED_SAMPLING_KEYS = {
     "temperature", "top_p", "top_k",
@@ -93,9 +94,8 @@ def _coerce_sampling(key, value):
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     """Recursive dict merge: base + override, where override wins per leaf.
-
-    Used both at config-load time (tier over global) and at request time
-    (request extra_body merged with config extra_body)."""
+    Used at request time to layer tier config over [global] and to merge
+    config extra_body into the upstream body."""
     out = dict(base)
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -207,11 +207,11 @@ logger.warning(
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
     """Resolve a config value: CONFIG[proxy|routing][key] → env var → default.
-    Explicit None in CONFIG falls through to env (so a programmatic None
-    override doesn't break the lookup chain)."""
+    None / "" in CONFIG fall through to env (so an unset or empty TOML slot
+    doesn't shadow the env-var fallback)."""
     section = "proxy" if key in _PROXY_KEYS else "routing"
     val = CONFIG[section].get(key)
-    if val is not None:
+    if val not in (None, ""):
         return val
     env_val = os.environ.get(env_name)
     return env_val if env_val is not None else default
@@ -230,7 +230,8 @@ def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
 
 def _get_tier_override(tier: str) -> Optional[str]:
     """Per-request lookup of the per-tier routing override (e.g. HAIKU_MODEL).
-    Re-read on every call so hot-reload of CONFIG takes effect immediately."""
+    Re-read each call so CONFIG edits to [routing] take effect without restart;
+    the BIG/SMALL fallback is captured at import (see TIER_DEFAULT)."""
     return _proxy_value(f"{tier}_model", f"{tier.upper()}_MODEL")
 
 
@@ -304,7 +305,12 @@ async def _configure_logging(app: FastAPI):
     handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     root.addHandler(handler)
 
-    logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+    _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+    try:
+        logger.setLevel(_LOG_LEVEL)
+    except ValueError:
+        logger.setLevel(logging.INFO)
+        logger.warning(f"Invalid LOG_LEVEL={_LOG_LEVEL!r}; falling back to INFO")
     for noisy in ("LiteLLM", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -887,9 +893,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         ("top_k", "top_k"),
         ("stop", "stop_sequences"),
     ):
-        if kw in tier_cfg and tier_cfg[kw]:
-            # Config-side `stop = []` is treated as absent; llama-server / ollama / vLLM
-            # reject empty stop with 400. Same for None-valued sampling fields.
+        if kw in tier_cfg and tier_cfg[kw] is not None:
+            # stop=[] is rejected by llama-server / ollama / vLLM — treat as absent.
+            if kw == "stop" and not tier_cfg[kw]:
+                continue
             litellm_request[kw] = tier_cfg[kw]
         elif attr in fields_set:
             value = getattr(anthropic_request, attr)
@@ -910,8 +917,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
     # deep-merge: config keys win per leaf; unrelated request keys preserved.
     if tier_cfg.get("extra_body"):
-        existing = litellm_request.get("extra_body", {}) or {}
-        litellm_request["extra_body"] = _deep_merge(existing, tier_cfg["extra_body"])
+        litellm_request["extra_body"] = _deep_merge(
+            litellm_request.get("extra_body", {}), tier_cfg["extra_body"]
+        )
 
     return litellm_request
 

@@ -1554,6 +1554,37 @@ def test_resolve_tier_config_does_not_share_nested_dicts() -> None:
         assert "new_key" not in srv.CONFIG["global"]["extra_body"]
 
 
+def test_convert_config_zero_sampling_field_is_preserved() -> None:
+    """Config-side temperature=0 / top_p=0 / top_k=0 must win (regression for #1).
+    Previous truthy check dropped 0 as 'absent'."""
+    with _patched_config("""
+        [sonnet]
+        temperature = 0
+        top_p = 0
+        top_k = 0
+    """):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["temperature"] == 0
+        assert out["top_p"] == 0
+        assert out["top_k"] == 0
+
+
+def test_proxy_value_empty_string_in_config_falls_through_to_env() -> None:
+    """Empty string from TOML must not shadow env var (regression for #3)."""
+    with _patched_empty_config():
+        os.environ["OPENAI_API_KEY"] = "sk-from-env"
+        srv.CONFIG["proxy"]["openai_api_key"] = ""
+        try:
+            assert srv._proxy_value("openai_api_key", "OPENAI_API_KEY") == "sk-from-env"
+        finally:
+            del os.environ["OPENAI_API_KEY"]
+
+
 # --- Deep merge ---
 
 def test_deep_merge_config_wins_per_leaf() -> None:
