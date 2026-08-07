@@ -1328,11 +1328,7 @@ async def create_message(request: MessagesRequest):
 
         sanitize_messages_for_openai(litellm_request["messages"])
 
-        # Dump the effective sampling params + extra_body that will reach
-        # upstream so operators can confirm config values (or request values)
-        # are landing on the wire — including backend knobs like cache_prompt
-        # or chat_template_kwargs that don't show up in OpenAI's standard
-        # sampling fields. Honours LOG_LEVEL=DEBUG.
+        # DEBUG: dump effective upstream params (request or config source).
         if logger.isEnabledFor(logging.DEBUG):
             debug = {"model": litellm_request.get("model")}
             for k in ("temperature", "top_p", "top_k", "stop", "max_completion_tokens", "seed"):
