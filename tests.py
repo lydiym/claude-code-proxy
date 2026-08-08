@@ -335,6 +335,17 @@ def test_validate_model_field_known_openai_model_gets_prefix() -> None:
     assert req.model == "openai/gpt-4.1"
 
 
+def test_validate_model_field_known_openai_model_is_lowercased() -> None:
+    """Mixed-case OpenAI model names must lowercase the upstream form — OpenAI matches case-sensitively."""
+    req = _make_request({
+        "model": "GPT-4.1",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert req.model == "openai/gpt-4.1"
+    assert req.original_model == "GPT-4.1"  # raw client input preserved
+
+
 def test_validate_model_field_existing_openai_prefix_passthrough() -> None:
     req = _make_request({
         "model": "openai/custom-model",
@@ -1206,7 +1217,12 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
 
 
 async def test_streaming_tool_call_then_text_opens_new_block() -> None:
-    """Text emitted after a tool_use must open a fresh text block (close-before-open)."""
+    """Text emitted after a tool_use must open a fresh text block (close-before-open).
+
+    Specifically: the tool_use block must stop BEFORE the new text block starts.
+    Earlier assertion only checked that SOME stop preceded SOME start, which let
+    a regression through where the tool block stayed open until the final flush.
+    """
     req = _base_request(stream=True, tools=[{
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
@@ -1222,9 +1238,19 @@ async def test_streaming_tool_call_then_text_opens_new_block() -> None:
         and (e.get("content_block") or {}).get("type") == "text"
     ]
     assert len(text_starts) == 2, f"expected two text blocks (initial + post-tool), got {len(text_starts)}"
-    # Canonical sequence: tool_use stop(0) → text start(1) → text stop(1).
-    types = [e["type"] for e in events]
-    assert types.index("content_block_stop") < types.index("content_block_start", types.index("content_block_stop") + 1)
+    # Anthropic SSE contract: tool_use stop(idx=1) must precede text start(idx=2).
+    tool_stop_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_stop" and e["index"] == 1
+    )
+    new_text_start_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_start" and e["index"] == 2
+    )
+    assert tool_stop_idx < new_text_start_idx, (
+        f"tool_use stop (event pos {tool_stop_idx}) must precede new text start "
+        f"(event pos {new_text_start_idx})"
+    )
 
 
 async def test_streaming_tool_only_no_text() -> None:
@@ -1261,7 +1287,12 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
 
 async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     """A chunk that crashes the inner pipeline must yield `event: error` so the
-    SDK raises APIStatusError instead of silently terminating the stream."""
+    SDK raises APIStatusError instead of silently terminating the stream.
+
+    Canonical finish shape: message_delta → message_stop → error → done. SDKs
+    wait for message_stop before raising APIStatusError; without it the error
+    is silently swallowed and output_tokens is reported as 0.
+    """
     req = _base_request(stream=True)
 
     async def _bad_upstream():
@@ -1288,6 +1319,40 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     assert errors[0]["error"]["type"] == "api_error"
     assert "chunk processing failed" in errors[0]["error"]["message"]
     assert events[-1] == {"type": "[DONE]"}
+    # Canonical SSE order: message_delta → message_stop → error → done.
+    msg_stop_idx = next(i for i, e in enumerate(events) if e["type"] == "message_stop")
+    error_idx = next(i for i, e in enumerate(events) if e["type"] == "error")
+    assert msg_stop_idx < error_idx, (
+        f"message_stop (pos {msg_stop_idx}) must precede error (pos {error_idx})"
+    )
+    msg_delta_idx = next(i for i, e in enumerate(events) if e["type"] == "message_delta")
+    assert msg_delta_idx < error_idx
+
+
+async def test_streaming_emits_canonical_shape_on_outer_error() -> None:
+    """A failure outside the per-chunk loop (outer except) must also emit
+    message_delta → message_stop → error → done, not just message_delta → error."""
+    req = _base_request(stream=True)
+
+    async def _bad_upstream():
+        raise RuntimeError("upstream connection died")
+        yield  # make this an async generator  # noqa: F841
+
+    raw: List[str] = []
+    async for piece in srv.handle_streaming(_bad_upstream(), req):
+        raw.append(piece)
+
+    events = _parse_sse(raw)
+    types = [e["type"] for e in events]
+    # All four canonical frames must be present and in order.
+    assert "message_delta" in types
+    assert "message_stop" in types
+    assert "error" in types
+    assert events[-1] == {"type": "[DONE]"}
+    msg_delta_idx = types.index("message_delta")
+    msg_stop_idx = types.index("message_stop")
+    error_idx = types.index("error")
+    assert msg_delta_idx < msg_stop_idx < error_idx, types
 
 
 def test_sse_formatter_error_emits_canonical_shape() -> None:
@@ -1300,6 +1365,69 @@ def test_sse_formatter_error_emits_canonical_shape() -> None:
         "type": "error",
         "error": {"type": "overloaded_error", "message": "try again later"},
     }
+
+
+# --- BlockTracker ---
+
+def test_block_tracker_close_primary_only_closes_primary() -> None:
+    """close_primary closes only the primary; tool_use blocks stay open.
+
+    The realistic scenario — </think> arriving with a tool block open under
+    the same primary — needs both blocks coexisting; we seed the tool block
+    directly because ``open_tool`` itself clears the primary."""
+    t = srv.BlockTracker()
+    t.open("thinking")
+    t._tool_blocks[0] = srv.OpenBlock(index=1, kind="tool_use")
+    events = t.close_primary()
+    assert len(events) == 1, "one stop event (for the primary)"
+    assert t._tool_blocks, "tool block preserved"
+    assert t._tool_blocks[0].kind == "tool_use"
+
+
+def test_block_tracker_delta_for_tool_drops_stale_index_silently() -> None:
+    """A delta for a tool_index with no open block must yield '' rather than
+    raising — prevents a stale resumed delta from aborting the whole stream."""
+    t = srv.BlockTracker()
+    assert t.delta_for_tool(99, {"type": "input_json_delta", "partial_json": "x"}) == ""
+
+
+def test_block_tracker_ensure_closes_open_tool_blocks() -> None:
+    """When transitioning to a text primary, ensure() must emit stops for
+    any tool_use blocks still open — Anthropic SSE stop-before-start contract."""
+    t = srv.BlockTracker()
+    t.open("text")
+    _, _ = t.open_tool(0)
+    _, _ = t.open_tool(1)
+    events = t.ensure("text")
+    # Two tool stops, no primary stop (primary was already cleared by open_tool).
+    assert len(events) == 2
+    assert all('"type": "content_block_stop"' in e for e in events)
+    assert t._tool_blocks == {}, "tool blocks cleared by ensure"
+
+
+async def test_handle_streaming_reopens_reused_tool_index_after_close() -> None:
+    """Re-using a tool_index after close_all_tools must re-open cleanly.
+
+    Regression for the stale ``open_tool_indices`` set: a tool→text→same-tool
+    sequence should re-open the tool block, not skip it. With the old set-based
+    guard, the reused index short-circuited and downstream deltas raised.
+    """
+    req = _base_request(stream=True, tools=[{
+        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
+    }])
+    chunks = [
+        _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"a":1}'),
+        _text_chunk("between"),  # text delta → ensure("text") closes the tool
+        _tool_delta_chunk(0, id="call_2", name="calc", arguments='{"b":2}'),
+        _finish_chunk("tool_calls"),
+    ]
+    events = await _run_stream(chunks, req)
+    tool_starts = [
+        e for e in events
+        if e["type"] == "content_block_start"
+        and (e.get("content_block") or {}).get("type") == "tool_use"
+    ]
+    assert len(tool_starts) == 2, f"expected 2 tool_use blocks, got {len(tool_starts)}"
 
 
 async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
