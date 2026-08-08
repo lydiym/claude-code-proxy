@@ -881,11 +881,14 @@ def convert_tool_definitions(tools):
 
 
 def convert_tool_choice(choice):
+    # OpenAI Chat Completions accepts: "none" | "auto" | "required" | specific fn.
+    # Anthropic "any" forces the model to call a tool → OpenAI "required".
+    # Anthropic "none" forbids tool use → OpenAI "none".
     choice_type = get_field(choice, "type")
-    if choice_type == "auto":
-        return "auto"
+    if choice_type == "none":
+        return "none"
     if choice_type == "any":
-        return "any"
+        return "required"
     if choice_type == "tool":
         name = get_field(choice, "name")
         if name:
@@ -1274,7 +1277,7 @@ def log_request(method, path, source_model, target_model, tier, num_messages, nu
 async def handle_streaming(response_generator, original_request: MessagesRequest):
     tracker = BlockTracker()
     think_parser = ThinkStreamParser()
-    tool_index: Optional[int] = None
+    open_tool_indices: set[int] = set()  # indices with an open tool_use block
     input_tokens = 0
     output_tokens = 0
     has_sent_stop_reason = False
@@ -1322,7 +1325,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 finish_reason = get_field(choice, "finish_reason")
 
                 # litellm exposes native reasoning as delta.reasoning_content on some providers;
-                # honour it before falling back to `` parsing.
+                # honour it before falling back to think-tag parsing.
                 delta_reasoning = get_field(delta, "reasoning_content")
 
                 delta_content = get_field(delta, "content")
@@ -1344,23 +1347,21 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     delta_tool_calls = delta["tool_calls"]
 
                 if delta_tool_calls:
-                    if tool_index is None:
-                        for event in tracker.close():
-                            yield event
                     if not isinstance(delta_tool_calls, list):
                         delta_tool_calls = [delta_tool_calls]
 
                     for tool_call in delta_tool_calls:
                         current_index = get_field(tool_call, "index", 0)
 
-                        if tool_index is None or current_index != tool_index:
-                            # Anthropic SSE requires content_block_stop(N) before
-                            # content_block_start(N+1); close the prior tool block
-                            # when a parallel call arrives in the same delta.
-                            if tool_index is not None:
+                        if current_index not in open_tool_indices:
+                            # New tool call: always close whatever's open so
+                            # we emit content_block_stop before the new start.
+                            # Tracks the index so continuation args (same index,
+                            # no id) don't open a spurious block.
+                            if tracker.is_open():
                                 for event in tracker.close():
                                     yield event
-                            tool_index = current_index
+                            open_tool_indices.add(current_index)
                             function = get_field(tool_call, "function", {}) or {}
                             name = get_field(function, "name", "")
                             tool_id = get_field(tool_call, "id") or new_tool_id()

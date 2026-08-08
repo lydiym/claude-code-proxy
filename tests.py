@@ -677,7 +677,8 @@ def test_tool_use_and_tool_result_ordering() -> None:
         assert roles == ["user", "assistant", "tool", "user"], f"got {roles}"
 
 
-def test_tool_choice_any_passes_through() -> None:
+def test_tool_choice_any_maps_to_required() -> None:
+    """Anthropic 'any' forces the model to call a tool; OpenAI equivalent is 'required'."""
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -687,7 +688,21 @@ def test_tool_choice_any_passes_through() -> None:
             "tool_choice": {"type": "any"},
         })
         out = srv.convert_anthropic_to_litellm(req)
-        assert out["tool_choice"] == "any"
+        assert out["tool_choice"] == "required"
+
+
+def test_tool_choice_none_forbids_tools() -> None:
+    """Anthropic 'none' must not silently become 'auto'."""
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["tool_choice"] == "none"
 
 
 def test_tool_choice_unknown_type_falls_back_to_auto() -> None:
@@ -1323,6 +1338,53 @@ async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
         if e["type"] == "content_block_stop" and e["index"] == 0
     )
     assert first_tool_stop_idx < second_tool_start_idx
+
+
+async def test_streaming_parallel_new_calls_in_one_chunk_open_distinct_blocks() -> None:
+    """Two parallel tool_calls in the same delta must each open a fresh
+    content_block_start with a distinct SSE index. Regression: tracking only
+    the last-opened index used to overwrite the first block without emitting
+    its content_block_stop, producing a single confused block."""
+    req = _base_request(stream=True, tools=[{
+        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
+    }])
+    chunks = [
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "type": "function",
+             "function": {"name": "calc", "arguments": '{"a":1}'}},
+            {"index": 1, "id": "call_2", "type": "function",
+             "function": {"name": "calc", "arguments": '{"b":2}'}},
+        ]}}]},
+        _finish_chunk("tool_calls"),
+    ]
+    events = await _run_stream(chunks, req)
+    tool_starts = [
+        e for e in events
+        if e["type"] == "content_block_start"
+        and (e.get("content_block") or {}).get("type") == "tool_use"
+    ]
+    assert len(tool_starts) == 2, f"expected exactly 2 tool_use blocks, got {len(tool_starts)}"
+    indices = {t["index"] for t in tool_starts}
+    assert len(indices) == 2, f"tool blocks must have distinct SSE indices, got {indices}"
+    # First tool block's stop must precede second block's start (Anthropic SSE).
+    first_start_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_start"
+        and (e.get("content_block") or {}).get("type") == "tool_use"
+        and e["index"] == tool_starts[0]["index"]
+    )
+    second_start_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_start"
+        and (e.get("content_block") or {}).get("type") == "tool_use"
+        and e["index"] == tool_starts[1]["index"]
+    )
+    first_stop_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_stop" and e["index"] == tool_starts[0]["index"]
+    )
+    assert first_stop_idx < second_start_idx, \
+        "first tool_use block must stop before second starts"
 
 
 async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
