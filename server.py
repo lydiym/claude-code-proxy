@@ -147,8 +147,11 @@ def _coerce_sampling(key, value):
             raise ValueError(f"must be non-negative, got {value}")
         return int(value)
     if key == "stop":
+        # OpenAI spec: string or list of strings (≤4). Wrap a bare string.
         if isinstance(value, str):
-            raise ValueError("must be a list of strings, got a single string")
+            if value == "":
+                raise ValueError("must not be empty")
+            return [value]
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
             raise ValueError("must be a list of strings")
         # backends reject "" as a stop string; warn + drop so an empty entry
@@ -213,6 +216,23 @@ def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
     return out
 
 
+_COERCE_DROP = object()  # sentinel: coercion failed, key should be dropped
+_BOOL_TLS_VERIFY = {"openai_tls_verify"}
+
+
+def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
+    """Coerce a [proxy] / [routing] TOML value to the expected Python type.
+    Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped."""
+    if isinstance(value, str):
+        return value  # strings are the canonical type for api_key, base_url, model names
+    if key in _BOOL_TLS_VERIFY and isinstance(value, bool):
+        return value
+    if key in _BOOL_TLS_VERIFY and isinstance(value, int) and not isinstance(value, bool):
+        return bool(value)
+    logger.warning(f"[{section}].{key}={value!r} has wrong type ({type(value).__name__}); ignoring")
+    return _COERCE_DROP
+
+
 def _load_config(path: str) -> Dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
     out: Dict[str, Any] = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
@@ -243,14 +263,20 @@ def _load_config(path: str) -> Dict[str, Any]:
                 if k not in allowed:
                     logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
                     continue
-                out["proxy"][k] = v
+                coerced = _coerce_proxy_value(k, v, section)
+                if coerced is _COERCE_DROP:
+                    continue
+                out["proxy"][k] = coerced
         elif section == "routing":
             allowed = _ROUTING_KEYS
             for k, v in body.items():
                 if k not in allowed:
                     logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
                     continue
-                out["routing"][k] = v
+                coerced = _coerce_proxy_value(k, v, section)
+                if coerced is _COERCE_DROP:
+                    continue
+                out["routing"][k] = coerced
         elif section == "global":
             out["global"] = _parse_tier_section(body, section)
         else:  # per-tier section
@@ -925,9 +951,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         litellm_request["tool_choice"] = convert_tool_choice(anthropic_request.tool_choice)
 
     # Per-tier CONFIG: config wins per key; request value preserved only when
-    # the client explicitly sent it (model_fields_set); otherwise omit so the
-    # upstream API uses its own default rather than MessagesRequest's Pydantic
-    # defaults like temperature=1.0.
+    # the client explicitly sent a non-null value (Pydantic v2 includes
+    # explicit-null in model_fields_set, so _is_skip_sampling drops those to
+    # keep the wire form "unset" → upstream uses its own default rather than
+    # MessagesRequest's Pydantic defaults like temperature=1.0).
     tier_cfg = _resolve_tier_config(anthropic_request)
     fields_set = anthropic_request.model_fields_set
 
@@ -1084,9 +1111,8 @@ class BlockTracker:
     The state machine is caller-driven: ``ensure(kind)`` closes any
     different-kind block that is open, then ``open(kind)`` allocates a fresh
     index. ``open()`` is unconditional and overwrites the prior block — callers
-    that need close-before-open behaviour must call ``ensure()`` first. The
-    tool_use path relies on this so consecutive parallel tool calls each get
-    their own index without an intermediate ``content_block_stop``.
+    that need close-before-open behaviour must call ``ensure()`` first, or call
+    ``close()`` explicitly when emitting consecutive parallel tool blocks.
     """
 
     def __init__(self) -> None:
@@ -1299,7 +1325,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     for event in _emit_thinking(tracker, delta_reasoning):
                         yield event
 
-                if delta_content and tool_index is None:
+                # Text after a tool_use closes the tool block first; track
+                # "is a tool block open now" rather than "has one ever opened".
+                if delta_content:
                     for event in _translate_parser_events(think_parser.feed(delta_content), tracker):
                         yield event
 
@@ -1318,6 +1346,12 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         current_index = get_field(tool_call, "index", 0)
 
                         if tool_index is None or current_index != tool_index:
+                            # Anthropic SSE requires content_block_stop(N) before
+                            # content_block_start(N+1); close the prior tool block
+                            # when a parallel call arrives in the same delta.
+                            if tool_index is not None:
+                                for event in tracker.close():
+                                    yield event
                             tool_index = current_index
                             function = get_field(tool_call, "function", {}) or {}
                             name = get_field(function, "name", "")

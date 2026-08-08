@@ -514,6 +514,27 @@ def test_convert_anthropic_to_litellm_passes_optional_sampling() -> None:
         assert out["top_k"] == 40
 
 
+def test_explicit_null_sampling_is_dropped() -> None:
+    """Explicit null in a sampling field (Pydantic v2 sets model_fields_set)
+    must be treated as 'unset' → upstream uses its own default. Wire form
+    must not include the field."""
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "temperature": None,
+            "top_p": None,
+            "stop_sequences": None,
+        })
+        # Pydantic v2 includes explicit null in fields_set — confirm semantics.
+        assert "temperature" in req.model_fields_set
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "temperature" not in out
+        assert "top_p" not in out
+        assert "stop" not in out
+
+
 def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None:
     with _patched_empty_config():
         req = _make_request({
@@ -1169,8 +1190,8 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
     )
 
 
-async def test_streaming_tool_call_then_text_block_stays_closed() -> None:
-    """After tool calls, no new text block should appear."""
+async def test_streaming_tool_call_then_text_opens_new_block() -> None:
+    """Text emitted after a tool_use must open a fresh text block (close-before-open)."""
     req = _base_request(stream=True, tools=[{
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
@@ -1185,7 +1206,10 @@ async def test_streaming_tool_call_then_text_block_stays_closed() -> None:
         if e["type"] == "content_block_start"
         and (e.get("content_block") or {}).get("type") == "text"
     ]
-    assert len(text_starts) == 1, f"expected exactly one text block, got {len(text_starts)}"
+    assert len(text_starts) == 2, f"expected two text blocks (initial + post-tool), got {len(text_starts)}"
+    # Canonical sequence: tool_use stop(0) → text start(1) → text stop(1).
+    types = [e["type"] for e in events]
+    assert types.index("content_block_stop") < types.index("content_block_start", types.index("content_block_stop") + 1)
 
 
 async def test_streaming_tool_only_no_text() -> None:
@@ -1221,7 +1245,8 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
 
 
 async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
-    """Parallel tool calls must each get their own SSE block index."""
+    """Parallel tool calls must each get their own SSE block index, with
+    content_block_stop(N) emitted before content_block_start(N+1)."""
     req = _base_request(stream=True, tools=[{
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
@@ -1239,6 +1264,22 @@ async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     assert len(tool_starts) == 2
     indices = {t["index"] for t in tool_starts}
     assert len(indices) == 2, f"tool blocks must have distinct indices, got {indices}"
+    # Anthropic SSE contract: stop(0) must precede start(1) for parallel blocks.
+    starts = [e for e in events if e["type"] == "content_block_start"]
+    stops = [e for e in events if e["type"] == "content_block_stop"]
+    assert len(stops) >= len(starts), "each tool_use must be closed before the next opens"
+    # In event order, the first tool stop precedes the second tool start.
+    second_tool_start_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_start"
+        and (e.get("content_block") or {}).get("type") == "tool_use"
+        and e["index"] == 1
+    )
+    first_tool_stop_idx = next(
+        i for i, e in enumerate(events)
+        if e["type"] == "content_block_stop" and e["index"] == 0
+    )
+    assert first_tool_stop_idx < second_tool_start_idx
 
 
 async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
@@ -1495,13 +1536,58 @@ def test_load_config_coerces_int_to_float_for_temperature() -> None:
         assert isinstance(srv.CONFIG["tiers"]["sonnet"]["temperature"], float)
 
 
-def test_load_config_stop_must_be_list() -> None:
+def test_load_config_stop_accepts_single_string() -> None:
+    """OpenAI accepts either string or list<string> for stop; coerce the bare form."""
     with _patched_config("""
         [sonnet]
         stop = "END"
     """):
-        # scalar stop is rejected with a warning; key dropped.
+        assert srv.CONFIG["tiers"]["sonnet"]["stop"] == ["END"]
+
+
+def test_load_config_stop_rejects_empty_string() -> None:
+    with _patched_config("""
+        [sonnet]
+        stop = ""
+    """):
         assert "stop" not in srv.CONFIG["tiers"]["sonnet"]
+
+
+def test_load_config_rejects_non_string_proxy_keys() -> None:
+    """api_key / base_url are strings — ints/arrays would corrupt the auth header
+    or api_base at runtime. Loader must reject, not silently store."""
+    with _patched_config("""
+        [proxy]
+        openai_api_key = 12345
+        openai_base_url = ["http://localhost"]
+    """):
+        assert "openai_api_key" not in srv.CONFIG["proxy"]
+        assert "openai_base_url" not in srv.CONFIG["proxy"]
+
+
+def test_load_config_rejects_non_string_routing_keys() -> None:
+    """Routing model names are strings; coerce or drop otherwise."""
+    with _patched_config("""
+        [routing]
+        haiku_model = 42
+        big_model = ["a", "b"]
+    """):
+        assert "haiku_model" not in srv.CONFIG["routing"]
+        assert "big_model" not in srv.CONFIG["routing"]
+
+
+def test_load_config_coerces_int_bool_for_openai_tls_verify() -> None:
+    """TOML int for openai_tls_verify should coerce to bool, not be silently dropped."""
+    with _patched_config("""
+        [proxy]
+        openai_tls_verify = 0
+    """):
+        assert srv.CONFIG["proxy"]["openai_tls_verify"] is False
+    with _patched_config("""
+        [proxy]
+        openai_tls_verify = 1
+    """):
+        assert srv.CONFIG["proxy"]["openai_tls_verify"] is True
 
 
 def test_load_config_rejects_nonpositive_max_completion_tokens() -> None:
