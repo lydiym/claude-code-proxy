@@ -3,7 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator, model_validator
-from typing import List, Dict, Any, Optional, Union, Literal, Iterator
+from typing import List, Dict, Any, Optional, Union, Literal, Iterator, Tuple
 import logging
 import json
 import os
@@ -1109,49 +1109,83 @@ class OpenBlock:
 
 
 class BlockTracker:
-    """Allocates indices and tracks the currently-open Anthropic content block.
+    """Allocates indices and tracks currently-open Anthropic content blocks.
 
-    The state machine is caller-driven: ``ensure(kind)`` closes any
-    different-kind block that is open, then ``open(kind)`` allocates a fresh
-    index. ``open()`` is unconditional and overwrites the prior block — callers
-    that need close-before-open behaviour must call ``ensure()`` first, or call
-    ``close()`` explicitly when emitting consecutive parallel tool blocks.
+    One "primary" block for text/thinking (mutually exclusive) plus a dict of
+    tool_use blocks keyed by tool_index. The multi-block tool tracking lets
+    parallel tool_calls stay open simultaneously so interleaved continuation
+    args land on the correct block.
     """
 
     def __init__(self) -> None:
         self._next_index = 0
-        self._current: Optional[OpenBlock] = None
+        self._primary: Optional[OpenBlock] = None
+        self._tool_blocks: Dict[int, OpenBlock] = {}
 
     @property
     def current(self) -> Optional[OpenBlock]:
-        return self._current
+        return self._primary
 
     def is_open(self, kind: Optional[str] = None) -> bool:
+        if kind in ("text", "thinking"):
+            return self._primary is not None and self._primary.kind == kind
+        if kind == "tool_use":
+            return bool(self._tool_blocks)
         if kind is None:
-            return self._current is not None
-        return self._current is not None and self._current.kind == kind
+            return self._primary is not None or bool(self._tool_blocks)
+        return False
 
     def open(self, kind: str) -> OpenBlock:
         block = OpenBlock(index=self._next_index, kind=kind)
         self._next_index += 1
-        self._current = block
+        self._primary = block
         return block
 
     def ensure(self, kind: str) -> List[str]:
-        if self._current is not None and self._current.kind != kind:
-            return self.close()
+        if self._primary is not None and self._primary.kind != kind:
+            return [SseFormatter.content_block_stop(self._primary.index)]
         return []
 
     def delta(self, delta_payload: Dict[str, Any]) -> str:
-        if self._current is None:
+        if self._primary is None:
             raise RuntimeError("no block is open; call open() first")
-        return SseFormatter.content_block_delta(self._current.index, delta_payload)
+        return SseFormatter.content_block_delta(self._primary.index, delta_payload)
+
+    def open_tool(self, tool_index: int) -> Tuple[OpenBlock, List[str]]:
+        """Open a tool_use block. Closes the primary (text/thinking) if any."""
+        close_events: List[str] = []
+        if self._primary is not None:
+            close_events.append(SseFormatter.content_block_stop(self._primary.index))
+            self._primary = None
+        block = OpenBlock(index=self._next_index, kind="tool_use")
+        self._next_index += 1
+        self._tool_blocks[tool_index] = block
+        return block, close_events
+
+    def delta_for_tool(self, tool_index: int, delta_payload: Dict[str, Any]) -> str:
+        block = self._tool_blocks.get(tool_index)
+        if block is None:
+            raise RuntimeError(f"no tool_use block open for tool_index={tool_index}")
+        return SseFormatter.content_block_delta(block.index, delta_payload)
+
+    def close_all_tools(self) -> List[str]:
+        """Emit content_block_stop for every open tool_use block and clear them."""
+        events = [
+            SseFormatter.content_block_stop(b.index)
+            for b in self._tool_blocks.values()
+        ]
+        self._tool_blocks.clear()
+        return events
 
     def close(self) -> List[str]:
-        if self._current is None:
-            return []
-        events = [SseFormatter.content_block_stop(self._current.index)]
-        self._current = None
+        """Close all open blocks (primary + all tools) and emit their stops."""
+        events: List[str] = []
+        if self._primary is not None:
+            events.append(SseFormatter.content_block_stop(self._primary.index))
+            self._primary = None
+        for block in self._tool_blocks.values():
+            events.append(SseFormatter.content_block_stop(block.index))
+        self._tool_blocks.clear()
         return events
 
 
@@ -1354,18 +1388,17 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         current_index = get_field(tool_call, "index", 0)
 
                         if current_index not in open_tool_indices:
-                            # New tool call: always close whatever's open so
-                            # we emit content_block_stop before the new start.
-                            # Tracks the index so continuation args (same index,
-                            # no id) don't open a spurious block.
-                            if tracker.is_open():
-                                for event in tracker.close():
-                                    yield event
+                            # New tool call: serialize (stop-before-start per
+                            # Anthropic SSE), then open this one.
+                            for event in tracker.close_all_tools():
+                                yield event
+                            block, close_events = tracker.open_tool(current_index)
+                            for event in close_events:
+                                yield event
                             open_tool_indices.add(current_index)
                             function = get_field(tool_call, "function", {}) or {}
                             name = get_field(function, "name", "")
                             tool_id = get_field(tool_call, "id") or new_tool_id()
-                            block = tracker.open("tool_use")
                             yield SseFormatter.content_block_start(block.index, {
                                 "type": "tool_use", "id": tool_id, "name": name, "input": {},
                             })
@@ -1373,10 +1406,10 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         function = get_field(tool_call, "function", {}) or {}
                         arguments = get_field(function, "arguments", "")
                         if arguments:
-                            if isinstance(arguments, str):
-                                yield tracker.delta({"type": "input_json_delta", "partial_json": arguments})
-                            else:
-                                yield tracker.delta({"type": "input_json_delta", "partial_json": json.dumps(arguments)})
+                            payload = {"type": "input_json_delta", "partial_json": arguments}
+                            if not isinstance(arguments, str):
+                                payload["partial_json"] = json.dumps(arguments)
+                            yield tracker.delta_for_tool(current_index, payload)
 
                 if finish_reason and not has_sent_stop_reason:
                     has_sent_stop_reason = True
@@ -1409,6 +1442,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         logger.error(f"Error in streaming: {e}", exc_info=True)
         for event in tracker.close():
             yield event
+        # Emit partial usage in message_delta before the error event so SDKs
+        # that record usage up to the failure surface the token count.
+        yield SseFormatter.message_delta("end_turn", output_tokens)
         yield SseFormatter.error("api_error", f"upstream streaming failed: {e}")
         yield SseFormatter.done()
     finally:
