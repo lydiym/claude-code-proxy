@@ -1204,6 +1204,14 @@ class SseFormatter:
         return "data: [DONE]\n\n"
 
     @staticmethod
+    def error(error_type: str, message: str) -> str:
+        # Anthropic SDK raises APIStatusError on `event: error`.
+        return SseFormatter.event("error", {
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        })
+
+    @staticmethod
     def finish(stop_reason: str, output_tokens: int) -> List[str]:
         return [
             SseFormatter.message_delta(stop_reason, output_tokens),
@@ -1380,7 +1388,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     return
             except Exception as e:
                 logger.error(f"Error processing chunk: {e}")
-                continue
+                # Don't swallow forever — a malformed chunk storm would otherwise
+                # stream nothing while appearing to succeed.
+                for event in tracker.close():
+                    yield event
+                yield SseFormatter.error("api_error", f"chunk processing failed: {e}")
+                yield SseFormatter.done()
+                return
 
         if not has_sent_stop_reason:
             for event in _translate_parser_events(think_parser.flush(), tracker):
@@ -1392,8 +1406,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
     except Exception as e:
         logger.error(f"Error in streaming: {e}", exc_info=True)
-        yield SseFormatter.message_delta("error", 0)
-        yield SseFormatter.message_stop()
+        for event in tracker.close():
+            yield event
+        yield SseFormatter.error("api_error", f"upstream streaming failed: {e}")
         yield SseFormatter.done()
     finally:
         # Close so the internal httpx client releases deterministically —

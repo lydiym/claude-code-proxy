@@ -1244,6 +1244,49 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
     assert stop["delta"]["stop_reason"] == "end_turn"
 
 
+async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
+    """A chunk that crashes the inner pipeline must yield `event: error` so the
+    SDK raises APIStatusError instead of silently terminating the stream."""
+    req = _base_request(stream=True)
+
+    async def _bad_upstream():
+        yield {"choices": [{"delta": {"content": "ok"}}]}
+        yield {"choices": [{"delta": {"content": "more"}, "finish_reason": "stop"}]}
+
+    # Force the second chunk to raise inside the inner try/except.
+    original = srv._translate_parser_events
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated chunk processing failure")
+
+    srv._translate_parser_events = _boom
+    try:
+        raw: List[str] = []
+        async for piece in srv.handle_streaming(_bad_upstream(), req):
+            raw.append(piece)
+    finally:
+        srv._translate_parser_events = original
+
+    events = _parse_sse(raw)
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1, f"expected exactly one error frame, got {len(errors)}"
+    assert errors[0]["error"]["type"] == "api_error"
+    assert "chunk processing failed" in errors[0]["error"]["message"]
+    assert events[-1] == {"type": "[DONE]"}
+
+
+def test_sse_formatter_error_emits_canonical_shape() -> None:
+    """`event: error` payload must be {type, error: {type, message}} —
+    SDK looks up error.type to dispatch exception subclasses."""
+    frame = srv.SseFormatter.error("overloaded_error", "try again later")
+    assert frame.startswith("event: error\n")
+    body = json.loads(frame.split("data: ", 1)[1].split("\n\n")[0])
+    assert body == {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "try again later"},
+    }
+
+
 async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     """Parallel tool calls must each get their own SSE block index, with
     content_block_stop(N) emitted before content_block_start(N+1)."""
