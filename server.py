@@ -2,8 +2,8 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, model_validator
-from typing import List, Dict, Any, Optional, Union, Literal, Iterator, Tuple
+from pydantic import BaseModel, field_validator, model_validator
+from typing import List, Dict, Any, Optional, Union, Literal, Iterator
 import logging
 import json
 import os
@@ -48,18 +48,13 @@ def _str_to_bool(value, *, default=False):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-_TOML_RAW: Optional[Tuple[str, Dict[str, Any]]] = None  # (path, parsed); assigned by _resolve_tiktoken_offline
-
-
 def _resolve_tiktoken_offline() -> bool:
-    """Read [proxy].tiktoken_offline from CONFIG_PATH, then TIKTOKEN_OFFLINE env, then True."""
-    global _TOML_RAW
+    """[proxy].tiktoken_offline from CONFIG_PATH, TIKTOKEN_OFFLINE env, then True."""
     path = os.environ.get("CONFIG_PATH", "./config.toml")
     if path and os.path.isfile(path):
         try:
             with open(path, "rb") as f:
                 raw = tomllib.load(f)
-            _TOML_RAW = (path, raw)
             cfg = raw.get("proxy", {})
             if isinstance(cfg, dict) and "tiktoken_offline" in cfg:
                 return _str_to_bool(cfg["tiktoken_offline"], default=True)
@@ -238,38 +233,19 @@ def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
     return _COERCE_DROP
 
 
-def _parse_mapping_section(
-    body: Dict[str, Any], section: str, allowed: set
-) -> Dict[str, Any]:
-    """Walk a [proxy]/[routing] table — warn on unknown keys, coerce, drop bad values."""
-    out: Dict[str, Any] = {}
-    for k, v in body.items():
-        if k not in allowed:
-            logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
-            continue
-        coerced = _coerce_proxy_value(k, v, section)
-        if coerced is _COERCE_DROP:
-            continue
-        out[k] = coerced
-    return out
-
-
 def _load_config(path: str) -> Dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
     out: Dict[str, Any] = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
     if not path:
         return out
-    if _TOML_RAW is not None and _TOML_RAW[0] == path:
-        raw = _TOML_RAW[1]
-    elif os.path.isfile(path):
-        try:
-            with open(path, "rb") as f:
-                raw = tomllib.load(f)
-        except tomllib.TOMLDecodeError as e:
-            logger.error(f"Malformed TOML in {path}: {e}; falling back to env vars")
-            return out
-    else:
+    if not os.path.isfile(path):
         logger.info(f"CONFIG_PATH={path!r} not found; using env vars only")
+        return out
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        logger.error(f"Malformed TOML in {path}: {e}; falling back to env vars")
         return out
     for section, body in raw.items():
         if section not in _VALID_SECTIONS:
@@ -282,9 +258,25 @@ def _load_config(path: str) -> Dict[str, Any]:
             logger.warning(f"[{section}] must be a table, got {type(body).__name__}; ignoring")
             continue
         if section == "proxy":
-            out["proxy"] = _parse_mapping_section(body, section, _PROXY_KEYS)
+            allowed = _PROXY_KEYS
+            for k, v in body.items():
+                if k not in allowed:
+                    logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+                    continue
+                coerced = _coerce_proxy_value(k, v, section)
+                if coerced is _COERCE_DROP:
+                    continue
+                out["proxy"][k] = coerced
         elif section == "routing":
-            out["routing"] = _parse_mapping_section(body, section, _ROUTING_KEYS)
+            allowed = _ROUTING_KEYS
+            for k, v in body.items():
+                if k not in allowed:
+                    logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+                    continue
+                coerced = _coerce_proxy_value(k, v, section)
+                if coerced is _COERCE_DROP:
+                    continue
+                out["routing"][k] = coerced
         elif section == "global":
             out["global"] = _parse_tier_section(body, section)
         else:  # per-tier section
@@ -456,26 +448,6 @@ def to_anthropic_stop_reason(finish_reason):
     }.get(finish_reason or "", "end_turn")
 
 
-def _rewrite_model(raw: str) -> Tuple[str, Optional[str]]:
-    """Map to upstream openai/<name> and identify the tier. Precedence: tier → OPENAI_MODELS (lowercased) → openai/ passthrough → custom (case-preserved)."""
-    clean_v = _strip_provider_prefix(raw)
-    lower = raw.lower()
-    tier = _match_tier(raw)
-    if tier:
-        chosen = _get_tier_override(tier) or _default_for_tier(tier)
-        new_model = f"openai/{chosen}"
-    elif clean_v.lower() in OPENAI_MODELS and not lower.startswith("openai/"):
-        new_model = f"openai/{clean_v.lower()}"
-    elif lower.startswith("openai/"):
-        new_model = raw  # already-prefixed passthrough (case-insensitive)
-    else:
-        logger.debug(f"No mapping rule for model '{raw}', passing through")
-        new_model = f"openai/{clean_v}"
-
-    logger.debug(f"MODEL MAPPING: '{raw}' -> '{new_model}'")
-    return new_model, tier
-
-
 def get_field(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
@@ -567,13 +539,38 @@ class MessagesRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def capture_original_model(cls, data):
-        """Capture original name, rewrite to upstream form, identify tier — one pass (field validators can't share work)."""
         if isinstance(data, dict) and "model" in data:
-            raw = data["model"]
             data = dict(data)
-            data["original_model"] = raw
-            data["model"], data["tier"] = _rewrite_model(raw)
+            data["original_model"] = data["model"]
         return data
+
+    @model_validator(mode="after")
+    def derive_tier(self) -> "MessagesRequest":
+        """Identify the Anthropic tier from the pre-rewrite original_model."""
+        if self.original_model:
+            self.tier = _match_tier(self.original_model)
+        return self  # tier stays None → falls back to [global] in lookup
+
+    @field_validator("model")
+    def validate_model_field(cls, v):
+        clean_v = _strip_provider_prefix(v)  # case preserved
+
+        new_model = None
+        if tier := _match_tier(v):
+            chosen = _get_tier_override(tier) or _default_for_tier(tier)
+            new_model = f"openai/{chosen}"
+        elif clean_v.lower() in OPENAI_MODELS and not v.lower().startswith("openai/"):
+            new_model = f"openai/{clean_v}"
+        elif v.lower().startswith("openai/"):
+            new_model = v  # already-prefixed passthrough (case-insensitive)
+        else:
+            # Custom endpoint: pass the bare name through with the openai/ prefix.
+            logger.debug(f"No mapping rule for model '{v}', passing through")
+            new_model = f"openai/{clean_v}"
+
+        logger.debug(f"MODEL MAPPING: '{v}' -> '{new_model}'")
+
+        return new_model
 
 
 class Usage(BaseModel):
@@ -884,12 +881,11 @@ def convert_tool_definitions(tools):
 
 
 def convert_tool_choice(choice):
-    """Map Anthropic tool_choice to OpenAI Chat Completions form."""
     choice_type = get_field(choice, "type")
-    if choice_type == "none":
-        return "none"
+    if choice_type == "auto":
+        return "auto"
     if choice_type == "any":
-        return "required"
+        return "any"
     if choice_type == "tool":
         name = get_field(choice, "name")
         if name:
@@ -916,7 +912,7 @@ def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
     tiers = CONFIG.get("tiers") or {}
     if request.tier:
         tier_cfg = tiers.get(request.tier)
-        if isinstance(tier_cfg, dict):
+        if tier_cfg is not None:
             return deepcopy(_deep_merge(base, tier_cfg))
     return deepcopy(base)
 
@@ -987,10 +983,13 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if "seed" in tier_cfg:
         litellm_request["seed"] = tier_cfg["seed"]
 
-    # Per-tier CONFIG extra_body → upstream via LiteLLM. Merge target is always empty here — prior _deep_merge was vacuous. isinstance guard handles runtime-patched CONFIG.
+    # deep-merge: config keys win per leaf; unrelated request keys preserved.
+    # isinstance guard handles runtime-patched CONFIG that bypassed the loader.
     cfg_extra = tier_cfg.get("extra_body")
     if isinstance(cfg_extra, dict) and cfg_extra:
-        litellm_request["extra_body"] = cfg_extra
+        litellm_request["extra_body"] = _deep_merge(
+            litellm_request.get("extra_body", {}), cfg_extra
+        )
 
     return litellm_request
 
@@ -1107,76 +1106,49 @@ class OpenBlock:
 
 
 class BlockTracker:
-    """Tracks currently-open Anthropic content blocks (one primary + N tool_use)."""
+    """Allocates indices and tracks the currently-open Anthropic content block.
+
+    The state machine is caller-driven: ``ensure(kind)`` closes any
+    different-kind block that is open, then ``open(kind)`` allocates a fresh
+    index. ``open()`` is unconditional and overwrites the prior block — callers
+    that need close-before-open behaviour must call ``ensure()`` first, or call
+    ``close()`` explicitly when emitting consecutive parallel tool blocks.
+    """
 
     def __init__(self) -> None:
         self._next_index = 0
-        self._primary: Optional[OpenBlock] = None
-        self._tool_blocks: Dict[int, OpenBlock] = {}
+        self._current: Optional[OpenBlock] = None
+
+    @property
+    def current(self) -> Optional[OpenBlock]:
+        return self._current
+
+    def is_open(self, kind: Optional[str] = None) -> bool:
+        if kind is None:
+            return self._current is not None
+        return self._current is not None and self._current.kind == kind
 
     def open(self, kind: str) -> OpenBlock:
         block = OpenBlock(index=self._next_index, kind=kind)
         self._next_index += 1
-        self._primary = block
+        self._current = block
         return block
 
     def ensure(self, kind: str) -> List[str]:
-        """Close different-kind primary + all open tool blocks."""
-        events: List[str] = []
-        if self._primary is not None and self._primary.kind != kind:
-            events.append(SseFormatter.content_block_stop(self._primary.index))
-            self._primary = None
-        events.extend(self.close_all_tools())
-        return events
+        if self._current is not None and self._current.kind != kind:
+            return self.close()
+        return []
 
     def delta(self, delta_payload: Dict[str, Any]) -> str:
-        if self._primary is None:
+        if self._current is None:
             raise RuntimeError("no block is open; call open() first")
-        return SseFormatter.content_block_delta(self._primary.index, delta_payload)
-
-    def open_tool(self, tool_index: int) -> Tuple[OpenBlock, List[str]]:
-        """Open a tool_use block; closes the primary first if any."""
-        close_events = self.close_primary()
-        block = OpenBlock(index=self._next_index, kind="tool_use")
-        self._next_index += 1
-        self._tool_blocks[tool_index] = block
-        return block, close_events
-
-    def has_primary(self, kind: str) -> bool:
-        """True iff a primary block of ``kind`` (text/thinking) is currently open."""
-        return self._primary is not None and self._primary.kind == kind
-
-    def has_tool(self, tool_index: int) -> bool:
-        """True iff a tool_use block for ``tool_index`` is currently open."""
-        return tool_index in self._tool_blocks
-
-    def delta_for_tool(self, tool_index: int, delta_payload: Dict[str, Any]) -> str:
-        block = self._tool_blocks.get(tool_index)
-        if block is None:
-            return ""  # stale delta — drop silently rather than abort the stream
-        return SseFormatter.content_block_delta(block.index, delta_payload)
-
-    def close_all_tools(self) -> List[str]:
-        """Emit content_block_stop for every open tool_use block and clear them."""
-        events = [
-            SseFormatter.content_block_stop(b.index)
-            for b in self._tool_blocks.values()
-        ]
-        self._tool_blocks.clear()
-        return events
-
-    def close_primary(self) -> List[str]:
-        """Close the primary only; tool blocks stay open."""
-        if self._primary is None:
-            return []
-        events = [SseFormatter.content_block_stop(self._primary.index)]
-        self._primary = None
-        return events
+        return SseFormatter.content_block_delta(self._current.index, delta_payload)
 
     def close(self) -> List[str]:
-        """Close the primary + all tool blocks."""
-        events = self.close_primary()
-        events.extend(self.close_all_tools())
+        if self._current is None:
+            return []
+        events = [SseFormatter.content_block_stop(self._current.index)]
+        self._current = None
         return events
 
 
@@ -1232,14 +1204,6 @@ class SseFormatter:
         return "data: [DONE]\n\n"
 
     @staticmethod
-    def error(error_type: str, message: str) -> str:
-        # Anthropic SDK raises APIStatusError on `event: error`.
-        return SseFormatter.event("error", {
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        })
-
-    @staticmethod
     def finish(stop_reason: str, output_tokens: int) -> List[str]:
         return [
             SseFormatter.message_delta(stop_reason, output_tokens),
@@ -1253,7 +1217,7 @@ def _open_block(
 ) -> Iterator[str]:
     for event in tracker.ensure(kind):
         yield event
-    if not tracker.has_primary(kind):
+    if not tracker.is_open(kind):
         block = tracker.open(kind)
         yield SseFormatter.content_block_start(block.index, block_dict)
 
@@ -1265,18 +1229,6 @@ def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
     yield tracker.delta({"type": "thinking_delta", "thinking": text})
 
 
-def _emit_failure(
-    tracker: BlockTracker, output_tokens: int, message: str
-) -> Iterator[str]:
-    """Canonical error-finish: close blocks → message_delta → message_stop → error → done."""
-    for event in tracker.close():
-        yield event
-    yield SseFormatter.message_delta("end_turn", output_tokens)
-    yield SseFormatter.message_stop()
-    yield SseFormatter.error("api_error", message)
-    yield SseFormatter.done()
-
-
 def _translate_parser_events(
     events: List[tuple], tracker: BlockTracker
 ) -> Iterator[str]:
@@ -1284,7 +1236,7 @@ def _translate_parser_events(
         if kind == "open":
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
         elif kind == "close":
-            for event in tracker.close_primary():
+            for event in tracker.close():
                 yield event
         elif kind == "thinking" and value:
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
@@ -1314,6 +1266,7 @@ def log_request(method, path, source_model, target_model, tier, num_messages, nu
 async def handle_streaming(response_generator, original_request: MessagesRequest):
     tracker = BlockTracker()
     think_parser = ThinkStreamParser()
+    tool_index: Optional[int] = None
     input_tokens = 0
     output_tokens = 0
     has_sent_stop_reason = False
@@ -1361,7 +1314,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 finish_reason = get_field(choice, "finish_reason")
 
                 # litellm exposes native reasoning as delta.reasoning_content on some providers;
-                # honour it before falling back to think-tag parsing.
+                # honour it before falling back to `` parsing.
                 delta_reasoning = get_field(delta, "reasoning_content")
 
                 delta_content = get_field(delta, "content")
@@ -1383,22 +1336,27 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     delta_tool_calls = delta["tool_calls"]
 
                 if delta_tool_calls:
+                    if tool_index is None:
+                        for event in tracker.close():
+                            yield event
                     if not isinstance(delta_tool_calls, list):
                         delta_tool_calls = [delta_tool_calls]
 
                     for tool_call in delta_tool_calls:
                         current_index = get_field(tool_call, "index", 0)
 
-                        if not tracker.has_tool(current_index):
-                            # New tool call — stop-before-start per Anthropic SSE. _tool_blocks is the truth; close_all_tools cleared it, so reused indices re-open cleanly.
-                            for event in tracker.close_all_tools():
-                                yield event
-                            block, close_events = tracker.open_tool(current_index)
-                            for event in close_events:
-                                yield event
+                        if tool_index is None or current_index != tool_index:
+                            # Anthropic SSE requires content_block_stop(N) before
+                            # content_block_start(N+1); close the prior tool block
+                            # when a parallel call arrives in the same delta.
+                            if tool_index is not None:
+                                for event in tracker.close():
+                                    yield event
+                            tool_index = current_index
                             function = get_field(tool_call, "function", {}) or {}
                             name = get_field(function, "name", "")
                             tool_id = get_field(tool_call, "id") or new_tool_id()
+                            block = tracker.open("tool_use")
                             yield SseFormatter.content_block_start(block.index, {
                                 "type": "tool_use", "id": tool_id, "name": name, "input": {},
                             })
@@ -1406,10 +1364,10 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         function = get_field(tool_call, "function", {}) or {}
                         arguments = get_field(function, "arguments", "")
                         if arguments:
-                            payload = {"type": "input_json_delta", "partial_json": arguments}
-                            if not isinstance(arguments, str):
-                                payload["partial_json"] = json.dumps(arguments)
-                            yield tracker.delta_for_tool(current_index, payload)
+                            if isinstance(arguments, str):
+                                yield tracker.delta({"type": "input_json_delta", "partial_json": arguments})
+                            else:
+                                yield tracker.delta({"type": "input_json_delta", "partial_json": json.dumps(arguments)})
 
                 if finish_reason and not has_sent_stop_reason:
                     has_sent_stop_reason = True
@@ -1422,9 +1380,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     return
             except Exception as e:
                 logger.error(f"Error processing chunk: {e}")
-                for event in _emit_failure(tracker, output_tokens, f"chunk processing failed: {e}"):
-                    yield event
-                return
+                continue
 
         if not has_sent_stop_reason:
             for event in _translate_parser_events(think_parser.flush(), tracker):
@@ -1436,10 +1392,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
     except Exception as e:
         logger.error(f"Error in streaming: {e}", exc_info=True)
-        for event in _translate_parser_events(think_parser.flush(), tracker):
-            yield event
-        for event in _emit_failure(tracker, output_tokens, f"upstream streaming failed: {e}"):
-            yield event
+        yield SseFormatter.message_delta("error", 0)
+        yield SseFormatter.message_stop()
+        yield SseFormatter.done()
     finally:
         # Close so the internal httpx client releases deterministically —
         # otherwise mid-stream cancellation leaks it until GC.
