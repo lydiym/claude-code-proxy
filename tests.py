@@ -1217,12 +1217,7 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
 
 
 async def test_streaming_tool_call_then_text_opens_new_block() -> None:
-    """Text emitted after a tool_use must open a fresh text block (close-before-open).
-
-    Specifically: the tool_use block must stop BEFORE the new text block starts.
-    Earlier assertion only checked that SOME stop preceded SOME start, which let
-    a regression through where the tool block stayed open until the final flush.
-    """
+    """Text after a tool_use must open a fresh text block (tool block stops before new text starts)."""
     req = _base_request(stream=True, tools=[{
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
@@ -2163,6 +2158,19 @@ def test_resolve_tier_config_handles_none_global() -> None:
                               "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {}
+
+
+def test_resolve_tier_config_ignores_non_dict_tier_value() -> None:
+    """Regression: a non-dict non-None tier value (e.g. a list) used to crash
+    _deep_merge; must fall back to [global] silently."""
+    with _patched_empty_config():
+        srv.CONFIG["global"] = {"temperature": 0.5}
+        srv.CONFIG["tiers"] = {"haiku": ["not a dict"]}
+        req = _make_request({"model": "claude-3-5-haiku-20241022",
+                              "max_tokens": 100,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        cfg = srv._resolve_tier_config(req)
+        assert cfg == {"temperature": 0.5}
 
 
 def test_is_skip_sampling_skips_empty_stop_list() -> None:
