@@ -301,19 +301,19 @@ logger.warning(
 
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
-    """CONFIG[proxy|routing][key] → env var → default. None / "" fall through."""
+    """env var → CONFIG[proxy|routing][key] → default. None / "" fall through."""
     if key in _PROXY_KEYS:
         section = "proxy"
     elif key in _ROUTING_KEYS:
         section = "routing"
     else:
         raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy/routing key")
-    val = CONFIG[section].get(key)
-    if val not in (None, ""):
-        return val
     env_val = os.environ.get(env_name)
     if env_val not in (None, ""):
         return env_val
+    val = CONFIG[section].get(key)
+    if val not in (None, ""):
+        return val
     return default
 
 

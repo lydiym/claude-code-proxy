@@ -1,4 +1,4 @@
-# Single source of truth. Every key optional; lookup: config → env → default. LOG_LEVEL is env-only.
+# Single source of truth. Every key optional; lookup: env → config → default. LOG_LEVEL is env-only.
 
 [proxy]
 openai_api_key    = "sk-..."                      # env: OPENAI_API_KEY

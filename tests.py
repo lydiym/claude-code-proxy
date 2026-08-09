@@ -1760,12 +1760,12 @@ def test_deep_merge_does_not_mutate_inputs() -> None:
 
 # --- Env-var fallback resolver ---
 
-def test_proxy_value_picks_config_over_env() -> None:
+def test_proxy_value_env_overrides_config() -> None:
     original_env = os.environ.pop("BIG_MODEL", None)
     os.environ["BIG_MODEL"] = "env-model"
     try:
         with _patched_config('[routing]\nbig_model = "toml-model"'):
-            assert srv._proxy_value("big_model", "BIG_MODEL", "default") == "toml-model"
+            assert srv._proxy_value("big_model", "BIG_MODEL", "default") == "env-model"
     finally:
         if original_env is not None:
             os.environ["BIG_MODEL"] = original_env
@@ -1995,10 +1995,17 @@ def test_load_config_rejects_top_p_above_one() -> None:
 
 def test_default_for_tier_re_reads_per_call() -> None:
     """Edits to [routing].big_model / small_model take effect without restart."""
-    with _patched_empty_config():
-        assert srv._default_for_tier("sonnet") == srv._proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
-        srv.CONFIG["routing"]["big_model"] = "new-big"
-        assert srv._default_for_tier("sonnet") == "new-big"
+    original_env = os.environ.pop("BIG_MODEL", None)
+    try:
+        with _patched_empty_config():
+            assert srv._default_for_tier("sonnet") == srv._proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
+            srv.CONFIG["routing"]["big_model"] = "new-big"
+            assert srv._default_for_tier("sonnet") == "new-big"
+    finally:
+        if original_env is not None:
+            os.environ["BIG_MODEL"] = original_env
+        else:
+            os.environ.pop("BIG_MODEL", None)
 
 
 def test_validate_model_field_preserves_bare_name_case() -> None:

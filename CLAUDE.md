@@ -79,7 +79,7 @@ The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PAT
 - `[global]` — fallback per-tier settings (sampling + `extra_body`)
 - `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — tier-specific settings
 
-**Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy/routing setting. Lookup order per key: `CONFIG` → env var → built-in default.
+**Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy/routing setting. Lookup order per key: env var → `CONFIG` → built-in default. Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.
 
 **Per-tier capture** happens in `MessagesRequest.derive_tier` (a `@model_validator(mode="after")`) which inspects `original_model`, strips any `anthropic/` / `openai/` / `gemini/` prefix, and substring-matches against `TIER_DEFAULT` (insertion-order priority: `haiku` first). Unknown models end up with `tier=None` and fall back to `[global]`.
 

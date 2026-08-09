@@ -115,9 +115,11 @@ extra_body = { chat_template_kwargs = { enable_thinking = false } }
 
 For each setting, the proxy uses the first non-empty value from this list:
 
-1. `config.toml` (the matching `[proxy]` / `[routing]` / `[global]` / `[tier]` section)
-2. Environment variable (e.g. `OPENAI_API_KEY`)
+1. Environment variable (e.g. `OPENAI_API_KEY`)
+2. `config.toml` (the matching `[proxy]` / `[routing]` / `[global]` / `[tier]` section)
 3. Built-in default (e.g. `BIG_MODEL` → `gpt-4.1`)
+
+Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.
 
 ### Per-tier merge semantics
 
