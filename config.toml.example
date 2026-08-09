@@ -1,14 +1,14 @@
 # Single source of truth. Every key optional; lookup: config → env → default. LOG_LEVEL is env-only.
 
 [proxy]
-# openai_api_key    = "sk-..."                      # env: OPENAI_API_KEY
-# openai_base_url   = "http://localhost:8081/v1"    # env: OPENAI_BASE_URL (optional)
-# openai_tls_verify = true                          # env: OPENAI_TLS_VERIFY (default true)
-# tiktoken_offline  = true                          # env: TIKTOKEN_OFFLINE (default true)
+openai_api_key    = "sk-..."                      # env: OPENAI_API_KEY
+openai_base_url   = "http://localhost:8081/v1"    # env: OPENAI_BASE_URL (optional)
+openai_tls_verify = true                          # env: OPENAI_TLS_VERIFY (default true)
+tiktoken_offline  = true                          # env: TIKTOKEN_OFFLINE (default true)
 
 [routing]
-# big_model      = "gpt-4.1"     # env: BIG_MODEL      (default gpt-4.1)
-# small_model    = "gpt-4.1-mini"  # env: SMALL_MODEL    (default gpt-4.1-mini)
+big_model      = "gpt-4.1"     # env: BIG_MODEL      (default gpt-4.1)
+small_model    = "gpt-4.1-mini"  # env: SMALL_MODEL    (default gpt-4.1-mini)
 # haiku_model    = "qwen3.5"     # env: HAIKU_MODEL    (optional; defaults to small_model)
 # sonnet_model   = "qwen3.5"     # env: SONNET_MODEL   (optional; defaults to big_model)
 # opus_model     = "gpt-4.1"     # env: OPUS_MODEL     (optional; defaults to big_model)
@@ -17,29 +17,20 @@
 
 # --- Per-tier settings ---
 # [global] is fallback; tier sections deep-merge over it. Config wins per leaf.
-# Sampling: config wins per key; omitted when neither sets it. extra_body → upstream backend knobs.
+# Sampling: config wins per key; omitted when neither sets it. extra_body -> upstream backend knobs.
 
-[global]
+# [global]
 # extra_body = { cache_prompt = true }
 
-[haiku]
-temperature = 0.3
-top_p       = 0.9
-top_k       = 40
+# [haiku]
+# temperature = 0.3
+# top_p       = 0.9
+# top_k       = 40
+# extra_body = { cache_prompt = true, n_predict = 4096, chat_template_kwargs = { enable_thinking = false } }
 
-[haiku.extra_body]
-cache_prompt = true
-n_predict    = 4096
-
-[haiku.extra_body.chat_template_kwargs]
-# Qwen3.5+ emits <think>…</think> by default; turn it off for fast tier.
-enable_thinking = false
-
-[sonnet]
-temperature = 0.7
-
-[sonnet.extra_body.chat_template_kwargs]
-enable_thinking = false
+# [sonnet]
+# temperature = 0.7
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }
 
 # [opus]
 # extra_body = { cache_prompt = true }
