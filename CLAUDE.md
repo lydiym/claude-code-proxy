@@ -66,7 +66,7 @@ These three knobs make the proxy work on isolated networks:
 - `LITELLM_LOCAL_MODEL_COST_MAP=True` — set before importing litellm so it doesn't try to refresh the model cost map from GitHub.
 - `OPENAI_TLS_VERIFY=false` — disables TLS verification for `OPENAI_BASE_URL` endpoints with self-signed certs.
 
-`MAX_OUTPUT_TOKENS = 16384` is the OpenAI cap; `litellm_request["max_completion_tokens"]` is clamped to it.
+`MAX_OUTPUT_TOKENS = 16384` is the documented OpenAI cap; the proxy no longer clamps — client `max_tokens` flows through as `max_completion_tokens` unmodified. If a user asks for 24000, upstream gets 24000.
 
 ### Configuration (config.toml)
 
@@ -76,8 +76,8 @@ The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PAT
 
 - `[proxy]` — `openai_api_key`, `openai_base_url`, `openai_tls_verify`. `tiktoken_offline` is parsed by the standalone resolver above (not part of the main loader schema).
 - `[routing]` — `big_model`, `small_model`, plus per-tier overrides (`haiku_model`, `sonnet_model`, `opus_model`, `fable_model`, `mythos_model`)
-- `[global]` — fallback per-tier settings (sampling + `extra_body`)
-- `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — tier-specific settings
+- `[global]` — fallback per-tier settings (`extra_body` only — sampling/reasoning/vendor knobs all live here)
+- `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — tier-specific settings (also `extra_body` only)
 
 **Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy/routing setting. Lookup order per key: env var → `CONFIG` → built-in default. Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.
 
@@ -85,10 +85,10 @@ The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PAT
 
 **Per-tier injection** at the tail of `convert_anthropic_to_litellm`:
 
-- Sampling fields (`temperature`, `top_p`, `top_k`, `stop`): config wins per key over the request; request value is preserved when config omits the key; field is **omitted from the upstream call** when neither sets it (no Anthropic defaults auto-applied).
-- `max_completion_tokens`: config can only **lower** the ceiling; the request value always wins when smaller than the config ceiling.
-- `seed`: config-only field (no Anthropic counterpart).
-- `extra_body`: deep-merged via `_deep_merge`. Config keys override request keys at each leaf; unrelated request keys are preserved. LiteLLM then merges this into the upstream OpenAI Chat Completions request body at top level (works for any OpenAI-compatible backend: llama-server, ollama, vLLM, llama.cpp).
+- Sampling fields (`temperature`, `top_p`, `top_k`, `stop_sequences`): Pydantic pass-through (only when client sent a non-null value via `model_fields_set`), then `extra_body` overrides per leaf. Field is **omitted from the upstream call** when neither sets it (no Anthropic defaults auto-applied).
+- `seed`: config-only field (no Anthropic counterpart), forwarded as top-level kwarg when set in `[tier].extra_body`.
+- `extra_body`: deep-merged via `_deep_merge` from `request.extra_body` (client) then `tier_cfg["extra_body"]` (already global+tier-merged). Config wins per leaf; unrelated client keys are preserved. Keys are lifted to top-level kwargs on the upstream call (works for any OpenAI-compatible backend: llama-server, ollama, vLLM, llama.cpp). All merged keys are auto-registered as `allowed_openai_params` so LiteLLM does not silently drop unfamiliar ones.
+- Protected keys (`model`, `messages`, `stream`, `tools`): if present in `extra_body`, the proxy warns and skips — these are owned by the proxy itself.
 
 The discriminator between "client sent the field" and "Pydantic default applied" is `MessagesRequest.model_fields_set` (Pydantic v2) — an O(1) set lookup. `_patched_config` in `tests.py` is the patching helper for unit tests.
 

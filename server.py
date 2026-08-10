@@ -48,6 +48,12 @@ def _str_to_bool(value, *, default=False):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _litellm_debug_http_enabled() -> bool:
+    """LITELLM_DEBUG_HTTP=1 turns on verbose litellm + httpx/httpcore logging
+    so we can see the actual wire payload sent to the upstream OpenAI endpoint."""
+    return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
+
+
 def _resolve_tiktoken_offline() -> bool:
     """[proxy].tiktoken_offline from CONFIG_PATH, TIKTOKEN_OFFLINE env, then True."""
     path = os.environ.get("CONFIG_PATH", "./config.toml")
@@ -105,10 +111,10 @@ import uvicorn
 # TOML-loader section validator and the per-request tier lookup both read this.
 TIER_KEYS = ("haiku", "sonnet", "opus", "fable", "mythos")
 _VALID_TIERS = set(TIER_KEYS)
-_ALLOWED_SAMPLING_KEYS = {
-    "temperature", "top_p", "top_k",
-    "max_completion_tokens", "stop", "seed",
-}
+# Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite —
+# the proxy owns these. Warn and skip rather than letting user config shadow
+# something we'd need to rebuild after.
+_PROTECTED_KEYS = {"model", "messages", "stream", "tools"}
 _PROXY_KEYS = {
     "openai_api_key", "openai_base_url",
     "openai_tls_verify",
@@ -118,48 +124,6 @@ _ROUTING_KEYS = {
     "haiku_model", "sonnet_model", "opus_model", "fable_model", "mythos_model",
 }
 _VALID_SECTIONS = {"proxy", "routing", "global"} | _VALID_TIERS
-
-
-def _coerce_sampling(key, value):
-    """Coerce a TOML value into the expected Python type for a sampling field.
-    Raises ValueError on bad type. TOML ints already come through as Python int,
-    floats as float, strings as str, lists as list."""
-    if key in ("temperature", "top_p"):
-        # TOML ints/floats both acceptable; bool is rejected (bool ⊂ int in Python).
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"must be a number, got {type(value).__name__}")
-        # OpenAI spec: temperature ∈ [0, 2], top_p ∈ [0, 1]. We enforce the
-        # universally-rejected bounds (negatives, top_p > 1) and leave the
-        # upper temperature bound permissive (some backends allow > 2).
-        if value < 0:
-            raise ValueError(f"must be non-negative, got {value}")
-        if key == "top_p" and value > 1:
-            raise ValueError(f"must be ≤ 1, got {value}")
-        return float(value)
-    if key in ("top_k", "max_completion_tokens", "seed"):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"must be an integer, got {type(value).__name__}")
-        # max_completion_tokens=0 is nonsensical (asking for zero tokens);
-        # top_k=0 / seed=0 are valid sentinels some backends accept.
-        if key == "max_completion_tokens" and value <= 0:
-            raise ValueError(f"must be positive, got {value}")
-        if value < 0:
-            raise ValueError(f"must be non-negative, got {value}")
-        return int(value)
-    if key == "stop":
-        # OpenAI spec: string or list of strings (≤4). Wrap a bare string.
-        if isinstance(value, str):
-            if value == "":
-                raise ValueError("must not be empty")
-            return [value]
-        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
-            raise ValueError("must be a list of strings")
-        # backends reject "" as a stop string; warn + drop so an empty entry
-        # in [tier].stop = ["foo", ""] doesn't break the upstream call.
-        if any(x == "" for x in value):
-            raise ValueError("must not contain empty strings")
-        return list(value)
-    return value  # unknown keys handled by caller
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -197,8 +161,10 @@ def _match_tier(name: str) -> Optional[str]:
 
 
 def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
-    """Parse a per-tier body (or [global]). Per-key type errors are warned and
-    skipped so one bad value doesn't drop the rest of the section."""
+    """Parse a per-tier body (or [global]). Only `extra_body` is recognised —
+    everything else is rejected, since sampling and other knobs now live inside
+    `extra_body`. Bad values are warned and skipped so one error doesn't drop
+    the rest of the section."""
     out: Dict[str, Any] = {}
     for k, v in body.items():
         if k == "extra_body":
@@ -206,13 +172,8 @@ def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
                 logger.warning(f"[{section}].extra_body must be a table; ignoring")
                 continue
             out[k] = deepcopy(v)
-        elif k in _ALLOWED_SAMPLING_KEYS:
-            try:
-                out[k] = _coerce_sampling(k, v)
-            except ValueError as e:
-                logger.warning(f"[{section}].{k}: {e}; ignoring")
         else:
-            logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+            logger.warning(f"[{section}].{k} is not a recognised key; put it inside extra_body")
     return out
 
 
@@ -390,6 +351,16 @@ async def _configure_logging(app: FastAPI):
     for noisy in ("LiteLLM", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    if _litellm_debug_http_enabled():
+        # Verbose mode: see exactly what litellm sends/receives and what
+        # goes over the wire via httpx. Heavy — only for live debugging.
+        litellm.set_verbose = True
+        for noisy in ("httpx", "httpcore", "LiteLLM"):
+            logging.getLogger(noisy).setLevel(logging.DEBUG)
+        logger.warning(
+            "LITELLM_DEBUG_HTTP=1 — verbose litellm + httpx/httpcore DEBUG logs enabled"
+        )
+
     _reset_logger("uvicorn", propagate=True)
     _reset_logger("uvicorn.error", propagate=True)
     _reset_logger("uvicorn.access", propagate=False)
@@ -531,6 +502,9 @@ class MessagesRequest(BaseModel):
     top_k: Optional[int] = None
     tools: Optional[List[Tool]] = None
     tool_choice: Optional[Dict[str, Any]] = None
+    # Pass-through bag for arbitrary OpenAI Chat Completions keys. Merged
+    # with [tier].extra_body at convert time; per-leaf config-wins.
+    extra_body: Optional[Dict[str, Any]] = None
     original_model: Optional[str] = None
     # Populated by `derive_tier` (model_validator below); used by
     # convert_anthropic_to_litellm to look up per-tier CONFIG settings.
@@ -917,15 +891,6 @@ def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
     return deepcopy(base)
 
 
-def _is_skip_sampling(key: str, value: Any) -> bool:
-    """True when a sampling value should be treated as absent (None or empty stop)."""
-    if value is None:
-        return True
-    if key == "stop" and isinstance(value, list) and (not value or any(s == "" for s in value)):
-        return True
-    return False
-
-
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     call_ids, result_ids = collect_tool_ids(anthropic_request.messages)
 
@@ -942,7 +907,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     litellm_request: Dict[str, Any] = {
         "model": anthropic_request.model,
         "messages": messages,
-        "max_completion_tokens": min(anthropic_request.max_tokens, MAX_OUTPUT_TOKENS),
+        "max_completion_tokens": anthropic_request.max_tokens,
         "stream": anthropic_request.stream,
     }
     if anthropic_request.tools:
@@ -950,46 +915,45 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.tool_choice:
         litellm_request["tool_choice"] = convert_tool_choice(anthropic_request.tool_choice)
 
-    # Per-tier CONFIG: config wins per key; request value preserved only when
-    # the client explicitly sent a non-null value (Pydantic v2 includes
-    # explicit-null in model_fields_set, so _is_skip_sampling drops those to
-    # keep the wire form "unset" → upstream uses its own default rather than
-    # MessagesRequest's Pydantic defaults like temperature=1.0).
-    tier_cfg = _resolve_tier_config(anthropic_request)
+    # Pydantic sampling fields: only forwarded when the client explicitly
+    # sent a non-null value (model_fields_set tracks explicit sends, including
+    # explicit nulls, so we skip None to keep the wire form "unset" → upstream
+    # uses its own default rather than MessagesRequest's defaults like
+    # temperature=1.0).
     fields_set = anthropic_request.model_fields_set
+    if "temperature" in fields_set and anthropic_request.temperature is not None:
+        litellm_request["temperature"] = anthropic_request.temperature
+    if "top_p" in fields_set and anthropic_request.top_p is not None:
+        litellm_request["top_p"] = anthropic_request.top_p
+    if "top_k" in fields_set and anthropic_request.top_k is not None:
+        litellm_request["top_k"] = anthropic_request.top_k
+    if "stop_sequences" in fields_set and anthropic_request.stop_sequences:
+        litellm_request["stop"] = anthropic_request.stop_sequences
 
-    for kw, attr in (
-        ("temperature", "temperature"),
-        ("top_p", "top_p"),
-        ("top_k", "top_k"),
-        ("stop", "stop_sequences"),
-    ):
-        if kw in tier_cfg and not _is_skip_sampling(kw, tier_cfg[kw]):
-            litellm_request[kw] = tier_cfg[kw]
-        elif attr in fields_set:
-            value = getattr(anthropic_request, attr)
-            if _is_skip_sampling(kw, value):
-                continue
-            litellm_request[kw] = value
-
-    # Anthropic always sends max_tokens, so config can only lower the ceiling;
-    # MAX_OUTPUT_TOKENS remains the absolute OpenAI cap.
-    if "max_completion_tokens" in tier_cfg:
-        litellm_request["max_completion_tokens"] = min(
-            litellm_request["max_completion_tokens"],
-            int(tier_cfg["max_completion_tokens"]),
-        )
-
+    # [tier].extra_body (already global+tier-merged) → top-level kwargs.
+    # Pydantic sampling fields go in first, then extra_body overrides per
+    # leaf — so config-wins is automatic without a per-key special case.
+    # Client-supplied extra_body comes in below (before config) so config
+    # always wins on conflict.
+    tier_cfg = _resolve_tier_config(anthropic_request)
     if "seed" in tier_cfg:
         litellm_request["seed"] = tier_cfg["seed"]
 
-    # deep-merge: config keys win per leaf; unrelated request keys preserved.
-    # isinstance guard handles runtime-patched CONFIG that bypassed the loader.
-    cfg_extra = tier_cfg.get("extra_body")
-    if isinstance(cfg_extra, dict) and cfg_extra:
-        litellm_request["extra_body"] = _deep_merge(
-            litellm_request.get("extra_body", {}), cfg_extra
-        )
+    merged_extra: Dict[str, Any] = {}
+    if anthropic_request.extra_body:
+        merged_extra = _deep_merge(merged_extra, anthropic_request.extra_body)
+    tier_extra = tier_cfg.get("extra_body")
+    if isinstance(tier_extra, dict):
+        merged_extra = _deep_merge(merged_extra, tier_extra)
+
+    for k, v in merged_extra.items():
+        if k in _PROTECTED_KEYS:
+            logger.warning(f"ignoring protected key in extra_body: {k}")
+            continue
+        litellm_request[k] = v
+
+    if merged_extra:
+        litellm_request["allowed_openai_params"] = list(merged_extra.keys())
 
     return litellm_request
 
@@ -1270,6 +1234,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
     input_tokens = 0
     output_tokens = 0
     has_sent_stop_reason = False
+    debug_first_chunk_logged = False
+    debug_chunk_count = 0
 
     def new_tool_id() -> str:
         return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
@@ -1301,6 +1267,19 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
         async for chunk in response_generator:
             try:
+                if _litellm_debug_http_enabled():
+                    debug_chunk_count += 1
+                    # Log the first chunk so we see the upstream's wire shape;
+                    # for the rest, litellm.set_verbose + httpx DEBUG cover it.
+                    if not debug_first_chunk_logged:
+                        debug_first_chunk_logged = True
+                        try:
+                            logger.debug(
+                                f"litellm stream chunk #1 (first): "
+                                f"{json.dumps(chunk, default=str, ensure_ascii=False)}"
+                            )
+                        except Exception as e:
+                            logger.debug(f"litellm stream chunk dump failed: {e}")
                 usage = get_field(chunk, "usage")
                 if usage is not None:
                     input_tokens = get_field(usage, "prompt_tokens", input_tokens) or 0
@@ -1389,6 +1368,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 yield event
             for event in SseFormatter.finish("end_turn", output_tokens):
                 yield event
+        if _litellm_debug_http_enabled():
+            logger.debug(
+                f"litellm stream finished: {debug_chunk_count} chunks, "
+                f"input_tokens={input_tokens}, output_tokens={output_tokens}"
+            )
 
     except Exception as e:
         logger.error(f"Error in streaming: {e}", exc_info=True)
@@ -1414,14 +1398,24 @@ async def create_message(request: MessagesRequest):
         sanitize_messages_for_openai(litellm_request["messages"])
 
         # DEBUG: dump effective upstream params (request or config source).
+        # Skip the bulky fields (messages, tools) — they dominate the dump and
+        # are visible in litellm.set_verbose anyway.
         if logger.isEnabledFor(logging.DEBUG):
-            debug = {"model": litellm_request.get("model")}
-            for k in _ALLOWED_SAMPLING_KEYS:
-                if k in litellm_request:
-                    debug[k] = litellm_request[k]
-            if eb := litellm_request.get("extra_body"):
-                debug["extra_body"] = eb
+            debug = {k: v for k, v in litellm_request.items()
+                     if k not in ("messages", "tools")}
             logger.debug(f"upstream params: {debug}")
+
+            if _litellm_debug_http_enabled():
+                # Verbose: dump the entire kwargs dict going into litellm
+                # (messages, tools, tool_choice, …) so we can confirm the
+                # exact payload upstream sees, not just the sampling subset.
+                try:
+                    logger.debug(
+                        f"litellm.completion kwargs (full): "
+                        f"{json.dumps(litellm_request, default=str, ensure_ascii=False)}"
+                    )
+                except Exception as e:
+                    logger.debug(f"litellm.completion kwargs dump failed: {e}")
 
         log_request(
             "POST",
@@ -1446,6 +1440,20 @@ async def create_message(request: MessagesRequest):
         logger.debug(
             f"Response received: model={litellm_request.get('model')}, time={time.time() - start_time:.2f}s"
         )
+        if _litellm_debug_http_enabled():
+            try:
+                if hasattr(litellm_response, "model_dump"):
+                    payload = litellm_response.model_dump()
+                elif hasattr(litellm_response, "dict"):
+                    payload = litellm_response.dict()
+                else:
+                    payload = repr(litellm_response)
+                logger.debug(
+                    f"litellm.completion response (full): "
+                    f"{json.dumps(payload, default=str, ensure_ascii=False)}"
+                )
+            except Exception as e:
+                logger.debug(f"litellm.completion response dump failed: {e}")
         return convert_litellm_to_anthropic(litellm_response, request)
 
     except Exception as e:

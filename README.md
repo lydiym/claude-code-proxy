@@ -90,26 +90,21 @@ sonnet_model   = "qwen3.5"        # env: SONNET_MODEL  (optional)
 
 # Per-tier settings. [global] applies to every tier that has no explicit
 # section; a tier-specific section deep-merges over [global] at each leaf.
+# Sampling / reasoning / vendor knobs all live inside `extra_body` — there
+# is no per-key whitelist. Pass anything that the upstream OpenAI Chat
+# Completions API accepts.
 
 [global]
-# extra_body = { cache_prompt = true }
-
-[haiku]
-temperature = 0.3
-top_p       = 0.9
-top_k       = 40
-
-[haiku.extra_body]
-cache_prompt = true
-n_predict    = 4096
-
-[haiku.extra_body.chat_template_kwargs]
-enable_thinking = false
+extra_body = { temperature = 0.3 }
 
 [sonnet]
-extra_body = { chat_template_kwargs = { enable_thinking = false } }
-# temperature inherits from [global] if unset here
+extra_body = { temperature = 0.5, reasoning_effort = "low" }
+
+[opus]
+extra_body = { temperature = 0.7, top_p = 0.95 }
 ```
+
+Pick the knobs your backend actually understands — don't mix `reasoning_effort` (OpenAI o-series), `chat_template_kwargs` (llama.cpp), or Anthropic-native `thinking` in one section. They belong to different backends.
 
 ### Lookup order
 
@@ -123,9 +118,11 @@ Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` overr
 
 ### Per-tier merge semantics
 
-- **Sampling fields** (`temperature`, `top_p`, `top_k`, `max_completion_tokens`, `stop`, `seed`): when both config and the request set the same key, **config wins** at the leaf. When neither config nor the request sets the key, it is **omitted from the upstream call** (we don't auto-apply Anthropic defaults like `temperature=1.0`).
-- **`extra_body`**: deep-merged. Config keys override request keys at each leaf; unrelated request keys are preserved. LiteLLM merges this into the upstream OpenAI Chat Completions request body at top level — pass any backend-specific knob (`cache_prompt`, `n_predict`, `chat_template_kwargs`, …).
-- **`max_completion_tokens`**: config can only **lower** the ceiling. The OpenAI-side cap (`MAX_OUTPUT_TOKENS = 16384`) remains the absolute maximum.
+- **Sampling / reasoning / vendor fields** all live inside `[tier].extra_body` (and `[global].extra_body`). There is no per-key whitelist — pass any top-level key the upstream OpenAI Chat Completions API (or your compatible backend) accepts: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `max_completion_tokens`, `reasoning_effort`, `chat_template_kwargs`, `cache_prompt`, `n_predict`, …
+- **`extra_body`**: deep-merged. Config keys override client request keys at each leaf; unrelated client keys are preserved. Keys are lifted to top-level kwargs on the upstream call. The proxy also auto-registers them in `allowed_openai_params` so LiteLLM does not silently drop unfamiliar keys.
+- **Conflict resolution**: when both `[tier].extra_body` and the client request set the same key (whether via Pydantic sampling fields or a request-level `extra_body`), **config wins** per leaf.
+- **No defaults applied**: when neither config nor the request sets a key, it is **omitted from the upstream call** (we don't auto-apply Anthropic defaults like `temperature=1.0`).
+- **No `max_tokens` clamp**: client `max_tokens` flows through unmodified. If a user asks for 24000, upstream gets 24000.
 
 ### Targeting llama-server / ollama / vLLM
 
@@ -141,17 +138,10 @@ big_model   = "qwen3.5"
 small_model = "qwen3.5"
 
 [haiku]
-temperature = 0.3
-
-[haiku.extra_body]
-cache_prompt = true
-n_predict    = 4096
-
-[haiku.extra_body.chat_template_kwargs]
-enable_thinking = false
+extra_body = { temperature = 0.3, cache_prompt = true, n_predict = 4096, chat_template_kwargs = { enable_thinking = false } }
 ```
 
-Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, etc. land in the body. For offline checks, set `LOG_LEVEL=DEBUG` — the proxy logs the effective sampling fields + `extra_body` per request (sourced from request or `[tier]` config).
+Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, etc. land in the body. For offline checks, set `LOG_LEVEL=DEBUG` — the proxy logs the effective `extra_body` per request (sourced from request or `[tier]` config).
 
 ## How It Works 🧩
 
