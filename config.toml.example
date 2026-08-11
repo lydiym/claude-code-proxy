@@ -63,10 +63,9 @@
 #   - [global] applies to every tier that has no explicit override.
 #   - [bucket] (small for haiku, big for everything else) deep-merges over [global].
 #   - [tier] deep-merges over [bucket] (config-wins per leaf at every level).
-#   - If both the client request and config set the same key, config wins.
 #   - Keys in extra_body are lifted to top-level kwargs on the upstream call.
-#   - The proxy auto-registers all extra_body keys as allowed_openai_params
-#     so LiteLLM does not silently drop them.
+#   - Merged keys land in extra_body.allowed_openai_params so cascade proxies
+#     (litellm, OpenAI-SDK) forward them rather than filtering.
 #
 # Model lookup order per tier (first non-empty wins):
 #   {TIER}_MODEL env → {BIG|SMALL}_MODEL env → [tier].model

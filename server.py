@@ -1004,8 +1004,12 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             continue
         litellm_request[k] = v
 
+    # Cascade-safe: downstream litellm / OpenAI-SDK proxies read the whitelist
+    # via extra_body, not a top-level kwarg.
     if merged_extra:
-        litellm_request["allowed_openai_params"] = list(merged_extra.keys())
+        litellm_request["extra_body"] = {
+            "allowed_openai_params": list(merged_extra.keys()),
+        }
 
     return litellm_request
 
