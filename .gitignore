@@ -2,6 +2,9 @@
 .env
 config.toml
 
+# Vendored third-party sources — reference only, never committed
+vendoring_docs/
+
 # Python
 __pycache__/
 *.py[cod]
