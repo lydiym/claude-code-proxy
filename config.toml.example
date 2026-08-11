@@ -1,0 +1,79 @@
+# All settings are optional. Env vars (or .env) override per-key — see README.md.
+#
+# Copy to config.toml and edit. The schema is:
+#
+#   [proxy]    credentials / endpoint (or set OPENAI_API_KEY / OPENAI_BASE_URL)
+#   [big]      model + extra_body for sonnet/opus/fable/mythos
+#   [small]    model + extra_body for haiku
+#   [global]   model + extra_body fallback for every tier
+#   [haiku] / [sonnet] / [opus] / [fable] / [mythos]   per-tier overrides
+#              (optional model + extra_body)
+#
+# Every section except [proxy] accepts the same shape: optional `model`
+# (string) + `extra_body` (dict). extra_body is deep-merged into the
+# upstream OpenAI Chat Completions body at top level — sampling, reasoning,
+# vendor knobs, anything goes:
+
+# [proxy]
+# openai_api_key    = "sk-..."                       # env: OPENAI_API_KEY
+# openai_base_url   = "http://localhost:8081/v1"     # env: OPENAI_BASE_URL
+# openai_tls_verify = true                           # env: OPENAI_TLS_VERIFY
+# tiktoken_offline  = true                           # env: TIKTOKEN_OFFLINE
+
+# [big]
+# model       = "gpt-4.1"        # env: BIG_MODEL
+# extra_body  = { ... }          # optional
+#
+# [small]
+# model       = "gpt-4.1-mini"   # env: SMALL_MODEL
+# extra_body  = { ... }          # optional
+
+# --- Per-tier overrides (optional) ---
+# [haiku]    model = "..."   # env: HAIKU_MODEL   — overrides [small].model
+# [sonnet]   model = "..."   # env: SONNET_MODEL  — overrides [big].model
+# [opus]     model = "..."   # env: OPUS_MODEL
+# [fable]    model = "..."   # env: FABLE_MODEL
+# [mythos]   model = "..."   # env: MYTHOS_MODEL
+
+# --- Per-tier / [global] example (OpenAI-style backend) ---
+
+# [global]
+# model       = "gpt-4.1"        # catch-all fallback for any model
+# extra_body  = { temperature = 0.3 }
+#
+# [sonnet]
+# model       = "gpt-4.1"
+# extra_body  = { temperature = 0.5, reasoning_effort = "low" }
+#
+# [opus]
+# model       = "gpt-4.1"
+# extra_body  = { temperature = 0.7, top_p = 0.95 }
+
+# --- Alternative: llama.cpp / Qwen backend ---
+
+# [global]
+# model       = "qwen3.5"
+# extra_body  = { temperature = 0.3 }
+#
+# [haiku]
+# model       = "qwen3.5"
+# extra_body  = { n_predict = 1024, chat_template_kwargs = { enable_thinking = false } }
+
+# Merge rules:
+#   - [global] applies to every tier that has no explicit override.
+#   - [bucket] (small for haiku, big for everything else) deep-merges over [global].
+#   - [tier] deep-merges over [bucket] (config-wins per leaf at every level).
+#   - Keys in extra_body are lifted to top-level kwargs on the upstream call.
+#   - The merged key list is published as allowed_openai_params (top-level +
+#     inside extra_body) so the litellm hop and cascade proxies forward
+#     vendor keys rather than filtering them.
+#
+# Model lookup order per tier (first non-empty wins):
+#   {TIER}_MODEL env → {BIG|SMALL}_MODEL env → [tier].model
+#   → [bucket].model → [global].model → built-in
+#
+# Backend-specific knobs: pick the ones your upstream understands. Don't
+# mix `reasoning_effort` (OpenAI o-series) with `chat_template_kwargs`
+# (llama.cpp) — they belong to different backends. `thinking` is an
+# Anthropic-native field; if your backend speaks Anthropic API directly
+# (not OpenAI Chat Completions), it will accept it as top-level.

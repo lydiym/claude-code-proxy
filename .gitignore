@@ -1,5 +1,9 @@
-# Environment variables
+# Local config / env
 .env
+config.toml
+
+# Vendored third-party sources — reference only, never committed
+vendoring_docs/
 
 # Python
 __pycache__/
