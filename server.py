@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import lru_cache
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal, Iterator
@@ -119,11 +120,10 @@ _PROXY_KEYS = {
     "openai_api_key", "openai_base_url",
     "openai_tls_verify",
 }
-_ROUTING_KEYS = {
-    "big_model", "small_model",
-    "haiku_model", "sonnet_model", "opus_model", "fable_model", "mythos_model",
-}
-_VALID_SECTIONS = {"proxy", "routing", "global"} | _VALID_TIERS
+# haiku → small; everything else → big. Single source of truth for which bucket
+# a tier inherits from.
+_BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
+_VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -177,12 +177,32 @@ def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
     return out
 
 
+def _parse_bucket_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
+    """Parse [big], [small], or a per-tier section. Accepts `model` (str) and
+    `extra_body` (dict). Bad values warned and skipped."""
+    out: Dict[str, Any] = {}
+    for k, v in body.items():
+        if k == "model":
+            if not isinstance(v, str) or not v:
+                logger.warning(f"[{section}].model must be a non-empty string; ignoring")
+                continue
+            out[k] = v
+        elif k == "extra_body":
+            if not isinstance(v, dict):
+                logger.warning(f"[{section}].extra_body must be a table; ignoring")
+                continue
+            out[k] = deepcopy(v)
+        else:
+            logger.warning(f"[{section}].{k} is not a recognised key; put it inside extra_body")
+    return out
+
+
 _COERCE_DROP = object()  # sentinel: coercion failed, key should be dropped
 _BOOL_TLS_VERIFY = {"openai_tls_verify"}
 
 
 def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
-    """Coerce a [proxy] / [routing] TOML value to the expected Python type.
+    """Coerce a [proxy] TOML value to the expected Python type.
     Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped."""
     if isinstance(value, str):
         return value  # strings are the canonical type for api_key, base_url, model names
@@ -196,7 +216,7 @@ def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
 
 def _load_config(path: str) -> Dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
-    out: Dict[str, Any] = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+    out: Dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
     if not path:
         return out
     if not os.path.isfile(path):
@@ -228,20 +248,12 @@ def _load_config(path: str) -> Dict[str, Any]:
                 if coerced is _COERCE_DROP:
                     continue
                 out["proxy"][k] = coerced
-        elif section == "routing":
-            allowed = _ROUTING_KEYS
-            for k, v in body.items():
-                if k not in allowed:
-                    logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
-                    continue
-                coerced = _coerce_proxy_value(k, v, section)
-                if coerced is _COERCE_DROP:
-                    continue
-                out["routing"][k] = coerced
+        elif section in ("big", "small"):
+            out[section] = _parse_bucket_section(body, section)
         elif section == "global":
             out["global"] = _parse_tier_section(body, section)
         else:  # per-tier section
-            out["tiers"][section] = _parse_tier_section(body, section)
+            out["tiers"][section] = _parse_bucket_section(body, section)
     return out
 
 
@@ -251,28 +263,25 @@ try:
 except Exception as e:
     # Infrastructure error only — parse failures are handled inside _load_config.
     logger.error(f"Failed to load CONFIG_PATH={CONFIG_PATH!r}: {e}; using env vars only")
-    CONFIG = {"proxy": {}, "routing": {}, "global": {}, "tiers": {}}
+    CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
 
 # WARNING so the boot summary shows up before uvicorn installs its own handlers.
 logger.warning(
     f"Loaded config from {CONFIG_PATH!r}: "
-    f"proxy={list(CONFIG['proxy'])}, routing={list(CONFIG['routing'])}, "
+    f"proxy={list(CONFIG['proxy'])}, "
+    f"big={CONFIG['big']}, small={CONFIG['small']}, "
     f"global={'yes' if CONFIG['global'] else 'no'}, tiers={list(CONFIG['tiers'])}"
 )
 
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
-    """env var → CONFIG[proxy|routing][key] → default. None / "" fall through."""
-    if key in _PROXY_KEYS:
-        section = "proxy"
-    elif key in _ROUTING_KEYS:
-        section = "routing"
-    else:
-        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy/routing key")
+    """env var → CONFIG[proxy][key] → default. None / "" fall through."""
+    if key not in _PROXY_KEYS:
+        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy key")
     env_val = os.environ.get(env_name)
     if env_val not in (None, ""):
         return env_val
-    val = CONFIG[section].get(key)
+    val = CONFIG["proxy"].get(key)
     if val not in (None, ""):
         return val
     return default
@@ -288,20 +297,36 @@ def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
     return _str_to_bool(val, default=default)
 
 
-def _get_tier_override(tier: str) -> Optional[str]:
-    """Per-request lookup of the per-tier routing override (e.g. HAIKU_MODEL).
-    Re-read each call so CONFIG edits to [routing] take effect without restart;
-    the BIG/SMALL fallback is captured at import (see _default_for_tier)."""
-    return _proxy_value(f"{tier}_model", f"{tier.upper()}_MODEL")
+@lru_cache(maxsize=None)
+def _default_model_for_tier(tier: str) -> str:
+    """Per-tier upstream model. Lookup order:
+      1. {TIER}_MODEL env (e.g. HAIKU_MODEL)
+      2. {BIG|SMALL}_MODEL env
+      3. [tier].model config
+      4. [bucket].model config (haiku → small, others → big)
+      5. Built-in default
+    Cached at first call — env or CONFIG.toml edits after import require restart.
+    Live edits to [tier].extra_body still take effect via the per-call
+    _resolve_tier_config."""
+    bucket = "small" if tier == "haiku" else "big"
+    tier_env = f"{tier.upper()}_MODEL"
+    bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
+    built_in = "gpt-4.1-mini" if bucket == "small" else "gpt-4.1"
 
+    env_val = os.environ.get(tier_env)
+    if env_val not in (None, ""):
+        return env_val
+    env_val = os.environ.get(bucket_env)
+    if env_val not in (None, ""):
+        return env_val
 
-def _default_for_tier(tier: str) -> str:
-    """Fallback model for a tier when no per-tier override is set.
-    Re-reads per call so edits to [routing].big_model / small_model take
-    effect without restart."""
-    if tier == "haiku":
-        return _proxy_value("small_model", "SMALL_MODEL", "gpt-4.1-mini")
-    return _proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
+    tier_cfg = (CONFIG.get("tiers") or {}).get(tier) or {}
+    if isinstance(tier_cfg.get("model"), str) and tier_cfg["model"]:
+        return tier_cfg["model"]
+    bucket_cfg = CONFIG.get(bucket) or {}
+    if isinstance(bucket_cfg.get("model"), str) and bucket_cfg["model"]:
+        return bucket_cfg["model"]
+    return built_in
 
 
 class Colors:
@@ -373,12 +398,6 @@ app = FastAPI(lifespan=_configure_logging)
 
 OPENAI_API_KEY = _proxy_value("openai_api_key", "OPENAI_API_KEY")
 OPENAI_BASE_URL = _proxy_value("openai_base_url", "OPENAI_BASE_URL")
-BIG_MODEL = _proxy_value("big_model", "BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = _proxy_value("small_model", "SMALL_MODEL", "gpt-4.1-mini")
-
-# Per-tier default; the matching TIERNAME_MODEL config (or env var) overrides it.
-# TIER_KEYS (defined near the top) is the canonical tier list; _default_for_tier
-# maps each tier to SMALL_MODEL (haiku) or BIG_MODEL (everything else).
 
 # Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
 OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True)
@@ -529,9 +548,8 @@ class MessagesRequest(BaseModel):
     def validate_model_field(cls, v):
         clean_v = _strip_provider_prefix(v)  # case preserved
 
-        new_model = None
         if tier := _match_tier(v):
-            chosen = _get_tier_override(tier) or _default_for_tier(tier)
+            chosen = _default_model_for_tier(tier)
             new_model = f"openai/{chosen}"
         elif clean_v.lower() in OPENAI_MODELS and not v.lower().startswith("openai/"):
             new_model = f"openai/{clean_v}"
@@ -879,16 +897,29 @@ def sanitize_messages_for_openai(messages):
 
 
 def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
-    """Tier-specific config deep-merged over [global]; tier=None → just [global].
-    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts.
-    None guards on global/tiers/tier itself so a partially-patched CONFIG doesn't crash."""
-    base = CONFIG.get("global") or {}
-    tiers = CONFIG.get("tiers") or {}
+    """extra_body merge chain: [global] → [bucket] → [tier].
+    haiku → small bucket; others → big bucket; tier=None → no bucket or tier.
+    `model` is consumed by _default_model_for_tier and stripped from the result.
+    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts."""
+    layers: List[Dict[str, Any]] = []
+    global_cfg = CONFIG.get("global")
+    if global_cfg is not None:
+        layers.append(global_cfg)
+    bucket = _BUCKET_FOR_TIER.get(request.tier) if request.tier else None
+    if bucket:
+        bucket_cfg = CONFIG.get(bucket)
+        if bucket_cfg is not None:
+            layers.append(bucket_cfg)
     if request.tier:
-        tier_cfg = tiers.get(request.tier)
+        tier_cfg = (CONFIG.get("tiers") or {}).get(request.tier)
         if tier_cfg is not None:
-            return deepcopy(_deep_merge(base, tier_cfg))
-    return deepcopy(base)
+            layers.append(tier_cfg)
+
+    merged: Dict[str, Any] = {}
+    for layer in layers:
+        merged = _deep_merge(merged, layer)
+    merged.pop("model", None)
+    return deepcopy(merged)
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:

@@ -29,8 +29,7 @@ The proxy is a single FastAPI app (`server.py`) with the following pieces. They'
 `MessagesRequest.validate_model_field` runs during parsing and **rewrites** the model field to an `openai/<name>` string. Mapping rules:
 
 - Substring match on tier name (`haiku`/`sonnet`/`opus`/`fable`/`mythos`) chooses the tier's target
-- `haiku` uses `SMALL_MODEL`; everything else uses `BIG_MODEL` by default
-- Per-tier overrides (`HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `MYTHOS_MODEL`) take precedence over `BIG_MODEL`/`SMALL_MODEL`
+- The tier's model is resolved by `_default_model_for_tier(tier)` (cached at first call): `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` (haiku → `small`, others → `big`) → built-in default
 - Bare names in `OPENAI_MODELS` get prefixed with `openai/`; an existing `openai/` prefix passes through; unknown names get prefixed (assumes custom OpenAI-compatible endpoint)
 - `anthropic/`, `openai/`, `gemini/` prefixes are stripped before matching
 
@@ -72,22 +71,23 @@ These three knobs make the proxy work on isolated networks:
 
 The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PATH`) once at import time. Every key is optional and falls back to the equivalent env var — so `.env` is only needed for Docker overrides. The loader uses stdlib `tomllib` (Python ≥ 3.12).
 
-**Schema** (normalised to `CONFIG = {"proxy": ..., "routing": ..., "global": ..., "tiers": {...}}`):
+**Schema** (normalised to `CONFIG = {"proxy": ..., "global": ..., "big": ..., "small": ..., "tiers": {...}}`):
 
 - `[proxy]` — `openai_api_key`, `openai_base_url`, `openai_tls_verify`. `tiktoken_offline` is parsed by the standalone resolver above (not part of the main loader schema).
-- `[routing]` — `big_model`, `small_model`, plus per-tier overrides (`haiku_model`, `sonnet_model`, `opus_model`, `fable_model`, `mythos_model`)
-- `[global]` — fallback per-tier settings (`extra_body` only — sampling/reasoning/vendor knobs all live here)
-- `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — tier-specific settings (also `extra_body` only)
+- `[big]` / `[small]` — bucket sections; accept `model` (str) + `extra_body` (dict). haiku → `[small]`, everything else → `[big]`.
+- `[global]` — fallback per-tier settings (`extra_body` only — sampling/reasoning/vendor knobs all live here). No `model` here.
+- `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — per-tier sections; same shape as `[big]`/`[small]` (optional `model` + `extra_body`).
 
-**Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy/routing setting. Lookup order per key: env var → `CONFIG` → built-in default. Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.
+**Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy setting. Lookup order per key: env var → `CONFIG` → built-in default. Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.
 
-**Per-tier capture** happens in `MessagesRequest.derive_tier` (a `@model_validator(mode="after")`) which inspects `original_model`, strips any `anthropic/` / `openai/` / `gemini/` prefix, and substring-matches against `TIER_DEFAULT` (insertion-order priority: `haiku` first). Unknown models end up with `tier=None` and fall back to `[global]`.
+**Per-tier capture** happens in `MessagesRequest.derive_tier` (a `@model_validator(mode="after")`) which inspects `original_model`, strips any `anthropic/` / `openai/` / `gemini/` prefix, and substring-matches against `TIER_KEYS` (insertion-order priority: `haiku` first). Unknown models end up with `tier=None` and fall back to `[global]`.
 
 **Per-tier injection** at the tail of `convert_anthropic_to_litellm`:
 
+- The tier's merged config is produced by `_resolve_tier_config(request)`: layers `[global]` → `[bucket]` (`[small]` for haiku, `[big]` otherwise) → `[tier]` are deep-merged in order; later wins per leaf. `model` is stripped from the result.
 - Sampling fields (`temperature`, `top_p`, `top_k`, `stop_sequences`): Pydantic pass-through (only when client sent a non-null value via `model_fields_set`), then `extra_body` overrides per leaf. Field is **omitted from the upstream call** when neither sets it (no Anthropic defaults auto-applied).
 - `seed`: config-only field (no Anthropic counterpart), forwarded as top-level kwarg when set in `[tier].extra_body`.
-- `extra_body`: deep-merged via `_deep_merge` from `request.extra_body` (client) then `tier_cfg["extra_body"]` (already global+tier-merged). Config wins per leaf; unrelated client keys are preserved. Keys are lifted to top-level kwargs on the upstream call (works for any OpenAI-compatible backend: llama-server, ollama, vLLM, llama.cpp). All merged keys are auto-registered as `allowed_openai_params` so LiteLLM does not silently drop unfamiliar ones.
+- `extra_body`: deep-merged via `_deep_merge` from `request.extra_body` (client) then `tier_cfg["extra_body"]` (already global+bucket+tier-merged). Config wins per leaf; unrelated client keys are preserved. Keys are lifted to top-level kwargs on the upstream call (works for any OpenAI-compatible backend: llama-server, ollama, vLLM, llama.cpp). All merged keys are auto-registered as `allowed_openai_params` so LiteLLM does not silently drop unfamiliar ones.
 - Protected keys (`model`, `messages`, `stream`, `tools`): if present in `extra_body`, the proxy warns and skips — these are owned by the proxy itself.
 
 The discriminator between "client sent the field" and "Pydantic default applied" is `MessagesRequest.model_fields_set` (Pydantic v2) — an O(1) set lookup. `_patched_config` in `tests.py` is the patching helper for unit tests.

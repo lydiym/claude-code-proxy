@@ -3,13 +3,16 @@
 # Copy to config.toml and edit. The schema is:
 #
 #   [proxy]    credentials / endpoint (or set OPENAI_API_KEY / OPENAI_BASE_URL)
-#   [routing]  which upstream model each tier uses
-#   [global]   sampling / extra_body fallback for every tier
+#   [big]      model + extra_body for sonnet/opus/fable/mythos
+#   [small]    model + extra_body for haiku
+#   [global]   extra_body fallback for every tier (no model here)
 #   [haiku] / [sonnet] / [opus] / [fable] / [mythos]   per-tier overrides
+#              (optional model + extra_body)
 #
-# Every per-tier and [global] section accepts only `extra_body` — a free-form
-# dict that is deep-merged into the upstream OpenAI Chat Completions body at
-# top level. Sampling, reasoning, vendor knobs — anything goes:
+# All sections except [proxy] and [global] accept the same shape: optional
+# `model` (string) + `extra_body` (dict). extra_body is deep-merged into the
+# upstream OpenAI Chat Completions body at top level — sampling, reasoning,
+# vendor knobs, anything goes:
 
 # [proxy]
 # openai_api_key    = "sk-..."                       # env: OPENAI_API_KEY
@@ -17,12 +20,20 @@
 # openai_tls_verify = true                           # env: OPENAI_TLS_VERIFY
 # tiktoken_offline  = true                           # env: TIKTOKEN_OFFLINE
 
-# [routing]
-# big_model   = "gpt-4.1"        # env: BIG_MODEL
-# small_model = "gpt-4.1-mini"   # env: SMALL_MODEL
-# haiku_model = "qwen3.5"        # env: HAIKU_MODEL  (optional)
-# sonnet_model = "qwen3.5"       # env: SONNET_MODEL (optional)
-# opus_model  = "qwen3.5"        # env: OPUS_MODEL   (optional)
+# [big]
+# model       = "gpt-4.1"        # env: BIG_MODEL
+# extra_body  = { ... }          # optional
+#
+# [small]
+# model       = "gpt-4.1-mini"   # env: SMALL_MODEL
+# extra_body  = { ... }          # optional
+
+# --- Per-tier overrides (optional) ---
+# [haiku]    model = "..."   # env: HAIKU_MODEL   — overrides [small].model
+# [sonnet]   model = "..."   # env: SONNET_MODEL  — overrides [big].model
+# [opus]     model = "..."   # env: OPUS_MODEL
+# [fable]    model = "..."   # env: FABLE_MODEL
+# [mythos]   model = "..."   # env: MYTHOS_MODEL
 
 # --- Per-tier / [global] example (OpenAI-style backend) ---
 
@@ -45,11 +56,15 @@
 
 # Merge rules:
 #   - [global] applies to every tier that has no explicit override.
-#   - A per-tier section deep-merges over [global] at each leaf (config-wins).
+#   - [bucket] (small for haiku, big for everything else) deep-merges over [global].
+#   - [tier] deep-merges over [bucket] (config-wins per leaf at every level).
 #   - If both the client request and config set the same key, config wins.
 #   - Keys in extra_body are lifted to top-level kwargs on the upstream call.
 #   - The proxy auto-registers all extra_body keys as allowed_openai_params
 #     so LiteLLM does not silently drop them.
+#
+# Model lookup order per tier (first non-empty wins):
+#   {TIER}_MODEL env → {BIG|SMALL}_MODEL env → [tier].model → [bucket].model → built-in
 #
 # Backend-specific knobs: pick the ones your upstream understands. Don't
 # mix `reasoning_effort` (OpenAI o-series) with `chat_template_kwargs`

@@ -24,7 +24,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
 
 2. **Configure the proxy.** You have two equivalent options — pick whichever fits your workflow:
    - **`config.toml`** (recommended): copy `config.toml.example` to `config.toml`, then edit. See [Configuration](#configuration) below for the full schema.
-   - **`.env`** (for Docker / simple setups): copy `.env.example` to `.env`, then edit. Every key in `.env` has a TOML equivalent in `[proxy]` / `[routing]`.
+   - **`.env`** (for Docker / simple setups): copy `.env.example` to `.env`, then edit. Every key in `.env` has a TOML equivalent in `[proxy]` / `[big]` / `[small]`.
 
    ```bash
    cp config.toml.example config.toml   # or: cp .env.example .env
@@ -50,22 +50,23 @@ Claude Code sends requests naming Claude models (`claude-3-5-sonnet-...`, `claud
 
 | Claude Model | Default Mapping | Override |
 |--------------|-----------------|----------|
-| haiku        | `openai/SMALL_MODEL` (default `gpt-4.1-mini`) | set `SMALL_MODEL` or `HAIKU_MODEL` |
-| sonnet       | `openai/BIG_MODEL` (default `gpt-4.1`) | set `BIG_MODEL` or `SONNET_MODEL` |
-| opus / fable / mythos | `openai/BIG_MODEL` (default `gpt-4.1`) | set `BIG_MODEL`, or `OPUS_MODEL` / `FABLE_MODEL` / `MYTHOS_MODEL` |
+| haiku        | `openai/[small].model` (default `gpt-4.1-mini`) | set `SMALL_MODEL`, `HAIKU_MODEL`, or `[small].model` / `[haiku].model` |
+| sonnet       | `openai/[big].model` (default `gpt-4.1`) | set `BIG_MODEL`, `SONNET_MODEL`, or `[big].model` / `[sonnet].model` |
+| opus / fable / mythos | `openai/[big].model` (default `gpt-4.1`) | set `BIG_MODEL` or `[tier].model` |
 | anything else with `openai/` prefix | passed through | — |
 | bare model name in `OPENAI_MODELS` | `openai/<name>` | add to the list in `server.py` |
 | anything else | `openai/<name>` (assumes custom OpenAI-compatible endpoint) | — |
 
-A per-tier override (`HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `MYTHOS_MODEL`) takes precedence over `BIG_MODEL` / `SMALL_MODEL` for that tier only; tiers without an override keep using `BIG_MODEL` / `SMALL_MODEL`. Use this to point different Claude tiers at different backends — e.g. opus at a strong model while sonnet uses the default.
+A per-tier section (`[haiku]`, `[sonnet]`, `[opus]`, `[fable]`, `[mythos]`) with its own `model` overrides `[big].model` / `[small].model` for that tier only; tiers without an override keep using the bucket default. Use this to point different Claude tiers at different backends — e.g. opus at a strong model while sonnet uses the default.
 
-To target a custom model on a compatible endpoint, set both `BIG_MODEL` and `SMALL_MODEL` to that name:
+To target a custom model on a compatible endpoint, set `[big].model` and `[small].model` (or `BIG_MODEL` / `SMALL_MODEL` env vars):
 
-```dotenv
-OPENAI_API_KEY="sk-..."
-OPENAI_BASE_URL="https://api.your-provider.com/v1"
-BIG_MODEL="your-model-name"
-SMALL_MODEL="your-model-name"
+```toml
+[big]
+model = "your-model-name"
+
+[small]
+model = "your-model-name"
 ```
 
 ## Configuration ⚙️
@@ -81,18 +82,19 @@ openai_base_url    = "http://localhost:8081/v1"     # env: OPENAI_BASE_URL (opti
 openai_tls_verify  = true                           # env: OPENAI_TLS_VERIFY
 tiktoken_offline   = true                           # env: TIKTOKEN_OFFLINE
 
-[routing]
-big_model      = "gpt-4.1"        # env: BIG_MODEL
-small_model    = "gpt-4.1-mini"   # env: SMALL_MODEL
-haiku_model    = "qwen3.5"        # env: HAIKU_MODEL   (optional)
-sonnet_model   = "qwen3.5"        # env: SONNET_MODEL  (optional)
-# opus_model / fable_model / mythos_model all optional
+[big]
+model       = "gpt-4.1"        # env: BIG_MODEL
+extra_body  = { ... }          # optional
 
-# Per-tier settings. [global] applies to every tier that has no explicit
-# section; a tier-specific section deep-merges over [global] at each leaf.
-# Sampling / reasoning / vendor knobs all live inside `extra_body` — there
-# is no per-key whitelist. Pass anything that the upstream OpenAI Chat
-# Completions API accepts.
+[small]
+model       = "gpt-4.1-mini"   # env: SMALL_MODEL
+extra_body  = { ... }          # optional
+
+# Per-tier settings. [global] applies to every tier; [bucket] ([big]/[small])
+# applies to its tiers; [tier] overrides both. All deep-merge with later layers
+# winning per leaf. Sampling / reasoning / vendor knobs all live inside
+# `extra_body` — there is no per-key whitelist. Pass anything that the upstream
+# OpenAI Chat Completions API accepts.
 
 [global]
 extra_body = { temperature = 0.3 }
@@ -110,17 +112,18 @@ Pick the knobs your backend actually understands — don't mix `reasoning_effort
 
 For each setting, the proxy uses the first non-empty value from this list:
 
-1. Environment variable (e.g. `OPENAI_API_KEY`)
-2. `config.toml` (the matching `[proxy]` / `[routing]` / `[global]` / `[tier]` section)
-3. Built-in default (e.g. `BIG_MODEL` → `gpt-4.1`)
+1. Environment variable (e.g. `OPENAI_API_KEY`, `BIG_MODEL`, `HAIKU_MODEL`)
+2. `config.toml` (the matching `[proxy]` / `[big]` / `[small]` / `[global]` / `[tier]` section)
+3. Built-in default (e.g. `[big].model` → `gpt-4.1`)
 
 Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.
 
 ### Per-tier merge semantics
 
-- **Sampling / reasoning / vendor fields** all live inside `[tier].extra_body` (and `[global].extra_body`). There is no per-key whitelist — pass any top-level key the upstream OpenAI Chat Completions API (or your compatible backend) accepts: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `max_completion_tokens`, `reasoning_effort`, `chat_template_kwargs`, `cache_prompt`, `n_predict`, …
-- **`extra_body`**: deep-merged. Config keys override client request keys at each leaf; unrelated client keys are preserved. Keys are lifted to top-level kwargs on the upstream call. The proxy also auto-registers them in `allowed_openai_params` so LiteLLM does not silently drop unfamiliar keys.
-- **Conflict resolution**: when both `[tier].extra_body` and the client request set the same key (whether via Pydantic sampling fields or a request-level `extra_body`), **config wins** per leaf.
+- **Model selection**: per tier, the resolver walks `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` → built-in default. First non-empty wins.
+- **extra_body merge chain**: `[global] → [bucket] → [tier]` (haiku → `small`, others → `big`). Each layer deep-merges; later wins per leaf. Keys are lifted to top-level kwargs on the upstream call and auto-registered in `allowed_openai_params` so LiteLLM does not silently drop them.
+- **Sampling / reasoning / vendor fields** all live inside `[tier].extra_body` (and `[global].extra_body` / `[bucket].extra_body`). There is no per-key whitelist — pass any top-level key the upstream OpenAI Chat Completions API (or your compatible backend) accepts: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `max_completion_tokens`, `reasoning_effort`, `chat_template_kwargs`, `cache_prompt`, `n_predict`, …
+- **Conflict resolution**: when both a config layer (`[global]` / `[bucket]` / `[tier]`) and the client request set the same key (whether via Pydantic sampling fields or a request-level `extra_body`), **config wins** per leaf.
 - **No defaults applied**: when neither config nor the request sets a key, it is **omitted from the upstream call** (we don't auto-apply Anthropic defaults like `temperature=1.0`).
 - **No `max_tokens` clamp**: client `max_tokens` flows through unmodified. If a user asks for 24000, upstream gets 24000.
 
@@ -133,9 +136,11 @@ These backends ignore standard OpenAI sampling params but accept a `chat_templat
 openai_api_key  = "no-key"
 openai_base_url = "http://localhost:8081/v1"
 
-[routing]
-big_model   = "qwen3.5"
-small_model = "qwen3.5"
+[big]
+model = "qwen3.5"
+
+[small]
+model = "qwen3.5"
 
 [haiku]
 extra_body = { temperature = 0.3, cache_prompt = true, n_predict = 4096, chat_template_kwargs = { enable_thinking = false } }
@@ -146,7 +151,7 @@ Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_temp
 ## How It Works 🧩
 
 1. **Receive** the request in Anthropic's Messages API format 📥
-2. **Remap** the model (`haiku`/`sonnet` → `SMALL_MODEL`/`BIG_MODEL`) 🗺️
+2. **Remap** the model (`haiku`/`sonnet`/`opus`/... → `[small].model` / `[big].model` / `[tier].model`) 🗺️
 3. **Translate** to OpenAI Chat Completions format via LiteLLM 🔄
 4. **Send** to OpenAI (or any `OPENAI_BASE_URL`) 📤
 5. **Convert** the response back to Anthropic format 🔄
