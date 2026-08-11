@@ -90,11 +90,9 @@ extra_body  = { ... }          # optional
 model       = "gpt-4.1-mini"   # env: SMALL_MODEL
 extra_body  = { ... }          # optional
 
-# Per-tier settings. [global] applies to every tier; [bucket] ([big]/[small])
-# applies to its tiers; [tier] overrides both. All deep-merge with later layers
-# winning per leaf. Sampling / reasoning / vendor knobs all live inside
-# `extra_body` — there is no per-key whitelist. Pass anything that the upstream
-# OpenAI Chat Completions API accepts.
+# Per-tier: [global] for every tier, [bucket] ([big]/[small]) for its tiers,
+# [tier] overrides both. Deep-merge, later wins per leaf. Sampling / reasoning
+# / vendor knobs all live in `extra_body` — no per-key whitelist.
 
 [global]
 model       = "gpt-4.1"        # catch-all fallback for any model
