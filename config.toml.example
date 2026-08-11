@@ -64,8 +64,10 @@
 #   - [bucket] (small for haiku, big for everything else) deep-merges over [global].
 #   - [tier] deep-merges over [bucket] (config-wins per leaf at every level).
 #   - Keys in extra_body are lifted to top-level kwargs on the upstream call.
-#   - Merged keys land in extra_body.allowed_openai_params so cascade proxies
-#     (litellm, OpenAI-SDK) forward them rather than filtering.
+#   - The merged key list is published as allowed_openai_params (top-level +
+#     inside extra_body) so our litellm hop extends supported_params, and
+#     cascade proxies (litellm proxy, OpenWebUI) see the whitelist and forward
+#     vendor keys rather than filtering.
 #
 # Model lookup order per tier (first non-empty wins):
 #   {TIER}_MODEL env → {BIG|SMALL}_MODEL env → [tier].model

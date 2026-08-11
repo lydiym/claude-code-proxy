@@ -2098,6 +2098,7 @@ def test_extra_body_simple() -> None:
                               "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["reasoning_effort"] == "low"
+        assert out["allowed_openai_params"] == ["reasoning_effort"]
         assert out["extra_body"]["allowed_openai_params"] == ["reasoning_effort"]
 
 
@@ -2167,7 +2168,7 @@ def test_extra_body_protected_keys_blocked() -> None:
 
 
 def test_extra_body_allowed_openai_params_set() -> None:
-    """Non-empty extra_body → extra_body.allowed_openai_params for cascade proxies."""
+    """Non-empty extra_body → top-level + extra_body.allowed_openai_params."""
     with _patched_config("""
         [sonnet]
         extra_body = { reasoning_effort = "low", top_k = 5 }
@@ -2176,6 +2177,7 @@ def test_extra_body_allowed_openai_params_set() -> None:
                               "max_tokens": 100,
                               "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
+        assert set(out["allowed_openai_params"]) == {"reasoning_effort", "top_k"}
         assert set(out["extra_body"]["allowed_openai_params"]) == {"reasoning_effort", "top_k"}
 
 

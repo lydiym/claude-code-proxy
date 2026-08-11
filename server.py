@@ -1004,12 +1004,16 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             continue
         litellm_request[k] = v
 
-    # Cascade-safe: downstream litellm / OpenAI-SDK proxies read the whitelist
-    # via extra_body, not a top-level kwarg.
+    # Two paths, both verified in prod:
+    #   - top-level kwarg → litellm.get_optional_params appends to supported_params
+    #     (utils.py:3877), so unknown vendor keys survive our litellm hop.
+    #   - inside extra_body → openai_like handler pops and spreads into wire body
+    #     (handler.py:241,254-259), so cascades like OpenWebUI see the whitelist
+    #     verbatim and forward rather than filter.
     if merged_extra:
-        litellm_request["extra_body"] = {
-            "allowed_openai_params": list(merged_extra.keys()),
-        }
+        keys = list(merged_extra.keys())
+        litellm_request["allowed_openai_params"] = keys
+        litellm_request["extra_body"] = {"allowed_openai_params": keys}
 
     return litellm_request
 
