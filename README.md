@@ -82,6 +82,10 @@ openai_base_url    = "http://localhost:8081/v1"     # env: OPENAI_BASE_URL (opti
 openai_tls_verify  = true                           # env: OPENAI_TLS_VERIFY
 tiktoken_offline   = true                           # env: TIKTOKEN_OFFLINE
 
+[global]
+model       = "gpt-4.1"        # catch-all fallback for any model
+extra_body  = { temperature = 0.3 }
+
 [big]
 model       = "gpt-4.1"        # env: BIG_MODEL
 extra_body  = { ... }          # optional
@@ -89,14 +93,6 @@ extra_body  = { ... }          # optional
 [small]
 model       = "gpt-4.1-mini"   # env: SMALL_MODEL
 extra_body  = { ... }          # optional
-
-# Per-tier: [global] for every tier, [bucket] ([big]/[small]) for its tiers,
-# [tier] overrides both. Deep-merge, later wins per leaf. Sampling / reasoning
-# / vendor knobs all live in `extra_body` — no per-key whitelist.
-
-[global]
-model       = "gpt-4.1"        # catch-all fallback for any model
-extra_body  = { temperature = 0.3 }
 
 [sonnet]
 model       = "gpt-4.1"
@@ -106,6 +102,8 @@ extra_body  = { temperature = 0.5, reasoning_effort = "low" }
 model       = "gpt-4.1"
 extra_body  = { temperature = 0.7, top_p = 0.95 }
 ```
+
+Merge chain is `[global] → [bucket] → [tier]` (later wins per leaf). Sampling / reasoning / vendor knobs all live in `extra_body` — no per-key whitelist.
 
 Pick the knobs your backend actually understands — don't mix `reasoning_effort` (OpenAI o-series), `chat_template_kwargs` (llama.cpp), or Anthropic-native `thinking` in one section. They belong to different backends.
 

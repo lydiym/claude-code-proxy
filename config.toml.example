@@ -3,12 +3,13 @@
 # Copy to config.toml and edit. The schema is:
 #
 #   [proxy]    credentials / endpoint (or set OPENAI_API_KEY / OPENAI_BASE_URL)
+#   [global]   model + extra_body fallback for every tier
 #   [big]      model + extra_body for sonnet/opus/fable/mythos
 #   [small]    model + extra_body for haiku
-#   [global]   model + extra_body fallback for every tier
 #   [haiku] / [sonnet] / [opus] / [fable] / [mythos]   per-tier overrides
 #              (optional model + extra_body)
 #
+# Merge chain is [global] → [bucket] → [tier]; later wins per leaf.
 # Every section except [proxy] accepts the same shape: optional `model`
 # (string) + `extra_body` (dict). extra_body is deep-merged into the
 # upstream OpenAI Chat Completions body at top level — sampling, reasoning,
@@ -20,6 +21,10 @@
 # openai_tls_verify = true                           # env: OPENAI_TLS_VERIFY
 # tiktoken_offline  = true                           # env: TIKTOKEN_OFFLINE
 
+# [global]
+# model       = "gpt-4.1"        # catch-all fallback for any model
+# extra_body  = { ... }          # optional
+#
 # [big]
 # model       = "gpt-4.1"        # env: BIG_MODEL
 # extra_body  = { ... }          # optional
@@ -31,14 +36,14 @@
 # --- Per-tier overrides (optional) ---
 # [haiku]    model = "..."   # env: HAIKU_MODEL   — overrides [small].model
 # [sonnet]   model = "..."   # env: SONNET_MODEL  — overrides [big].model
-# [opus]     model = "..."   # env: OPUS_MODEL
-# [fable]    model = "..."   # env: FABLE_MODEL
-# [mythos]   model = "..."   # env: MYTHOS_MODEL
+# [opus]     model = "..."
+# [fable]    model = "..."
+# [mythos]   model = "..."
 
-# --- Per-tier / [global] example (OpenAI-style backend) ---
+# --- OpenAI-style backend: [global] default, [tier] overrides ---
 
 # [global]
-# model       = "gpt-4.1"        # catch-all fallback for any model
+# model       = "gpt-4.1"
 # extra_body  = { temperature = 0.3 }
 #
 # [sonnet]
@@ -49,7 +54,7 @@
 # model       = "gpt-4.1"
 # extra_body  = { temperature = 0.7, top_p = 0.95 }
 
-# --- Alternative: llama.cpp / Qwen backend ---
+# --- llama.cpp / Qwen backend ---
 
 # [global]
 # model       = "qwen3.5"
