@@ -1,5 +1,6 @@
-# Environment variables
+# Local config / env
 .env
+config.toml
 
 # Python
 __pycache__/
