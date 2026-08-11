@@ -29,7 +29,7 @@ The proxy is a single FastAPI app (`server.py`) with the following pieces. They'
 `MessagesRequest.validate_model_field` runs during parsing and **rewrites** the model field to an `openai/<name>` string. Mapping rules:
 
 - Substring match on tier name (`haiku`/`sonnet`/`opus`/`fable`/`mythos`) chooses the tier's target
-- The tier's model is resolved by `_default_model_for_tier(tier)` (cached at first call): `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` (haiku → `small`, others → `big`) → built-in default
+- The tier's model is resolved by `_default_model_for_tier(tier)` (cached at first call): `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` (haiku → `small`, others → `big`) → `[global].model` → built-in default
 - Bare names in `OPENAI_MODELS` get prefixed with `openai/`; an existing `openai/` prefix passes through; unknown names get prefixed (assumes custom OpenAI-compatible endpoint)
 - `anthropic/`, `openai/`, `gemini/` prefixes are stripped before matching
 
@@ -75,7 +75,7 @@ The proxy loads `config.toml` (default `./config.toml`, override via `CONFIG_PAT
 
 - `[proxy]` — `openai_api_key`, `openai_base_url`, `openai_tls_verify`. `tiktoken_offline` is parsed by the standalone resolver above (not part of the main loader schema).
 - `[big]` / `[small]` — bucket sections; accept `model` (str) + `extra_body` (dict). haiku → `[small]`, everything else → `[big]`.
-- `[global]` — fallback per-tier settings (`extra_body` only — sampling/reasoning/vendor knobs all live here). No `model` here.
+- `[global]` — fallback per-tier settings; accepts `model` (catch-all for any model, including unmapped) + `extra_body` (sampling/reasoning/vendor knobs).
 - `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` — per-tier sections; same shape as `[big]`/`[small]` (optional `model` + `extra_body`).
 
 **Resolver** (`_proxy_value`, `_proxy_bool`) is the single read path for every proxy setting. Lookup order per key: env var → `CONFIG` → built-in default. Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` override `config.toml` without rebuilding the image.

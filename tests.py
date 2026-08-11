@@ -2272,14 +2272,14 @@ def test_load_config_warns_on_routing_section() -> None:
         assert srv.CONFIG["small"] == {}
 
 
-def test_global_section_does_not_accept_model() -> None:
-    """[global] accepts only extra_body — model belongs in [big] / [small] / [tier]."""
+def test_global_section_accepts_model() -> None:
+    """[global].model is the catch-all fallback for any model (incl. unmapped)."""
     with _patched_config("""
         [global]
-        model = "should-be-dropped"
+        model = "global-fallback"
         extra_body = { x = 1 }
     """):
-        assert "model" not in srv.CONFIG["global"]
+        assert srv.CONFIG["global"]["model"] == "global-fallback"
         assert srv.CONFIG["global"]["extra_body"] == {"x": 1}
 
 
@@ -2460,6 +2460,92 @@ def test_default_model_for_tier_handles_none_tier_cfg() -> None:
             srv.CONFIG["tiers"] = {"sonnet": None}
             # Falls through to bucket (big) which is also empty → built-in default.
             assert srv._default_model_for_tier("sonnet") == "gpt-4.1"
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_default_model_for_tier_global_model_is_fallback() -> None:
+    """[global].model is the catch-all fallback for any tier when bucket/tier are unset."""
+    saved = _scrub_model_envs()
+    try:
+        with _patched_config("""
+            [global]
+            model = "global-fallback"
+        """):
+            srv._default_model_for_tier.cache_clear()
+            assert srv._default_model_for_tier("sonnet") == "global-fallback"
+            assert srv._default_model_for_tier("opus") == "global-fallback"
+            assert srv._default_model_for_tier("haiku") == "global-fallback"
+            assert srv._default_model_for_tier(None) == "global-fallback"
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_default_model_for_tier_global_model_beats_built_in_but_loses_to_bucket() -> None:
+    """[global].model loses to [bucket].model but wins over built-in defaults."""
+    saved = _scrub_model_envs()
+    try:
+        with _patched_config("""
+            [big]
+            model = "bucket-big"
+
+            [small]
+            model = "bucket-small"
+
+            [global]
+            model = "global-fallback"
+        """):
+            srv._default_model_for_tier.cache_clear()
+            # Bucket still wins.
+            assert srv._default_model_for_tier("sonnet") == "bucket-big"
+            assert srv._default_model_for_tier("haiku") == "bucket-small"
+            # No bucket for tier=None → global wins.
+            assert srv._default_model_for_tier(None) == "global-fallback"
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_default_model_for_tier_tier_overrides_global_model() -> None:
+    """[tier].model beats [global].model (tier > global at every leaf)."""
+    saved = _scrub_model_envs()
+    try:
+        with _patched_config("""
+            [global]
+            model = "global-fallback"
+
+            [sonnet]
+            model = "tier-sonnet"
+        """):
+            srv._default_model_for_tier.cache_clear()
+            assert srv._default_model_for_tier("sonnet") == "tier-sonnet"
+            # Opus uses bucket (empty here) → global.
+            assert srv._default_model_for_tier("opus") == "global-fallback"
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_default_model_for_tier_tier_none_uses_big_model_env() -> None:
+    """tier=None (unmapped model) — BIG_MODEL env still applies, SMALL_MODEL does not."""
+    saved = _scrub_model_envs()
+    try:
+        with _patched_empty_config():
+            os.environ["BIG_MODEL"] = "big-env"
+            srv._default_model_for_tier.cache_clear()
+            assert srv._default_model_for_tier(None) == "big-env"
+            os.environ.pop("BIG_MODEL", None)
+
+            os.environ["SMALL_MODEL"] = "small-env"
+            srv._default_model_for_tier.cache_clear()
+            assert srv._default_model_for_tier(None) == "gpt-4.1"
+            os.environ.pop("SMALL_MODEL", None)
     finally:
         for k, v in saved.items():
             if v is not None:

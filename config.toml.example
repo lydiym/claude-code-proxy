@@ -5,12 +5,12 @@
 #   [proxy]    credentials / endpoint (or set OPENAI_API_KEY / OPENAI_BASE_URL)
 #   [big]      model + extra_body for sonnet/opus/fable/mythos
 #   [small]    model + extra_body for haiku
-#   [global]   extra_body fallback for every tier (no model here)
+#   [global]   model + extra_body fallback for every tier
 #   [haiku] / [sonnet] / [opus] / [fable] / [mythos]   per-tier overrides
 #              (optional model + extra_body)
 #
-# All sections except [proxy] and [global] accept the same shape: optional
-# `model` (string) + `extra_body` (dict). extra_body is deep-merged into the
+# Every section except [proxy] accepts the same shape: optional `model`
+# (string) + `extra_body` (dict). extra_body is deep-merged into the
 # upstream OpenAI Chat Completions body at top level — sampling, reasoning,
 # vendor knobs, anything goes:
 
@@ -38,21 +38,26 @@
 # --- Per-tier / [global] example (OpenAI-style backend) ---
 
 # [global]
-# extra_body = { temperature = 0.3 }
+# model       = "gpt-4.1"        # catch-all fallback for any model
+# extra_body  = { temperature = 0.3 }
 #
 # [sonnet]
-# extra_body = { temperature = 0.5, reasoning_effort = "low" }
+# model       = "gpt-4.1"
+# extra_body  = { temperature = 0.5, reasoning_effort = "low" }
 #
 # [opus]
-# extra_body = { temperature = 0.7, top_p = 0.95 }
+# model       = "gpt-4.1"
+# extra_body  = { temperature = 0.7, top_p = 0.95 }
 
 # --- Alternative: llama.cpp / Qwen backend ---
 
 # [global]
-# extra_body = { temperature = 0.3 }
+# model       = "qwen3.5"
+# extra_body  = { temperature = 0.3 }
 #
 # [haiku]
-# extra_body = { n_predict = 1024, chat_template_kwargs = { enable_thinking = false } }
+# model       = "qwen3.5"
+# extra_body  = { n_predict = 1024, chat_template_kwargs = { enable_thinking = false } }
 
 # Merge rules:
 #   - [global] applies to every tier that has no explicit override.
@@ -64,7 +69,8 @@
 #     so LiteLLM does not silently drop them.
 #
 # Model lookup order per tier (first non-empty wins):
-#   {TIER}_MODEL env → {BIG|SMALL}_MODEL env → [tier].model → [bucket].model → built-in
+#   {TIER}_MODEL env → {BIG|SMALL}_MODEL env → [tier].model
+#   → [bucket].model → [global].model → built-in
 #
 # Backend-specific knobs: pick the ones your upstream understands. Don't
 # mix `reasoning_effort` (OpenAI o-series) with `chat_template_kwargs`

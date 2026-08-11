@@ -97,13 +97,16 @@ extra_body  = { ... }          # optional
 # OpenAI Chat Completions API accepts.
 
 [global]
-extra_body = { temperature = 0.3 }
+model       = "gpt-4.1"        # catch-all fallback for any model
+extra_body  = { temperature = 0.3 }
 
 [sonnet]
-extra_body = { temperature = 0.5, reasoning_effort = "low" }
+model       = "gpt-4.1"
+extra_body  = { temperature = 0.5, reasoning_effort = "low" }
 
 [opus]
-extra_body = { temperature = 0.7, top_p = 0.95 }
+model       = "gpt-4.1"
+extra_body  = { temperature = 0.7, top_p = 0.95 }
 ```
 
 Pick the knobs your backend actually understands — don't mix `reasoning_effort` (OpenAI o-series), `chat_template_kwargs` (llama.cpp), or Anthropic-native `thinking` in one section. They belong to different backends.
@@ -120,7 +123,7 @@ Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` overr
 
 ### Per-tier merge semantics
 
-- **Model selection**: per tier, the resolver walks `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` → built-in default. First non-empty wins.
+- **Model selection**: per tier, the resolver walks `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` → `[global].model` → built-in default. First non-empty wins. `[global].model` is the catch-all for any model — including unmapped ones (tier=None).
 - **extra_body merge chain**: `[global] → [bucket] → [tier]` (haiku → `small`, others → `big`). Each layer deep-merges; later wins per leaf. Keys are lifted to top-level kwargs on the upstream call and auto-registered in `allowed_openai_params` so LiteLLM does not silently drop them.
 - **Sampling / reasoning / vendor fields** all live inside `[tier].extra_body` (and `[global].extra_body` / `[bucket].extra_body`). There is no per-key whitelist — pass any top-level key the upstream OpenAI Chat Completions API (or your compatible backend) accepts: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `max_completion_tokens`, `reasoning_effort`, `chat_template_kwargs`, `cache_prompt`, `n_predict`, …
 - **Conflict resolution**: when both a config layer (`[global]` / `[bucket]` / `[tier]`) and the client request set the same key (whether via Pydantic sampling fields or a request-level `extra_body`), **config wins** per leaf.

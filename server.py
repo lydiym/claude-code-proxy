@@ -161,13 +161,16 @@ def _match_tier(name: str) -> Optional[str]:
 
 
 def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
-    """Parse a per-tier body (or [global]). Only `extra_body` is recognised —
-    everything else is rejected, since sampling and other knobs now live inside
-    `extra_body`. Bad values are warned and skipped so one error doesn't drop
-    the rest of the section."""
+    """Parse [global]. Accepts `model` (str) + `extra_body` (dict). Bad
+    values are warned and skipped so one error doesn't drop the rest."""
     out: Dict[str, Any] = {}
     for k, v in body.items():
-        if k == "extra_body":
+        if k == "model":
+            if not isinstance(v, str) or not v:
+                logger.warning(f"[{section}].model must be a non-empty string; ignoring")
+                continue
+            out[k] = v
+        elif k == "extra_body":
             if not isinstance(v, dict):
                 logger.warning(f"[{section}].extra_body must be a table; ignoring")
                 continue
@@ -298,34 +301,52 @@ def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
 
 
 @lru_cache(maxsize=None)
-def _default_model_for_tier(tier: str) -> str:
+def _default_model_for_tier(tier: Optional[str]) -> str:
     """Per-tier upstream model. Lookup order:
-      1. {TIER}_MODEL env (e.g. HAIKU_MODEL)
-      2. {BIG|SMALL}_MODEL env
-      3. [tier].model config
-      4. [bucket].model config (haiku → small, others → big)
-      5. Built-in default
+      1. {TIER}_MODEL env (e.g. HAIKU_MODEL; skipped when tier=None)
+      2. {BIG|SMALL}_MODEL env — bucket-level (haiku → SMALL_MODEL, others → BIG_MODEL)
+      3. [tier].model config (skipped when tier=None)
+      4. [bucket].model config (haiku → small, others → big; bucket skipped when tier=None)
+      5. [global].model config — fallback for any model
+      6. Built-in default (gpt-4.1-mini for haiku bucket, gpt-4.1 otherwise)
     Cached at first call — env or CONFIG.toml edits after import require restart.
     Live edits to [tier].extra_body still take effect via the per-call
     _resolve_tier_config."""
-    bucket = "small" if tier == "haiku" else "big"
-    tier_env = f"{tier.upper()}_MODEL"
-    bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
+    if tier == "haiku":
+        bucket = "small"
+    elif tier is None:
+        bucket = None
+    else:
+        bucket = "big"
     built_in = "gpt-4.1-mini" if bucket == "small" else "gpt-4.1"
 
-    env_val = os.environ.get(tier_env)
-    if env_val not in (None, ""):
-        return env_val
-    env_val = os.environ.get(bucket_env)
-    if env_val not in (None, ""):
-        return env_val
+    if tier:
+        env_val = os.environ.get(f"{tier.upper()}_MODEL")
+        if env_val not in (None, ""):
+            return env_val
+    if bucket:
+        bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
+        env_val = os.environ.get(bucket_env)
+        if env_val not in (None, ""):
+            return env_val
+    else:
+        # tier=None: no specific bucket; treat as "big" for env lookup so BIG_MODEL
+        # still applies (and SMALL_MODEL would be wrong here).
+        env_val = os.environ.get("BIG_MODEL")
+        if env_val not in (None, ""):
+            return env_val
 
-    tier_cfg = (CONFIG.get("tiers") or {}).get(tier) or {}
-    if isinstance(tier_cfg.get("model"), str) and tier_cfg["model"]:
-        return tier_cfg["model"]
-    bucket_cfg = CONFIG.get(bucket) or {}
-    if isinstance(bucket_cfg.get("model"), str) and bucket_cfg["model"]:
-        return bucket_cfg["model"]
+    if tier:
+        tier_cfg = (CONFIG.get("tiers") or {}).get(tier) or {}
+        if isinstance(tier_cfg.get("model"), str) and tier_cfg["model"]:
+            return tier_cfg["model"]
+    if bucket:
+        bucket_cfg = CONFIG.get(bucket) or {}
+        if isinstance(bucket_cfg.get("model"), str) and bucket_cfg["model"]:
+            return bucket_cfg["model"]
+    global_cfg = CONFIG.get("global") or {}
+    if isinstance(global_cfg.get("model"), str) and global_cfg["model"]:
+        return global_cfg["model"]
     return built_in
 
 
