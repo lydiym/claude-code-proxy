@@ -967,11 +967,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.tool_choice:
         litellm_request["tool_choice"] = convert_tool_choice(anthropic_request.tool_choice)
 
-    # Pydantic sampling fields: only forwarded when the client explicitly
-    # sent a non-null value (model_fields_set tracks explicit sends, including
-    # explicit nulls, so we skip None to keep the wire form "unset" → upstream
-    # uses its own default rather than MessagesRequest's defaults like
-    # temperature=1.0).
+    # Forward sampling fields only if the client sent them; None means
+    # "use the upstream's own default" rather than MessagesRequest's.
     fields_set = anthropic_request.model_fields_set
     if "temperature" in fields_set and anthropic_request.temperature is not None:
         litellm_request["temperature"] = anthropic_request.temperature
@@ -982,11 +979,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if "stop_sequences" in fields_set and anthropic_request.stop_sequences:
         litellm_request["stop"] = anthropic_request.stop_sequences
 
-    # [tier].extra_body (already global+tier-merged) → top-level kwargs.
-    # Pydantic sampling fields go in first, then extra_body overrides per
-    # leaf — so config-wins is automatic without a per-key special case.
-    # Client-supplied extra_body comes in below (before config) so config
-    # always wins on conflict.
+    # Tier config applied after client sampling fields → config wins per leaf.
+    # Client extra_body merged in before tier extra_body → config wins there too.
     tier_cfg = _resolve_tier_config(anthropic_request)
     if "seed" in tier_cfg:
         litellm_request["seed"] = tier_cfg["seed"]
@@ -1004,12 +998,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             continue
         litellm_request[k] = v
 
-    # Two paths, both verified in prod:
-    #   - top-level kwarg → litellm.get_optional_params appends to supported_params
-    #     (utils.py:3877), so unknown vendor keys survive our litellm hop.
-    #   - inside extra_body → openai_like handler pops and spreads into wire body
-    #     (handler.py:241,254-259), so cascades like OpenWebUI see the whitelist
-    #     verbatim and forward rather than filter.
+    # Publish whitelist twice: top-level extends litellm's supported_params
+    # (utils.py:3877); inside extra_body lands in the wire body so cascade
+    # proxies forward vendor keys instead of filtering them.
     if merged_extra:
         keys = list(merged_extra.keys())
         litellm_request["allowed_openai_params"] = keys
