@@ -1264,6 +1264,226 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
     assert stop["delta"]["stop_reason"] == "end_turn"
 
 
+async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
+    """A chunk that crashes the inner pipeline must yield `event: error` so the
+    SDK raises APIStatusError instead of silently terminating the stream."""
+    req = _base_request(stream=True)
+
+    async def _bad_upstream():
+        # MAX_CONSECUTIVE_CHUNK_ERRORS+1 bad chunks to exceed the tolerance
+        # threshold (single bad chunks are now tolerated — see
+        # test_streaming_tolerates_isolated_bad_chunks).
+        for i in range(srv.MAX_CONSECUTIVE_CHUNK_ERRORS + 1):
+            yield {"choices": [{"delta": {"content": f"bad{i}"}}]}
+
+    original = srv._translate_parser_events
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated chunk processing failure")
+
+    srv._translate_parser_events = _boom
+    try:
+        raw: List[str] = []
+        async for piece in srv.handle_streaming(_bad_upstream(), req):
+            raw.append(piece)
+    finally:
+        srv._translate_parser_events = original
+
+    events = _parse_sse(raw)
+    types = [e["type"] for e in events]
+    # First chunk opened a text block; the failure on chunk 2 must close it.
+    assert "content_block_stop" in types
+    assert types.count("error") == 1
+    assert types[-1] == "[DONE]"
+    # Order: stop → message_delta(error) → error → done.
+    stop_idx = types.index("content_block_stop")
+    md_idx = next(i for i, t in enumerate(types) if t == "message_delta")
+    err_idx = types.index("error")
+    assert stop_idx < md_idx < err_idx < types.index("[DONE]")
+    md = events[md_idx]
+    assert md["delta"]["stop_reason"] == "end_turn"
+    assert md["usage"]["output_tokens"] == 0
+    err = events[err_idx]
+    assert err["error"]["type"] == "api_error"
+    assert "chunk processing failed" in err["error"]["message"]
+
+
+async def test_streaming_tolerates_isolated_bad_chunks() -> None:
+    """A single bad chunk in a stream of good ones must NOT surface as an
+    error frame — the counter resets on the next successful chunk."""
+    req = _base_request(stream=True)
+
+    async def _mixed_upstream():
+        yield {"choices": [{"delta": {"content": "good1"}}]}
+        # Bad chunk — _translate_parser_events raises once.
+        yield {"choices": [{"delta": {"content": "bad"}}]}
+        # Subsequent good chunks must still flow through.
+        yield {"choices": [{"delta": {"content": "good2"}}]}
+        yield {"choices": [{"delta": {"content": "good3"}, "finish_reason": "stop"}]}
+
+    original = srv._translate_parser_events
+    call_count = {"n": 0}
+
+    def _boom_once(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("single transient chunk failure")
+        return original(*args, **kwargs)
+
+    srv._translate_parser_events = _boom_once
+    try:
+        raw: List[str] = []
+        async for piece in srv.handle_streaming(_mixed_upstream(), req):
+            raw.append(piece)
+    finally:
+        srv._translate_parser_events = original
+
+    events = _parse_sse(raw)
+    types = [e["type"] for e in events]
+    # No error frame — the bad chunk was tolerated.
+    assert "error" not in types
+    # Stream terminated cleanly via message_stop (not error).
+    assert "message_stop" in types
+    # good2/good3 must have flowed through — counter reset on next success.
+    text_deltas = [
+        e for e in events
+        if e["type"] == "content_block_delta"
+        and e.get("delta", {}).get("type") == "text_delta"
+    ]
+    text_blob = "".join(d["delta"]["text"] for d in text_deltas)
+    assert "good1" in text_blob and "good2" in text_blob and "good3" in text_blob
+
+
+async def test_streaming_counter_resets_on_successful_chunks() -> None:
+    """Tolerance is per-streak, not lifetime — a successful chunk must reset
+    the error counter. Without reset, sparse bad chunks across a long stream
+    would accumulate and trip the threshold even though no two are adjacent."""
+    req = _base_request(stream=True)
+
+    async def _interleaved():
+        # 5 bad chunks (counter → 5, all tolerated).
+        for _ in range(srv.MAX_CONSECUTIVE_CHUNK_ERRORS):
+            yield {"choices": [{"delta": {"content": "bad"}}]}
+        # 1 good chunk — counter must reset to 0.
+        yield {"choices": [{"delta": {"content": "good"}}]}
+        # 5 more bad chunks — counter goes 1..5 again, all tolerated.
+        for _ in range(srv.MAX_CONSECUTIVE_CHUNK_ERRORS):
+            yield {"choices": [{"delta": {"content": "bad"}}]}
+        # Final good chunk + finish_reason closes the stream.
+        yield {"choices": [{"delta": {"content": "good2"}, "finish_reason": "stop"}]}
+
+    original = srv._translate_parser_events
+    srv._translate_parser_events = lambda *a, **kw: iter(())
+    try:
+        raw: List[str] = []
+        async for piece in srv.handle_streaming(_interleaved(), req):
+            raw.append(piece)
+    finally:
+        srv._translate_parser_events = original
+
+    events = _parse_sse(raw)
+    types = [e["type"] for e in events]
+    # No error frame — interleaved bad chunks reset on the good one.
+    assert "error" not in types, (
+        f"counter did not reset on success; got error frame. types={types}"
+    )
+    assert "message_stop" in types
+
+
+async def test_streaming_emits_error_frame_on_upstream_failure() -> None:
+    """A failure from the upstream async iterator itself (e.g. litellm
+    connection error) is caught by the outer except — must still emit the
+    canonical failure shape in the same order as the inner path."""
+    req = _base_request(stream=True)
+
+    async def _exploding_upstream():
+        yield {"choices": [{"delta": {"content": "partial"}}]}
+        raise RuntimeError("simulated upstream connection failure")
+
+    raw: List[str] = []
+    async for piece in srv.handle_streaming(_exploding_upstream(), req):
+        raw.append(piece)
+    events = _parse_sse(raw)
+    types = [e["type"] for e in events]
+    assert types.count("error") == 1
+    assert types[-1] == "[DONE]"
+    # Outer path also closes any open block before message_delta.
+    assert "content_block_stop" in types
+    stop_idx = types.index("content_block_stop")
+    md_idx = next(i for i, t in enumerate(types) if t == "message_delta")
+    err_idx = types.index("error")
+    assert stop_idx < md_idx < err_idx < types.index("[DONE]")
+    err = events[err_idx]
+    assert err["error"]["type"] == "api_error"
+    assert "upstream streaming failed" in err["error"]["message"]
+
+
+async def test_streaming_flushes_buffered_think_content_on_failure() -> None:
+    """ThinkStreamParser holds content until </think> in thinking mode — if
+    the stream errors mid-think, the buffer would be dropped without flush().
+    Must surface the buffered thinking as a delta before the error frame."""
+    req = _base_request(stream=True)
+
+    async def _bad_upstream():
+        # First chunk opens a think block with "partial reasoning..." buffered.
+        yield {"choices": [{"delta": {"content": "<think>partial reasoning..."}}]}
+        # Then MAX_CONSECUTIVE_CHUNK_ERRORS+1 bad chunks (with think still open)
+        # to exceed the tolerance threshold and trigger the fail path.
+        for i in range(srv.MAX_CONSECUTIVE_CHUNK_ERRORS + 1):
+            yield {"choices": [{"delta": {"content": f"more{i}"}}]}
+
+    original = srv._translate_parser_events
+    call_count = {"n": 0}
+
+    def _boom_after_first(*args, **kwargs):
+        # Let the first call (think-open + buffered reasoning) through so
+        # the test can verify it surfaces before the error frame.
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return original(*args, **kwargs)
+        raise RuntimeError("simulated mid-think failure")
+
+    srv._translate_parser_events = _boom_after_first
+    try:
+        raw: List[str] = []
+        async for piece in srv.handle_streaming(_bad_upstream(), req):
+            raw.append(piece)
+    finally:
+        srv._translate_parser_events = original
+
+    events = _parse_sse(raw)
+    types = [e["type"] for e in events]
+    # Buffered thinking must surface as a thinking_delta before the error.
+    thinking_deltas = [
+        e for e in events
+        if e["type"] == "content_block_delta"
+        and e.get("delta", {}).get("type") == "thinking_delta"
+    ]
+    assert thinking_deltas, "buffered think content must be flushed before error frame"
+    assert any(
+        "partial reasoning" in d["delta"]["thinking"]
+        for d in thinking_deltas
+    )
+    err_idx = types.index("error")
+    assert thinking_deltas[-1] is not None  # buffered delta emitted first
+    # All buffered deltas come before the error frame.
+    for d in thinking_deltas:
+        delta_idx = events.index(d)
+        assert delta_idx < err_idx
+
+
+def test_sse_formatter_error_emits_canonical_shape() -> None:
+    """`event: error` payload must be {type, error: {type, message}} —
+    SDK looks up error.type to dispatch exception subclasses."""
+    frame = srv.SseFormatter.error("overloaded_error", "try again later")
+    assert frame.startswith("event: error\n")
+    body = json.loads(frame.split("data: ", 1)[1].split("\n\n")[0])
+    assert body == {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "try again later"},
+    }
+
+
 async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     """Parallel tool calls must each get their own SSE block index, with
     content_block_stop(N) emitted before content_block_start(N+1)."""
