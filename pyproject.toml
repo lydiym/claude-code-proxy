@@ -24,7 +24,29 @@ line-length = 120
 exclude = ["tests.py"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP"]
+preview = true
+# Curated strict set: original Recommended + the high-value categories
+# the max-strict triage surfaced (G=logging, PTH=pathlib, FURB=refurb,
+# COM=commas, RUF=ruff-specific). Pedantic families (D, ANN, C901, N,
+# FBT, PLR091x, etc.) stay disabled to avoid noise.
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "G",   # logging — caught 32 lazy-f-string issues
+    "PTH", # pathlib — caught 4 os.path uses
+    "FURB",# refurb — caught 1 if/else→or
+    "RUF", # ruff-specific
+    "EM",  # exception messages
+    "TRY", # tryceratops
+]
+# False positives / intentional suppressions.
+ignore = [
+    "hardcoded-bind-all-interfaces",   # dev-server default (0.0.0.0)
+    "unused-function-argument",        # `_get_encoding`/`_encoding_for_model`/`_configure_logging` mirror upstream signatures
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["server", "tests"]

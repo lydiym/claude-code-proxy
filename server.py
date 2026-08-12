@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import pathlib
 import re
 import sys
 import time
@@ -29,7 +30,7 @@ os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(
-    level=logging.WARN,
+    level=logging.WARNING,
     format=_LOG_FORMAT,
     datefmt=_DATE_FORMAT,
 )
@@ -55,16 +56,17 @@ def _str_to_bool(value, *, default=False):
 
 def _litellm_debug_http_enabled() -> bool:
     """LITELLM_DEBUG_HTTP=1 turns on verbose litellm + httpx/httpcore logging
-    so we can see the actual wire payload sent to the upstream OpenAI endpoint."""
+    so we can see the actual wire payload sent to the upstream OpenAI endpoint.
+    """
     return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
 
 
 def _resolve_tiktoken_offline() -> bool:
     """[proxy].tiktoken_offline from CONFIG_PATH, TIKTOKEN_OFFLINE env, then True."""
     path = os.environ.get("CONFIG_PATH", "./config.toml")
-    if path and os.path.isfile(path):
+    if path and pathlib.Path(path).is_file():
         try:
-            with open(path, "rb") as f:
+            with pathlib.Path(path).open("rb") as f:
                 raw = tomllib.load(f)
             cfg = raw.get("proxy", {})
             if isinstance(cfg, dict) and "tiktoken_offline" in cfg:
@@ -72,7 +74,7 @@ def _resolve_tiktoken_offline() -> bool:
         except (OSError, tomllib.TOMLDecodeError):
             pass
     env = os.environ.get("TIKTOKEN_OFFLINE")
-    if env not in (None, ""):
+    if env not in {None, ""}:
         return _str_to_bool(env, default=True)
     return True
 
@@ -85,7 +87,7 @@ if TIKTOKEN_OFFLINE:
     import tiktoken
 
     class _OfflineEncoding(tiktoken.Encoding):
-        def __init__(self):
+        def __init__(self) -> None:
             # Override parent's __init__ to skip the required mergeable_ranks / special_tokens.
             pass
 
@@ -102,11 +104,11 @@ if TIKTOKEN_OFFLINE:
             return [1]
 
         @override
-        def decode(self, tokens, *args, **kwargs):
+        def decode(self, tokens, *args, **kwargs) -> str:
             return ""
 
         @override
-        def decode_single_token_bytes(self, token):
+        def decode_single_token_bytes(self, token) -> bytes:
             return b""
 
     def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
@@ -120,8 +122,8 @@ if TIKTOKEN_OFFLINE:
     tiktoken.encoding_for_model = _encoding_for_model  # type: ignore[ty:invalid-assignment]
 
 # These imports must come after the env-var + tiktoken patch above.
-import litellm  # noqa: E402
-import uvicorn  # noqa: E402
+import litellm  # ruff: ignore[module-import-not-at-top-of-file]
+import uvicorn  # ruff: ignore[module-import-not-at-top-of-file]
 
 # ---------------------------------------------------------------------------
 # Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
@@ -147,7 +149,8 @@ _VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge: base + override, where override wins per leaf.
     Used at request time to layer tier config over [global] and to merge
-    config extra_body into the upstream body."""
+    config extra_body into the upstream body.
+    """
     out = dict(base)
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -170,7 +173,8 @@ def _strip_provider_prefix(name: str) -> str:
 
 def _match_tier(name: str) -> str | None:
     """First TIER_KEYS substring that appears in the lower-cased name.
-    Returns None when no tier matches."""
+    Returns None when no tier matches.
+    """
     lower = name.lower()
     for tier in TIER_KEYS:  # insertion order = routing priority (haiku first)
         if tier in lower:
@@ -180,41 +184,43 @@ def _match_tier(name: str) -> str | None:
 
 def _parse_tier_section(body: dict[str, Any], section: str) -> dict[str, Any]:
     """Parse [global]. Accepts `model` (str) + `extra_body` (dict). Bad
-    values are warned and skipped so one error doesn't drop the rest."""
+    values are warned and skipped so one error doesn't drop the rest.
+    """
     out: dict[str, Any] = {}
     for k, v in body.items():
         if k == "model":
             if not isinstance(v, str) or not v:
-                logger.warning(f"[{section}].model must be a non-empty string; ignoring")
+                logger.warning("[%s].model must be a non-empty string; ignoring", section)
                 continue
             out[k] = v
         elif k == "extra_body":
             if not isinstance(v, dict):
-                logger.warning(f"[{section}].extra_body must be a table; ignoring")
+                logger.warning("[%s].extra_body must be a table; ignoring", section)
                 continue
             out[k] = deepcopy(v)
         else:
-            logger.warning(f"[{section}].{k} is not a recognised key; put it inside extra_body")
+            logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
     return out
 
 
 def _parse_bucket_section(body: dict[str, Any], section: str) -> dict[str, Any]:
     """Parse [big], [small], or a per-tier section. Accepts `model` (str) and
-    `extra_body` (dict). Bad values warned and skipped."""
+    `extra_body` (dict). Bad values warned and skipped.
+    """
     out: dict[str, Any] = {}
     for k, v in body.items():
         if k == "model":
             if not isinstance(v, str) or not v:
-                logger.warning(f"[{section}].model must be a non-empty string; ignoring")
+                logger.warning("[%s].model must be a non-empty string; ignoring", section)
                 continue
             out[k] = v
         elif k == "extra_body":
             if not isinstance(v, dict):
-                logger.warning(f"[{section}].extra_body must be a table; ignoring")
+                logger.warning("[%s].extra_body must be a table; ignoring", section)
                 continue
             out[k] = deepcopy(v)
         else:
-            logger.warning(f"[{section}].{k} is not a recognised key; put it inside extra_body")
+            logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
     return out
 
 
@@ -224,14 +230,21 @@ _BOOL_TLS_VERIFY = {"openai_tls_verify"}
 
 def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
     """Coerce a [proxy] TOML value to the expected Python type.
-    Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped."""
+    Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped.
+    """
     if isinstance(value, str):
         return value  # strings are the canonical type for api_key, base_url, model names
     if key in _BOOL_TLS_VERIFY and isinstance(value, bool):
         return value
     if key in _BOOL_TLS_VERIFY and isinstance(value, int) and not isinstance(value, bool):
         return bool(value)
-    logger.warning(f"[{section}].{key}={value!r} has wrong type ({type(value).__name__}); ignoring")
+    logger.warning(
+        "[%s].%s=%r has wrong type (%s); ignoring",
+        section,
+        key,
+        value,
+        type(value).__name__,
+    )
     return _COERCE_DROP
 
 
@@ -240,33 +253,38 @@ def _load_config(path: str) -> dict[str, Any]:
     out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
     if not path:
         return out
-    if not os.path.isfile(path):
-        logger.info(f"CONFIG_PATH={path!r} not found; using env vars only")
+    if not pathlib.Path(path).is_file():
+        logger.info("CONFIG_PATH=%r not found; using env vars only", path)
         return out
     try:
-        with open(path, "rb") as f:
+        with pathlib.Path(path).open("rb") as f:
             raw = tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        logger.error(f"Malformed TOML in {path}: {e}; falling back to env vars")
+    except tomllib.TOMLDecodeError:
+        logger.exception("Malformed TOML in %s; falling back to env vars", path)
         return out
     for section, body in raw.items():
         if section not in _VALID_SECTIONS:
-            logger.warning(f"Unknown section [{section}] in {path}; ignoring (valid: {sorted(_VALID_SECTIONS)})")
+            logger.warning(
+                "Unknown section [%s] in %s; ignoring (valid: %s)",
+                section,
+                path,
+                sorted(_VALID_SECTIONS),
+            )
             continue
         if not isinstance(body, dict):
-            logger.warning(f"[{section}] must be a table, got {type(body).__name__}; ignoring")
+            logger.warning("[%s] must be a table, got %s; ignoring", section, type(body).__name__)
             continue
         if section == "proxy":
             allowed = _PROXY_KEYS
             for k, v in body.items():
                 if k not in allowed:
-                    logger.warning(f"[{section}].{k} is not a recognised key; ignoring")
+                    logger.warning("[%s].%s is not a recognised key; ignoring", section, k)
                     continue
                 coerced = _coerce_proxy_value(k, v, section)
                 if coerced is _COERCE_DROP:
                     continue
                 out["proxy"][k] = coerced
-        elif section in ("big", "small"):
+        elif section in {"big", "small"}:
             out[section] = _parse_bucket_section(body, section)
         elif section == "global":
             out["global"] = _parse_tier_section(body, section)
@@ -278,29 +296,33 @@ def _load_config(path: str) -> dict[str, Any]:
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config.toml")
 try:
     CONFIG = _load_config(CONFIG_PATH)
-except Exception as e:
+except Exception:
     # Infrastructure error only — parse failures are handled inside _load_config.
-    logger.error(f"Failed to load CONFIG_PATH={CONFIG_PATH!r}: {e}; using env vars only")
+    logger.exception("Failed to load CONFIG_PATH=%r; using env vars only", CONFIG_PATH)
     CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
 
 # WARNING so the boot summary shows up before uvicorn installs its own handlers.
 logger.warning(
-    f"Loaded config from {CONFIG_PATH!r}: "
-    f"proxy={list(CONFIG['proxy'])}, "
-    f"big={CONFIG['big']}, small={CONFIG['small']}, "
-    f"global={'yes' if CONFIG['global'] else 'no'}, tiers={list(CONFIG['tiers'])}"
+    "Loaded config from %r: proxy=%s, big=%s, small=%s, global=%s, tiers=%s",
+    CONFIG_PATH,
+    list(CONFIG["proxy"]),
+    CONFIG["big"],
+    CONFIG["small"],
+    "yes" if CONFIG["global"] else "no",
+    list(CONFIG["tiers"]),
 )
 
 
 def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
-    """env var → CONFIG[proxy][key] → default. None / "" fall through."""
+    """Env var → CONFIG[proxy][key] → default. None / "" fall through."""
     if key not in _PROXY_KEYS:
-        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy key")
+        msg = f"_proxy_value: {key!r} is not a recognised proxy key"
+        raise ValueError(msg)
     env_val = os.environ.get(env_name)
-    if env_val not in (None, ""):
+    if env_val not in {None, ""}:
         return env_val
     val = CONFIG["proxy"].get(key)
-    if val not in (None, ""):
+    if val not in {None, ""}:
         return val
     return default
 
@@ -326,7 +348,8 @@ def _default_model_for_tier(tier: str | None) -> str:
       6. Built-in default (gpt-4.1-mini for haiku bucket, gpt-4.1 otherwise)
     Cached at first call — env or CONFIG.toml edits after import require restart.
     Live edits to [tier].extra_body still take effect via the per-call
-    _resolve_tier_config."""
+    _resolve_tier_config.
+    """
     if tier == "haiku":
         bucket = "small"
     elif tier is None:
@@ -337,18 +360,18 @@ def _default_model_for_tier(tier: str | None) -> str:
 
     if tier:
         env_val = os.environ.get(f"{tier.upper()}_MODEL")
-        if env_val not in (None, ""):
+        if env_val not in {None, ""}:
             return env_val
     if bucket:
         bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
         env_val = os.environ.get(bucket_env)
-        if env_val not in (None, ""):
+        if env_val not in {None, ""}:
             return env_val
     else:
         # tier=None: no specific bucket; treat as "big" for env lookup so BIG_MODEL
         # still applies (and SMALL_MODEL would be wrong here).
         env_val = os.environ.get("BIG_MODEL")
-        if env_val not in (None, ""):
+        if env_val not in {None, ""}:
             return env_val
 
     if tier:
@@ -388,7 +411,7 @@ def _color(code, text):
     return text
 
 
-def _reset_logger(name, *, propagate):
+def _reset_logger(name, *, propagate) -> None:
     log = logging.getLogger(name)
     log.handlers.clear()
     log.propagate = propagate
@@ -397,19 +420,20 @@ def _reset_logger(name, *, propagate):
 @asynccontextmanager
 async def _configure_logging(app: FastAPI):
     """Unify the log format and silence uvicorn.access. Runs after uvicorn's
-    own configure_logging() so it overrides whatever uvicorn set up."""
+    own configure_logging() so it overrides whatever uvicorn set up.
+    """
     root = logging.getLogger()
     root.handlers.clear()
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     root.addHandler(handler)
 
-    _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
     try:
-        logger.setLevel(_LOG_LEVEL)
+        logger.setLevel(LOG_LEVEL)
     except ValueError:
         logger.setLevel(logging.INFO)
-        logger.warning(f"Invalid LOG_LEVEL={_LOG_LEVEL!r}; falling back to INFO")
+        logger.warning("Invalid LOG_LEVEL=%r; falling back to INFO", LOG_LEVEL)
     for noisy in ("LiteLLM", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -517,7 +541,7 @@ def get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-def new_msg_id():
+def new_msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
 
@@ -624,10 +648,10 @@ class MessagesRequest(BaseModel):
             new_model = v  # already-prefixed passthrough (case-insensitive)
         else:
             # Custom endpoint: pass the bare name through with the openai/ prefix.
-            logger.debug(f"No mapping rule for model '{v}', passing through")
+            logger.debug("No mapping rule for model '%s', passing through", v)
             new_model = f"openai/{clean_v}"
 
-        logger.debug(f"MODEL MAPPING: '{v}' -> '{new_model}'")
+        logger.debug("MODEL MAPPING: '%s' -> '%s'", v, new_model)
 
         return new_model
 
@@ -665,7 +689,7 @@ class ThinkStreamParser:
     and yield tagged deltas for the caller to forward.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.in_thinking = False
         self.buffer = ""
 
@@ -683,7 +707,7 @@ class ThinkStreamParser:
             pass
         return events
 
-    def _drain(self, events):
+    def _drain(self, events) -> bool:
         if not self.buffer:
             return False
         tag = THINK_CLOSE_TAG if self.in_thinking else THINK_OPEN_TAG
@@ -853,7 +877,7 @@ def convert_assistant_message(msg, result_ids):
                             "name": block.name,
                             "arguments": json.dumps(block.input),
                         },
-                    }
+                    },
                 )
             else:
                 # Dangling call (result truncated from history): describe in
@@ -863,7 +887,7 @@ def convert_assistant_message(msg, result_ids):
     text = "\n".join(text_parts).strip()
     out = {"role": "assistant"}
     # OpenAI allows null content only when tool_calls are present.
-    out["content"] = text if text else (None if tool_calls else "")
+    out["content"] = text or (None if tool_calls else "")
     if tool_calls:
         out["tool_calls"] = tool_calls
     return out
@@ -888,7 +912,7 @@ def convert_user_message(msg, call_ids):
                         "role": "tool",
                         "tool_call_id": tool_use_id,
                         "content": result_text,
-                    }
+                    },
                 )
             else:
                 # Orphaned result (truncated call): fold into user text; the ghost id is meaningless.
@@ -896,7 +920,7 @@ def convert_user_message(msg, call_ids):
                     {
                         "type": "text",
                         "text": f"(Result from an earlier tool call:)\n{result_text}",
-                    }
+                    },
                 )
 
     # Tool results must follow the matching assistant turn, so emit them first.
@@ -945,14 +969,14 @@ def convert_tool_choice(choice):
     return "auto"
 
 
-def sanitize_messages_for_openai(messages):
+def sanitize_messages_for_openai(messages) -> None:
     allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls"}
     for msg in messages:
         for key in list(msg.keys()):
             if key not in allowed_keys:
-                logger.debug(f"Removing unsupported message field: {key}")
+                logger.debug("Removing unsupported message field: %s", key)
                 del msg[key]
-        if msg.get("content") in (None, "") and not msg.get("tool_calls"):
+        if msg.get("content") in {None, ""} and not msg.get("tool_calls"):
             msg["content"] = "..."
 
 
@@ -960,7 +984,8 @@ def _resolve_tier_config(request: "MessagesRequest") -> dict[str, Any]:
     """extra_body merge chain: [global] → [bucket] → [tier].
     haiku → small bucket; others → big bucket; tier=None → no bucket or tier.
     `model` is consumed by _default_model_for_tier and stripped from the result.
-    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts."""
+    Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts.
+    """
     layers: list[dict[str, Any]] = []
     global_cfg = CONFIG.get("global")
     if global_cfg is not None:
@@ -1033,7 +1058,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
 
     for k, v in merged_extra.items():
         if k in _PROTECTED_KEYS:
-            logger.warning(f"ignoring protected key in extra_body: {k}")
+            logger.warning("ignoring protected key in extra_body: %s", k)
             continue
         litellm_request[k] = v
 
@@ -1077,7 +1102,7 @@ def _parse_tool_arguments(raw):
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning(f"Failed to parse tool arguments as JSON: {raw}")
+        logger.warning("Failed to parse tool arguments as JSON: %s", raw)
         return {"raw": raw}
 
 
@@ -1103,7 +1128,7 @@ def _build_content_blocks(text, reasoning, tool_calls):
                 "id": get_field(tool_call, "id", f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"),
                 "name": get_field(function, "name", ""),
                 "input": _parse_tool_arguments(get_field(function, "arguments", "{}")),
-            }
+            },
         )
     return blocks or [{"type": "text", "text": ""}]
 
@@ -1116,7 +1141,8 @@ def _extract_usage(usage):
 
 
 def convert_litellm_to_anthropic(
-    litellm_response: dict[str, Any] | Any, original_request: MessagesRequest
+    litellm_response: dict[str, Any] | Any,
+    original_request: MessagesRequest,
 ) -> MessagesResponse:
     try:
         message = _first_message(litellm_response)
@@ -1139,7 +1165,7 @@ def convert_litellm_to_anthropic(
             usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
         )
     except Exception as e:
-        logger.error(f"Error converting response: {e}", exc_info=True)
+        logger.exception("Error converting response")
         return MessagesResponse(
             id=new_msg_id(),
             model=original_request.model,
@@ -1148,7 +1174,7 @@ def convert_litellm_to_anthropic(
                 {
                     "type": "text",
                     "text": f"Error converting response: {e}. Please check server logs.",
-                }
+                },
             ],
             stop_reason="end_turn",
             usage=Usage(input_tokens=0, output_tokens=0),
@@ -1197,7 +1223,8 @@ class BlockTracker:
 
     def delta(self, delta_payload: dict[str, Any]) -> str:
         if self._current is None:
-            raise RuntimeError("no block is open; call open() first")
+            msg = "no block is open; call open() first"
+            raise RuntimeError(msg)
         return SseFormatter.content_block_delta(self._current.index, delta_payload)
 
     def close(self) -> list[str]:
@@ -1209,7 +1236,7 @@ class BlockTracker:
 
 
 class SseFormatter:
-    """Stateless formatters for Anthropic SSE events.
+    r"""Stateless formatters for Anthropic SSE events.
 
     Each event is framed as ``event: <name>\\ndata: <json>\\n\\n``; the trailing
     ``[DONE]`` sentinel is the only frame without an ``event:`` line. Keeping
@@ -1332,7 +1359,8 @@ def _emit_failure(
     message_prefix: str,
 ) -> Iterator[str]:
     """Drain, close, message_delta → event:error → done. Per-step try-wrap
-    so a broken upstream can't mask the primary error."""
+    so a broken upstream can't mask the primary error.
+    """
     try:
         for event in _translate_parser_events(parser.flush(), tracker):
             yield event
@@ -1351,7 +1379,7 @@ def _emit_failure(
     yield SseFormatter.done()
 
 
-def log_request(method, path, source_model, target_model, tier, num_messages, num_tools, status_code):
+def log_request(method, path, source_model, target_model, tier, num_messages, num_tools, status_code) -> None:
     endpoint = path.split("?", 1)[0] if "?" in path else path
     status_color = Colors.GREEN if status_code == 200 else Colors.RED
     tier_str = f" tier={_color(Colors.YELLOW, tier)}" if tier else ""
@@ -1420,10 +1448,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         debug_first_chunk_logged = True
                         try:
                             logger.debug(
-                                f"litellm stream chunk #1 (first): {json.dumps(chunk, default=str, ensure_ascii=False)}"
+                                "litellm stream chunk #1 (first): %s",
+                                json.dumps(chunk, default=str, ensure_ascii=False),
                             )
                         except Exception as e:
-                            logger.debug(f"litellm stream chunk dump failed: {e}")
+                            logger.debug("litellm stream chunk dump failed: %s", e)
                 usage = get_field(chunk, "usage")
                 if usage is not None:
                     # Overwrite only when upstream sends non-zero — some providers emit `0` mid-stream as a no-op.
@@ -1517,7 +1546,10 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             except Exception as e:
                 # Tolerated: warning only, no traceback.
                 logger.warning(
-                    f"Error processing chunk ({consecutive_chunk_errors + 1}/{MAX_CONSECUTIVE_CHUNK_ERRORS + 1}): {e}"
+                    "Error processing chunk (%d/%d): %s",
+                    consecutive_chunk_errors + 1,
+                    MAX_CONSECUTIVE_CHUNK_ERRORS + 1,
+                    e,
                 )
                 consecutive_chunk_errors += 1
                 if consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
@@ -1537,8 +1569,10 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 yield event
         if _litellm_debug_http_enabled():
             logger.debug(
-                f"litellm stream finished: {debug_chunk_count} chunks, "
-                f"input_tokens={input_tokens}, output_tokens={output_tokens}"
+                "litellm stream finished: %s chunks, input_tokens=%s, output_tokens=%s",
+                debug_chunk_count,
+                input_tokens,
+                output_tokens,
             )
 
     except Exception as e:
@@ -1567,8 +1601,8 @@ async def create_message(request: MessagesRequest):
         # Skip the bulky fields (messages, tools) — they dominate the dump and
         # are visible in litellm.set_verbose anyway.
         if logger.isEnabledFor(logging.DEBUG):
-            debug = {k: v for k, v in litellm_request.items() if k not in ("messages", "tools")}
-            logger.debug(f"upstream params: {debug}")
+            debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools"}}
+            logger.debug("upstream params: %s", debug)
 
             if _litellm_debug_http_enabled():
                 # Verbose: dump the entire kwargs dict going into litellm
@@ -1576,11 +1610,11 @@ async def create_message(request: MessagesRequest):
                 # exact payload upstream sees, not just the sampling subset.
                 try:
                     logger.debug(
-                        f"litellm.completion kwargs (full): "
-                        f"{json.dumps(litellm_request, default=str, ensure_ascii=False)}"
+                        "litellm.completion kwargs (full): %s",
+                        json.dumps(litellm_request, default=str, ensure_ascii=False),
                     )
                 except Exception as e:
-                    logger.debug(f"litellm.completion kwargs dump failed: {e}")
+                    logger.debug("litellm.completion kwargs dump failed: %s", e)
 
         log_request(
             "POST",
@@ -1602,7 +1636,11 @@ async def create_message(request: MessagesRequest):
 
         start_time = time.time()
         litellm_response = litellm.completion(**litellm_request)
-        logger.debug(f"Response received: model={litellm_request.get('model')}, time={time.time() - start_time:.2f}s")
+        logger.debug(
+            "Response received: model=%s, time=%.2fs",
+            litellm_request.get("model"),
+            time.time() - start_time,
+        )
         if _litellm_debug_http_enabled():
             try:
                 if hasattr(litellm_response, "model_dump"):
@@ -1612,14 +1650,15 @@ async def create_message(request: MessagesRequest):
                 else:
                     payload = repr(litellm_response)
                 logger.debug(
-                    f"litellm.completion response (full): {json.dumps(payload, default=str, ensure_ascii=False)}"
+                    "litellm.completion response (full): %s",
+                    json.dumps(payload, default=str, ensure_ascii=False),
                 )
             except Exception as e:
-                logger.debug(f"litellm.completion response dump failed: {e}")
+                logger.debug("litellm.completion response dump failed: %s", e)
         return convert_litellm_to_anthropic(litellm_response, request)
 
     except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
+        logger.exception("Error processing request")
         status_code = getattr(e, "status_code", 500)
         message = getattr(e, "message", None) or str(e)
         raise HTTPException(status_code=status_code, detail=message) from e
