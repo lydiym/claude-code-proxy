@@ -435,9 +435,7 @@ DEFAULT_PORT = 8082
 
 MSG_ID_HEX_LEN = 24
 
-# Tolerate transient per-chunk failures (bad shape, missing field) before
-# surfacing an error. One bad chunk in 100 shouldn't kill the rest of the
-# stream; 5 in a row means the upstream is genuinely broken.
+# Per-streak tolerance for transient chunk failures before surfacing an error.
 MAX_CONSECUTIVE_CHUNK_ERRORS = 5
 
 # Recognised bare names; anything else is opaque and passed through with openai/.
@@ -465,8 +463,8 @@ def to_anthropic_stop_reason(finish_reason):
     }.get(finish_reason or "", "end_turn")
 
 
-# Anthropic error types used in event:error — see APIStatusError docs.
-# Kept narrow; unknown upstream errors fall through to "api_error".
+# Maps litellm exception class names to Anthropic error_type enum values.
+# Unknown classes fall through to "api_error".
 _ANTHROPIC_ERROR_TYPES = {
     "RateLimitError": "rate_limit_error",
     "AuthenticationError": "authentication_error",
@@ -487,23 +485,19 @@ def _anthropic_error_type(exc: BaseException) -> str:
     return _ANTHROPIC_ERROR_TYPES.get(cls, "api_error")
 
 
-# Patterns that leak credentials / URLs with secrets when echoed from
-# litellm/httpx exception messages. Conservative — matches a long prefix
-# that scopes it to actual secret formats rather than every "key" mention.
+# litellm/httpx exception messages echo upstream bodies verbatim and can
+# carry credentials. Redact before yielding event:error.message.
 _CREDENTIAL_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),                  # OpenAI project keys
-    re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}"),              # Anthropic keys
-    re.compile(r"sk-or-[A-Za-z0-9_-]{20,}"),               # OpenRouter
-    re.compile(r"x-api-key=[A-Za-z0-9_-]{16,}"),           # inline API key in URL
-    re.compile(r"://[^/\s]+:[^/\s]+@"),                    # user:pass@ in URL
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"x-api-key=[A-Za-z0-9_-]{16,}"),
+    re.compile(r"://[^/\s]+:[^/\s]+@"),
 ]
 
 
 def _sanitize_error_message(message: str) -> str:
-    redacted = message
     for pat in _CREDENTIAL_PATTERNS:
-        redacted = pat.sub("[REDACTED]", redacted)
-    return redacted
+        message = pat.sub("[REDACTED]", message)
+    return message
 
 
 def get_field(obj, key, default=None):
@@ -1316,24 +1310,31 @@ def _translate_parser_events(
             yield tracker.delta({"type": "text_delta", "text": value})
 
 
-def _safe_drain_parser(
-    parser: "ThinkStreamParser", tracker: BlockTracker
+def _emit_failure(
+    parser: "ThinkStreamParser",
+    tracker: BlockTracker,
+    output_tokens: int,
+    exc: BaseException,
+    message_prefix: str,
 ) -> Iterator[str]:
-    """Flush parser state using only tracker+formatter — bypasses the
-    per-chunk translator so a broken upstream state can't drop the
-    buffered thinking/text that was already paid for."""
-    for kind, value in parser.flush():
-        if kind == "open":
-            yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
-        elif kind == "close":
-            for event in tracker.close():
-                yield event
-        elif kind == "thinking" and value:
-            yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
-            yield tracker.delta({"type": "thinking_delta", "thinking": value})
-        elif kind == "text" and value:
-            yield from _open_block(tracker, "text", {"type": "text", "text": ""})
-            yield tracker.delta({"type": "text_delta", "text": value})
+    """Drain, close, message_delta → event:error → done. Per-step try-wrap
+    so a broken upstream can't mask the primary error."""
+    try:
+        for event in _translate_parser_events(parser.flush(), tracker):
+            yield event
+    except Exception:
+        logger.exception("draining parser on fail")
+    try:
+        for event in tracker.close():
+            yield event
+    except Exception:
+        logger.exception("closing tracker on fail")
+    yield SseFormatter.message_delta("end_turn", output_tokens)
+    yield SseFormatter.error(
+        _anthropic_error_type(exc),
+        _sanitize_error_message(f"{message_prefix}: {exc}"),
+    )
+    yield SseFormatter.done()
 
 
 def log_request(method, path, source_model, target_model, tier, num_messages, num_tools, status_code):
@@ -1363,7 +1364,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
     debug_first_chunk_logged = False
     debug_chunk_count = 0
     consecutive_chunk_errors = 0
-    last_iter_succeeded = True  # reset streak at end of each successful iter
 
     def new_tool_id() -> str:
         return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
@@ -1394,11 +1394,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield SseFormatter.ping()
 
         async for chunk in response_generator:
-            # A successful previous iteration resets the streak counter —
-            # tolerance is per-streak, not per-stream-lifetime.
-            if last_iter_succeeded:
-                consecutive_chunk_errors = 0
-            last_iter_succeeded = False
             try:
                 if _litellm_debug_http_enabled():
                     debug_chunk_count += 1
@@ -1497,43 +1492,20 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     for event in SseFormatter.finish(to_anthropic_stop_reason(finish_reason), output_tokens):
                         yield event
                     return
-                # Reached end of try without exception — this iteration
-                # succeeded, so the next iteration's streak check will reset.
-                last_iter_succeeded = True
+                # Successful chunk — reset streak so tolerance is per-streak.
+                consecutive_chunk_errors = 0
             except Exception as e:
-                last_iter_succeeded = False
-                # Tolerated chunk: warning only (no traceback) so the log
-                # channel doesn't fill with red ERROR frames for chunks the
-                # proxy decided to skip.
+                # Tolerated: warning only, no traceback.
                 logger.warning(f"Error processing chunk ({consecutive_chunk_errors + 1}/{MAX_CONSECUTIVE_CHUNK_ERRORS + 1}): {e}")
-                # Tolerate a few bad chunks before giving up — chunk-storms
-                # still need to surface, but one transient shape mismatch
-                # shouldn't cost the rest of the response.
                 consecutive_chunk_errors += 1
                 if consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
                     continue
-                # Threshold tripped: now escalate with full traceback.
-                logger.error(f"Chunk error threshold exceeded; surfacing error: {e}", exc_info=True)
-                # Threshold hit — flush + close are best-effort; the broken
-                # upstream may have left the per-chunk translator in a state
-                # where even the flush call raises. Use the safe drainer so
-                # buffered thinking/text always reaches the client.
-                try:
-                    for event in _safe_drain_parser(think_parser, tracker):
-                        yield event
-                except Exception as flush_err:
-                    logger.error(f"Error flushing parser on fail: {flush_err}", exc_info=True)
-                try:
-                    for event in tracker.close():
-                        yield event
-                except Exception as close_err:
-                    logger.error(f"Error closing tracker on fail: {close_err}", exc_info=True)
-                yield SseFormatter.message_delta("end_turn", output_tokens)
-                yield SseFormatter.error(
-                    _anthropic_error_type(e),
-                    _sanitize_error_message(f"chunk processing failed: {e}"),
-                )
-                yield SseFormatter.done()
+                # Threshold tripped — escalate with traceback and surface error.
+                logger.exception("Chunk error threshold exceeded; surfacing error")
+                for event in _emit_failure(
+                    think_parser, tracker, output_tokens, e, "chunk processing failed"
+                ):
+                    yield event
                 return
 
         if not has_sent_stop_reason:
@@ -1550,24 +1522,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             )
 
     except Exception as e:
-        logger.error(f"Error in streaming: {e}", exc_info=True)
-        try:
-            for event in _safe_drain_parser(think_parser, tracker):
-                yield event
-        except Exception as flush_err:
-            logger.error(f"Error flushing parser on fail: {flush_err}", exc_info=True)
-        try:
-            for event in tracker.close():
-                yield event
-        except Exception as close_err:
-            logger.error(f"Error closing tracker on fail: {close_err}", exc_info=True)
-        # Emit accumulated usage so SDKs surface partial token counts on failure.
-        yield SseFormatter.message_delta("end_turn", output_tokens)
-        yield SseFormatter.error(
-            _anthropic_error_type(e),
-            _sanitize_error_message(f"upstream streaming failed: {e}"),
-        )
-        yield SseFormatter.done()
+        logger.exception("Error in streaming")
+        for event in _emit_failure(
+            think_parser, tracker, output_tokens, e, "upstream streaming failed"
+        ):
+            yield event
     finally:
         # Close so the internal httpx client releases deterministically —
         # otherwise mid-stream cancellation leaks it until GC.

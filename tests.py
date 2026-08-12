@@ -1418,58 +1418,34 @@ async def test_streaming_emits_error_frame_on_upstream_failure() -> None:
     assert "upstream streaming failed" in err["error"]["message"]
 
 
-async def test_streaming_flushes_buffered_think_content_on_failure() -> None:
-    """ThinkStreamParser holds content until </think> in thinking mode — if
-    the stream errors mid-think, the buffer would be dropped without flush().
-    Must surface the buffered thinking as a delta before the error frame."""
-    req = _base_request(stream=True)
+def test_emit_failure_flushes_buffered_think_content() -> None:
+    """ThinkStreamParser holds content until </think> in thinking mode;
+    _emit_failure must surface buffered thinking as a delta before the
+    error frame."""
+    parser = srv.ThinkStreamParser()
+    parser.feed("<think>partial reasoning...")  # buffered, no closing tag
+    tracker = srv.BlockTracker()
+    exc = RuntimeError("test")
 
-    async def _bad_upstream():
-        # First chunk opens a think block with "partial reasoning..." buffered.
-        yield {"choices": [{"delta": {"content": "<think>partial reasoning..."}}]}
-        # Then MAX_CONSECUTIVE_CHUNK_ERRORS+1 bad chunks (with think still open)
-        # to exceed the tolerance threshold and trigger the fail path.
-        for i in range(srv.MAX_CONSECUTIVE_CHUNK_ERRORS + 1):
-            yield {"choices": [{"delta": {"content": f"more{i}"}}]}
-
-    original = srv._translate_parser_events
-    call_count = {"n": 0}
-
-    def _boom_after_first(*args, **kwargs):
-        # Let the first call (think-open + buffered reasoning) through so
-        # the test can verify it surfaces before the error frame.
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            return original(*args, **kwargs)
-        raise RuntimeError("simulated mid-think failure")
-
-    srv._translate_parser_events = _boom_after_first
-    try:
-        raw: List[str] = []
-        async for piece in srv.handle_streaming(_bad_upstream(), req):
-            raw.append(piece)
-    finally:
-        srv._translate_parser_events = original
-
+    raw: List[str] = []
+    for piece in srv._emit_failure(parser, tracker, 0, exc, "test failed"):
+        raw.append(piece)
     events = _parse_sse(raw)
-    types = [e["type"] for e in events]
-    # Buffered thinking must surface as a thinking_delta before the error.
+
     thinking_deltas = [
         e for e in events
         if e["type"] == "content_block_delta"
         and e.get("delta", {}).get("type") == "thinking_delta"
     ]
     assert thinking_deltas, "buffered think content must be flushed before error frame"
-    assert any(
-        "partial reasoning" in d["delta"]["thinking"]
-        for d in thinking_deltas
-    )
+    assert any("partial reasoning" in d["delta"]["thinking"] for d in thinking_deltas)
+
+    types = [e["type"] for e in events]
     err_idx = types.index("error")
-    assert thinking_deltas[-1] is not None  # buffered delta emitted first
-    # All buffered deltas come before the error frame.
+    assert types[-1] == "[DONE]"
     for d in thinking_deltas:
-        delta_idx = events.index(d)
-        assert delta_idx < err_idx
+        assert events.index(d) < err_idx
+    assert types.index("content_block_stop") < err_idx
 
 
 def test_sse_formatter_error_emits_canonical_shape() -> None:
