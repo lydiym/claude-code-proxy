@@ -84,7 +84,11 @@ if TIKTOKEN_OFFLINE:
     # Token counts are approximate; real counts come from upstream usage.
     import tiktoken
 
-    class _OfflineEncoding:
+    class _OfflineEncoding(tiktoken.Encoding):
+        def __init__(self):
+            # Override parent's __init__ to skip the required mergeable_ranks / special_tokens.
+            pass
+
         def encode(self, text, *args, **kwargs):
             return [1] * max(1, len(text) // 4)
 
@@ -100,8 +104,15 @@ if TIKTOKEN_OFFLINE:
         def decode_single_token_bytes(self, token):
             return b""
 
-    tiktoken.get_encoding = lambda name: _OfflineEncoding()
-    tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
+    def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
+        return _OfflineEncoding()
+
+    def _encoding_for_model(model_name: str) -> tiktoken.Encoding:
+        return _OfflineEncoding()
+
+    # ty invalid-assignment: monkey-patching module functions, intentional.
+    tiktoken.get_encoding = _get_encoding  # type: ignore[ty:invalid-assignment]
+    tiktoken.encoding_for_model = _encoding_for_model  # type: ignore[ty:invalid-assignment]
 
 # These imports must come after the env-var + tiktoken patch above.
 import litellm  # noqa: E402
@@ -400,7 +411,7 @@ async def _configure_logging(app: FastAPI):
     if _litellm_debug_http_enabled():
         # Verbose mode: see exactly what litellm sends/receives and what
         # goes over the wire via httpx. Heavy — only for live debugging.
-        litellm.set_verbose = True
+        litellm.set_verbose = True  # type: ignore[ty:invalid-assignment]
         for noisy in ("httpx", "httpcore", "LiteLLM"):
             logging.getLogger(noisy).setLevel(logging.DEBUG)
         logger.warning("LITELLM_DEBUG_HTTP=1 — verbose litellm + httpx/httpcore DEBUG logs enabled")
