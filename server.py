@@ -1,20 +1,22 @@
-from contextlib import asynccontextmanager
-from copy import deepcopy
-from dataclasses import dataclass
-from functools import lru_cache
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, field_validator, model_validator
-from typing import List, Dict, Any, Optional, Union, Literal, Iterator
-import logging
 import json
-import re
+import logging
 import os
+import re
 import sys
 import time
 import tomllib
 import uuid
+from collections.abc import Iterator
+from contextlib import asynccontextmanager
+from copy import deepcopy
+from dataclasses import dataclass
+from functools import cache
+from typing import Any, Literal
+
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, field_validator, model_validator
 
 load_dotenv()
 
@@ -38,6 +40,7 @@ logger = logging.getLogger(__name__)
 # Pre-import: tiktoken stub before `import litellm`. Resolver is standalone
 # so the main loader sits below.
 # ---------------------------------------------------------------------------
+
 
 def _str_to_bool(value, *, default=False):
     """Parse an env-style boolean; unrecognised strings fall back to ``default``."""
@@ -100,9 +103,9 @@ if TIKTOKEN_OFFLINE:
     tiktoken.get_encoding = lambda name: _OfflineEncoding()
     tiktoken.encoding_for_model = lambda model: _OfflineEncoding()
 
-import litellm
-import uvicorn
-
+# These imports must come after the env-var + tiktoken patch above.
+import litellm  # noqa: E402
+import uvicorn  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
@@ -116,7 +119,8 @@ _VALID_TIERS = set(TIER_KEYS)
 # Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite — the proxy owns these.
 _PROTECTED_KEYS = {"model", "messages", "stream", "tools"}
 _PROXY_KEYS = {
-    "openai_api_key", "openai_base_url",
+    "openai_api_key",
+    "openai_base_url",
     "openai_tls_verify",
 }
 # haiku → small; everything else → big. Single source of truth for which bucket a tier inherits from.
@@ -124,7 +128,7 @@ _BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
 _VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge: base + override, where override wins per leaf.
     Used at request time to layer tier config over [global] and to merge
     config extra_body into the upstream body."""
@@ -144,11 +148,11 @@ def _strip_provider_prefix(name: str) -> str:
     """Strip a known provider prefix (case-insensitive). Bare-name case preserved."""
     for prefix in _PROVIDER_PREFIXES:
         if name.lower().startswith(prefix):
-            return name[len(prefix):]
+            return name[len(prefix) :]
     return name
 
 
-def _match_tier(name: str) -> Optional[str]:
+def _match_tier(name: str) -> str | None:
     """First TIER_KEYS substring that appears in the lower-cased name.
     Returns None when no tier matches."""
     lower = name.lower()
@@ -158,10 +162,10 @@ def _match_tier(name: str) -> Optional[str]:
     return None
 
 
-def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
+def _parse_tier_section(body: dict[str, Any], section: str) -> dict[str, Any]:
     """Parse [global]. Accepts `model` (str) + `extra_body` (dict). Bad
     values are warned and skipped so one error doesn't drop the rest."""
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for k, v in body.items():
         if k == "model":
             if not isinstance(v, str) or not v:
@@ -178,10 +182,10 @@ def _parse_tier_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
     return out
 
 
-def _parse_bucket_section(body: Dict[str, Any], section: str) -> Dict[str, Any]:
+def _parse_bucket_section(body: dict[str, Any], section: str) -> dict[str, Any]:
     """Parse [big], [small], or a per-tier section. Accepts `model` (str) and
     `extra_body` (dict). Bad values warned and skipped."""
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for k, v in body.items():
         if k == "model":
             if not isinstance(v, str) or not v:
@@ -215,9 +219,9 @@ def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
     return _COERCE_DROP
 
 
-def _load_config(path: str) -> Dict[str, Any]:
+def _load_config(path: str) -> dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
-    out: Dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
     if not path:
         return out
     if not os.path.isfile(path):
@@ -231,10 +235,7 @@ def _load_config(path: str) -> Dict[str, Any]:
         return out
     for section, body in raw.items():
         if section not in _VALID_SECTIONS:
-            logger.warning(
-                f"Unknown section [{section}] in {path}; ignoring "
-                f"(valid: {sorted(_VALID_SECTIONS)})"
-            )
+            logger.warning(f"Unknown section [{section}] in {path}; ignoring (valid: {sorted(_VALID_SECTIONS)})")
             continue
         if not isinstance(body, dict):
             logger.warning(f"[{section}] must be a table, got {type(body).__name__}; ignoring")
@@ -298,8 +299,8 @@ def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
     return _str_to_bool(val, default=default)
 
 
-@lru_cache(maxsize=None)
-def _default_model_for_tier(tier: Optional[str]) -> str:
+@cache
+def _default_model_for_tier(tier: str | None) -> str:
     """Per-tier upstream model. Lookup order:
       1. {TIER}_MODEL env (e.g. HAIKU_MODEL; skipped when tier=None)
       2. {BIG|SMALL}_MODEL env — bucket-level (haiku → SMALL_MODEL, others → BIG_MODEL)
@@ -350,6 +351,7 @@ def _default_model_for_tier(tier: Optional[str]) -> str:
 
 class Colors:
     """ANSI color codes used to highlight parts of operational log lines."""
+
     CYAN = "\033[96m"
     BLUE = "\033[94m"
     GREEN = "\033[92m"
@@ -401,9 +403,7 @@ async def _configure_logging(app: FastAPI):
         litellm.set_verbose = True
         for noisy in ("httpx", "httpcore", "LiteLLM"):
             logging.getLogger(noisy).setLevel(logging.DEBUG)
-        logger.warning(
-            "LITELLM_DEBUG_HTTP=1 — verbose litellm + httpx/httpcore DEBUG logs enabled"
-        )
+        logger.warning("LITELLM_DEBUG_HTTP=1 — verbose litellm + httpx/httpcore DEBUG logs enabled")
 
     _reset_logger("uvicorn", propagate=True)
     _reset_logger("uvicorn.error", propagate=True)
@@ -518,25 +518,25 @@ class ContentBlockThinking(BaseModel):
     type: Literal["thinking"]
     thinking: str
     # Echoed back in conversation history; we don't generate it locally.
-    signature: Optional[str] = None
+    signature: str | None = None
 
 
 class ContentBlockImage(BaseModel):
     type: Literal["image"]
-    source: Dict[str, Any]
+    source: dict[str, Any]
 
 
 class ContentBlockToolUse(BaseModel):
     type: Literal["tool_use"]
     id: str
     name: str
-    input: Dict[str, Any]
+    input: dict[str, Any]
 
 
 class ContentBlockToolResult(BaseModel):
     type: Literal["tool_result"]
     tool_use_id: str
-    content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
+    content: str | list[dict[str, Any]] | dict[str, Any] | list[Any] | Any
 
 
 class SystemContent(BaseModel):
@@ -546,45 +546,39 @@ class SystemContent(BaseModel):
 
 class Message(BaseModel):
     role: Literal["user", "assistant", "system"]
-    content: Union[
-        str,
-        List[
-            Union[
-                ContentBlockText,
-                ContentBlockThinking,
-                ContentBlockImage,
-                ContentBlockToolUse,
-                ContentBlockToolResult,
-            ]
-        ],
-    ]
+    content: (
+        str
+        | list[
+            ContentBlockText | ContentBlockThinking | ContentBlockImage | ContentBlockToolUse | ContentBlockToolResult
+        ]
+    )
 
 
 class Tool(BaseModel):
     name: str
-    description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    description: str | None = None
+    input_schema: dict[str, Any]
 
 
 class MessagesRequest(BaseModel):
     model: str
     max_tokens: int
-    messages: List[Message]
-    system: Optional[Union[str, List[SystemContent]]] = None
-    stop_sequences: Optional[List[str]] = None
-    stream: Optional[bool] = False
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    tools: Optional[List[Tool]] = None
-    tool_choice: Optional[Dict[str, Any]] = None
+    messages: list[Message]
+    system: str | list[SystemContent] | None = None
+    stop_sequences: list[str] | None = None
+    stream: bool | None = False
+    temperature: float | None = 1.0
+    top_p: float | None = None
+    top_k: int | None = None
+    tools: list[Tool] | None = None
+    tool_choice: dict[str, Any] | None = None
     # Pass-through bag for arbitrary OpenAI Chat Completions keys. Merged
     # with [tier].extra_body at convert time; per-leaf config-wins.
-    extra_body: Optional[Dict[str, Any]] = None
-    original_model: Optional[str] = None
+    extra_body: dict[str, Any] | None = None
+    original_model: str | None = None
     # Populated by `derive_tier` (model_validator below); used by
     # convert_anthropic_to_litellm to look up per-tier CONFIG settings.
-    tier: Optional[str] = None
+    tier: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -633,12 +627,10 @@ class MessagesResponse(BaseModel):
     id: str
     model: str
     role: Literal["assistant"] = "assistant"
-    content: List[Union[ContentBlockText, ContentBlockThinking, ContentBlockToolUse]]
+    content: list[ContentBlockText | ContentBlockThinking | ContentBlockToolUse]
     type: Literal["message"] = "message"
-    stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
-    ] = None
-    stop_sequence: Optional[str] = None
+    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
+    stop_sequence: str | None = None
     usage: Usage
 
 
@@ -699,7 +691,7 @@ class ThinkStreamParser:
             events.append((kind, self.buffer[:idx]))
         events.append(("close" if self.in_thinking else "open", None))
         self.in_thinking = not self.in_thinking
-        self.buffer = self.buffer[idx + len(tag):]
+        self.buffer = self.buffer[idx + len(tag) :]
         return True
 
     def flush(self):
@@ -756,7 +748,7 @@ def parse_tool_result_content(content):
         return "Unparseable content"
 
 
-def convert_image_block(source: Any) -> Dict[str, Any]:
+def convert_image_block(source: Any) -> dict[str, Any]:
     if isinstance(source, dict):
         if source.get("type") == "base64":
             media_type = source.get("media_type", "image/png")
@@ -781,11 +773,7 @@ def _extract_text(content) -> str:
         return ""
     if isinstance(content, str):
         return content
-    parts = [
-        get_field(block, "text", "")
-        for block in content
-        if get_field(block, "type") == "text"
-    ]
+    parts = [get_field(block, "text", "") for block in content if get_field(block, "type") == "text"]
     return "\n\n".join(p for p in parts if p)
 
 
@@ -794,7 +782,7 @@ def system_to_message(system):
     return {"role": "system", "content": text} if text else None
 
 
-def _build_system_message(system_field, messages) -> Optional[Dict[str, str]]:
+def _build_system_message(system_field, messages) -> dict[str, str] | None:
     """Combine the top-level system field with any in-band role='system' messages
     into a single OpenAI system message.
 
@@ -805,11 +793,7 @@ def _build_system_message(system_field, messages) -> Optional[Dict[str, str]]:
     is the order Claude Code most likely intended when it injected the
     reminders inline.
     """
-    parts = [
-        text
-        for text in (_extract_text(m.content) for m in messages if m.role == "system")
-        if text
-    ]
+    parts = [text for text in (_extract_text(m.content) for m in messages if m.role == "system") if text]
     top = _extract_text(system_field)
     if top:
         parts.append(top)
@@ -845,21 +829,20 @@ def convert_assistant_message(msg, result_ids):
             text_parts.append(block.text)
         elif block_type == "tool_use":
             if block.id in result_ids:
-                tool_calls.append({
-                    "id": block.id,
-                    "type": "function",
-                    "function": {
-                        "name": block.name,
-                        "arguments": json.dumps(block.input),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block.id,
+                        "type": "function",
+                        "function": {
+                            "name": block.name,
+                            "arguments": json.dumps(block.input),
+                        },
+                    }
+                )
             else:
                 # Dangling call (result truncated from history): describe in
                 # prose — small models mimic tool-call syntax otherwise.
-                text_parts.append(
-                    f"(An earlier {block.name} tool call is missing its "
-                    f"result in this context.)"
-                )
+                text_parts.append(f"(An earlier {block.name} tool call is missing its result in this context.)")
 
     text = "\n".join(text_parts).strip()
     out = {"role": "assistant"}
@@ -884,17 +867,21 @@ def convert_user_message(msg, call_ids):
             tool_use_id = get_field(block, "tool_use_id", "") or ""
             result_text = parse_tool_result_content(get_field(block, "content"))
             if tool_use_id in call_ids:
-                tool_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": result_text,
-                })
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": result_text,
+                    }
+                )
             else:
                 # Orphaned result (truncated call): fold into user text; the ghost id is meaningless.
-                user_parts.append({
-                    "type": "text",
-                    "text": f"(Result from an earlier tool call:)\n{result_text}",
-                })
+                user_parts.append(
+                    {
+                        "type": "text",
+                        "text": f"(Result from an earlier tool call:)\n{result_text}",
+                    }
+                )
 
     # Tool results must follow the matching assistant turn, so emit them first.
     out = list(tool_messages)
@@ -907,7 +894,7 @@ def convert_user_message(msg, call_ids):
     return out
 
 
-def _convert_message(msg, result_ids, call_ids) -> List[Dict[str, Any]]:
+def _convert_message(msg, result_ids, call_ids) -> list[dict[str, Any]]:
     if isinstance(msg.content, str):
         return [{"role": msg.role, "content": msg.content}]
     if msg.role == "assistant":
@@ -953,12 +940,12 @@ def sanitize_messages_for_openai(messages):
             msg["content"] = "..."
 
 
-def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
+def _resolve_tier_config(request: "MessagesRequest") -> dict[str, Any]:
     """extra_body merge chain: [global] → [bucket] → [tier].
     haiku → small bucket; others → big bucket; tier=None → no bucket or tier.
     `model` is consumed by _default_model_for_tier and stripped from the result.
     Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts."""
-    layers: List[Dict[str, Any]] = []
+    layers: list[dict[str, Any]] = []
     global_cfg = CONFIG.get("global")
     if global_cfg is not None:
         layers.append(global_cfg)
@@ -972,14 +959,14 @@ def _resolve_tier_config(request: "MessagesRequest") -> Dict[str, Any]:
         if tier_cfg is not None:
             layers.append(tier_cfg)
 
-    merged: Dict[str, Any] = {}
+    merged: dict[str, Any] = {}
     for layer in layers:
         merged = _deep_merge(merged, layer)
     merged.pop("model", None)
     return deepcopy(merged)
 
 
-def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
+def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str, Any]:
     call_ids, result_ids = collect_tool_ids(anthropic_request.messages)
 
     messages = []
@@ -992,7 +979,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         if msg.role != "system":
             messages.extend(_convert_message(msg, result_ids, call_ids))
 
-    litellm_request: Dict[str, Any] = {
+    litellm_request: dict[str, Any] = {
         "model": anthropic_request.model,
         "messages": messages,
         "max_completion_tokens": anthropic_request.max_tokens,
@@ -1021,7 +1008,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if "seed" in tier_cfg:
         litellm_request["seed"] = tier_cfg["seed"]
 
-    merged_extra: Dict[str, Any] = {}
+    merged_extra: dict[str, Any] = {}
     if anthropic_request.extra_body:
         merged_extra = _deep_merge(merged_extra, anthropic_request.extra_body)
     tier_extra = tier_cfg.get("extra_body")
@@ -1094,12 +1081,14 @@ def _build_content_blocks(text, reasoning, tool_calls):
         blocks.append({"type": "text", "text": text})
     for tool_call in tool_calls:
         function = get_field(tool_call, "function", {}) or {}
-        blocks.append({
-            "type": "tool_use",
-            "id": get_field(tool_call, "id", f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"),
-            "name": get_field(function, "name", ""),
-            "input": _parse_tool_arguments(get_field(function, "arguments", "{}")),
-        })
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": get_field(tool_call, "id", f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"),
+                "name": get_field(function, "name", ""),
+                "input": _parse_tool_arguments(get_field(function, "arguments", "{}")),
+            }
+        )
     return blocks or [{"type": "text", "text": ""}]
 
 
@@ -1111,7 +1100,7 @@ def _extract_usage(usage):
 
 
 def convert_litellm_to_anthropic(
-    litellm_response: Union[Dict[str, Any], Any], original_request: MessagesRequest
+    litellm_response: dict[str, Any] | Any, original_request: MessagesRequest
 ) -> MessagesResponse:
     try:
         message = _first_message(litellm_response)
@@ -1168,13 +1157,13 @@ class BlockTracker:
 
     def __init__(self) -> None:
         self._next_index = 0
-        self._current: Optional[OpenBlock] = None
+        self._current: OpenBlock | None = None
 
     @property
-    def current(self) -> Optional[OpenBlock]:
+    def current(self) -> OpenBlock | None:
         return self._current
 
-    def is_open(self, kind: Optional[str] = None) -> bool:
+    def is_open(self, kind: str | None = None) -> bool:
         if kind is None:
             return self._current is not None
         return self._current is not None and self._current.kind == kind
@@ -1185,17 +1174,17 @@ class BlockTracker:
         self._current = block
         return block
 
-    def ensure(self, kind: str) -> List[str]:
+    def ensure(self, kind: str) -> list[str]:
         if self._current is not None and self._current.kind != kind:
             return self.close()
         return []
 
-    def delta(self, delta_payload: Dict[str, Any]) -> str:
+    def delta(self, delta_payload: dict[str, Any]) -> str:
         if self._current is None:
             raise RuntimeError("no block is open; call open() first")
         return SseFormatter.content_block_delta(self._current.index, delta_payload)
 
-    def close(self) -> List[str]:
+    def close(self) -> list[str]:
         if self._current is None:
             return []
         events = [SseFormatter.content_block_stop(self._current.index)]
@@ -1213,34 +1202,51 @@ class SseFormatter:
     """
 
     @staticmethod
-    def event(event_type: str, payload: Dict[str, Any]) -> str:
+    def event(event_type: str, payload: dict[str, Any]) -> str:
         return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
 
     @staticmethod
-    def content_block_start(index: int, block: Dict[str, Any]) -> str:
-        return SseFormatter.event("content_block_start", {
-            "type": "content_block_start", "index": index, "content_block": block,
-        })
+    def content_block_start(index: int, block: dict[str, Any]) -> str:
+        return SseFormatter.event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block,
+            },
+        )
 
     @staticmethod
-    def content_block_delta(index: int, delta: Dict[str, Any]) -> str:
-        return SseFormatter.event("content_block_delta", {
-            "type": "content_block_delta", "index": index, "delta": delta,
-        })
+    def content_block_delta(index: int, delta: dict[str, Any]) -> str:
+        return SseFormatter.event(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": delta,
+            },
+        )
 
     @staticmethod
     def content_block_stop(index: int) -> str:
-        return SseFormatter.event("content_block_stop", {
-            "type": "content_block_stop", "index": index,
-        })
+        return SseFormatter.event(
+            "content_block_stop",
+            {
+                "type": "content_block_stop",
+                "index": index,
+            },
+        )
 
     @staticmethod
     def message_delta(stop_reason: str, output_tokens: int) -> str:
-        return SseFormatter.event("message_delta", {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
-        })
+        return SseFormatter.event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            },
+        )
 
     @staticmethod
     def message_stop() -> str:
@@ -1257,13 +1263,16 @@ class SseFormatter:
     @staticmethod
     def error(error_type: str, message: str) -> str:
         # Anthropic SDK raises APIStatusError on `event: error`.
-        return SseFormatter.event("error", {
-            "type": "error",
-            "error": {"type": error_type, "message": message},
-        })
+        return SseFormatter.event(
+            "error",
+            {
+                "type": "error",
+                "error": {"type": error_type, "message": message},
+            },
+        )
 
     @staticmethod
-    def finish(stop_reason: str, output_tokens: int) -> List[str]:
+    def finish(stop_reason: str, output_tokens: int) -> list[str]:
         return [
             SseFormatter.message_delta(stop_reason, output_tokens),
             SseFormatter.message_stop(),
@@ -1271,11 +1280,8 @@ class SseFormatter:
         ]
 
 
-def _open_block(
-    tracker: BlockTracker, kind: str, block_dict: Dict[str, Any]
-) -> Iterator[str]:
-    for event in tracker.ensure(kind):
-        yield event
+def _open_block(tracker: BlockTracker, kind: str, block_dict: dict[str, Any]) -> Iterator[str]:
+    yield from tracker.ensure(kind)
     if not tracker.is_open(kind):
         block = tracker.open(kind)
         yield SseFormatter.content_block_start(block.index, block_dict)
@@ -1288,15 +1294,12 @@ def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
     yield tracker.delta({"type": "thinking_delta", "thinking": text})
 
 
-def _translate_parser_events(
-    events: List[tuple], tracker: BlockTracker
-) -> Iterator[str]:
+def _translate_parser_events(events: list[tuple], tracker: BlockTracker) -> Iterator[str]:
     for kind, value in events:
         if kind == "open":
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
         elif kind == "close":
-            for event in tracker.close():
-                yield event
+            yield from tracker.close()
         elif kind == "thinking" and value:
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
             yield tracker.delta({"type": "thinking_delta", "thinking": value})
@@ -1352,7 +1355,7 @@ def log_request(method, path, source_model, target_model, tier, num_messages, nu
 async def handle_streaming(response_generator, original_request: MessagesRequest):
     tracker = BlockTracker()
     think_parser = ThinkStreamParser()
-    tool_index: Optional[int] = None
+    tool_index: int | None = None
     input_tokens = 0
     output_tokens = 0
     has_sent_stop_reason = False
@@ -1364,24 +1367,27 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
     try:
-        yield SseFormatter.event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": new_msg_id(),
-                "type": "message",
-                "role": "assistant",
-                "model": original_request.model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "output_tokens": 0,
+        yield SseFormatter.event(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": new_msg_id(),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": original_request.model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
                 },
             },
-        })
+        )
 
         # Always start with a text block; close-and-open transitions handle upstream switches.
         for event in _open_block(tracker, "text", {"type": "text", "text": ""}):
@@ -1398,14 +1404,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         debug_first_chunk_logged = True
                         try:
                             logger.debug(
-                                f"litellm stream chunk #1 (first): "
-                                f"{json.dumps(chunk, default=str, ensure_ascii=False)}"
+                                f"litellm stream chunk #1 (first): {json.dumps(chunk, default=str, ensure_ascii=False)}"
                             )
                         except Exception as e:
                             logger.debug(f"litellm stream chunk dump failed: {e}")
                 usage = get_field(chunk, "usage")
                 if usage is not None:
-                    # Overwrite running totals only when upstream sends a value — some providers emit `0` mid-stream as a no-op, and the old `or 0` would clobber the real cumulative.
+                    # Overwrite only when upstream sends non-zero — some providers emit `0` mid-stream as a no-op.
                     incoming = get_field(usage, "prompt_tokens")
                     if isinstance(incoming, (int, float)) and incoming:
                         input_tokens = int(incoming)
@@ -1464,9 +1469,15 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             name = get_field(function, "name", "")
                             tool_id = get_field(tool_call, "id") or new_tool_id()
                             block = tracker.open("tool_use")
-                            yield SseFormatter.content_block_start(block.index, {
-                                "type": "tool_use", "id": tool_id, "name": name, "input": {},
-                            })
+                            yield SseFormatter.content_block_start(
+                                block.index,
+                                {
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": name,
+                                    "input": {},
+                                },
+                            )
 
                         function = get_field(tool_call, "function", {}) or {}
                         arguments = get_field(function, "arguments", "")
@@ -1489,15 +1500,15 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 consecutive_chunk_errors = 0
             except Exception as e:
                 # Tolerated: warning only, no traceback.
-                logger.warning(f"Error processing chunk ({consecutive_chunk_errors + 1}/{MAX_CONSECUTIVE_CHUNK_ERRORS + 1}): {e}")
+                logger.warning(
+                    f"Error processing chunk ({consecutive_chunk_errors + 1}/{MAX_CONSECUTIVE_CHUNK_ERRORS + 1}): {e}"
+                )
                 consecutive_chunk_errors += 1
                 if consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
                     continue
                 # Threshold tripped — escalate with traceback and surface error.
                 logger.exception("Chunk error threshold exceeded; surfacing error")
-                for event in _emit_failure(
-                    think_parser, tracker, output_tokens, e, "chunk processing failed"
-                ):
+                for event in _emit_failure(think_parser, tracker, output_tokens, e, "chunk processing failed"):
                     yield event
                 return
 
@@ -1516,9 +1527,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
     except Exception as e:
         logger.exception("Error in streaming")
-        for event in _emit_failure(
-            think_parser, tracker, output_tokens, e, "upstream streaming failed"
-        ):
+        for event in _emit_failure(think_parser, tracker, output_tokens, e, "upstream streaming failed"):
             yield event
     finally:
         # Close so the internal httpx client releases deterministically —
@@ -1542,8 +1551,7 @@ async def create_message(request: MessagesRequest):
         # Skip the bulky fields (messages, tools) — they dominate the dump and
         # are visible in litellm.set_verbose anyway.
         if logger.isEnabledFor(logging.DEBUG):
-            debug = {k: v for k, v in litellm_request.items()
-                     if k not in ("messages", "tools")}
+            debug = {k: v for k, v in litellm_request.items() if k not in ("messages", "tools")}
             logger.debug(f"upstream params: {debug}")
 
             if _litellm_debug_http_enabled():
@@ -1578,9 +1586,7 @@ async def create_message(request: MessagesRequest):
 
         start_time = time.time()
         litellm_response = litellm.completion(**litellm_request)
-        logger.debug(
-            f"Response received: model={litellm_request.get('model')}, time={time.time() - start_time:.2f}s"
-        )
+        logger.debug(f"Response received: model={litellm_request.get('model')}, time={time.time() - start_time:.2f}s")
         if _litellm_debug_http_enabled():
             try:
                 if hasattr(litellm_response, "model_dump"):
@@ -1590,8 +1596,7 @@ async def create_message(request: MessagesRequest):
                 else:
                     payload = repr(litellm_response)
                 logger.debug(
-                    f"litellm.completion response (full): "
-                    f"{json.dumps(payload, default=str, ensure_ascii=False)}"
+                    f"litellm.completion response (full): {json.dumps(payload, default=str, ensure_ascii=False)}"
                 )
             except Exception as e:
                 logger.debug(f"litellm.completion response dump failed: {e}")
@@ -1601,7 +1606,7 @@ async def create_message(request: MessagesRequest):
         logger.error(f"Error processing request: {e}", exc_info=True)
         status_code = getattr(e, "status_code", 500)
         message = getattr(e, "message", None) or str(e)
-        raise HTTPException(status_code=status_code, detail=message)
+        raise HTTPException(status_code=status_code, detail=message) from e
 
 
 @app.get("/")
