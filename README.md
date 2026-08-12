@@ -158,6 +158,31 @@ Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_temp
 
 Tool calls round-trip natively: `assistant.tool_calls` and `role="tool"` messages are preserved so tool use works with any OpenAI-compatible backend.
 
+## Development 🛠️
+
+```bash
+# Install dev deps (ruff, etc.) — uv manages them via PEP 735 [dependency-groups].
+uv sync
+
+# Lint (autofix what's safe, suggest fixes for the rest).
+uv run ruff check --fix
+
+# Format.
+uv run ruff format
+
+# Run the test suite (unit tests, no network needed).
+uv run python tests.py
+```
+
+The pre-commit hook runs both ruff checks on every commit:
+
+```bash
+uv tool install pre-commit
+pre-commit install
+```
+
+`tests.py` is excluded from ruff — it's a top-level test runner, not production code.
+
 ## Contributing 🤝
 
 Pull requests welcome. 🎁
