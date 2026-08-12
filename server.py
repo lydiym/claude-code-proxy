@@ -113,16 +113,13 @@ import uvicorn
 # TOML-loader section validator and the per-request tier lookup both read this.
 TIER_KEYS = ("haiku", "sonnet", "opus", "fable", "mythos")
 _VALID_TIERS = set(TIER_KEYS)
-# Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite —
-# the proxy owns these. Warn and skip rather than letting user config shadow
-# something we'd need to rebuild after.
+# Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite — the proxy owns these.
 _PROTECTED_KEYS = {"model", "messages", "stream", "tools"}
 _PROXY_KEYS = {
     "openai_api_key", "openai_base_url",
     "openai_tls_verify",
 }
-# haiku → small; everything else → big. Single source of truth for which bucket
-# a tier inherits from.
+# haiku → small; everything else → big. Single source of truth for which bucket a tier inherits from.
 _BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
 _VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 
@@ -463,8 +460,7 @@ def to_anthropic_stop_reason(finish_reason):
     }.get(finish_reason or "", "end_turn")
 
 
-# Maps litellm exception class names to Anthropic error_type enum values.
-# Unknown classes fall through to "api_error".
+# Maps litellm exception class names to Anthropic error_type enum; unknown classes fall through to "api_error".
 _ANTHROPIC_ERROR_TYPES = {
     "RateLimitError": "rate_limit_error",
     "AuthenticationError": "authentication_error",
@@ -485,8 +481,7 @@ def _anthropic_error_type(exc: BaseException) -> str:
     return _ANTHROPIC_ERROR_TYPES.get(cls, "api_error")
 
 
-# litellm/httpx exception messages echo upstream bodies verbatim and can
-# carry credentials. Redact before yielding event:error.message.
+# litellm/httpx exception messages echo upstream bodies verbatim and can carry credentials; redact before event:error.
 _CREDENTIAL_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"x-api-key=[A-Za-z0-9_-]{16,}"),
@@ -1410,9 +1405,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             logger.debug(f"litellm stream chunk dump failed: {e}")
                 usage = get_field(chunk, "usage")
                 if usage is not None:
-                    # Only overwrite running totals when upstream sends a value;
-                    # some providers emit `0` mid-stream as a no-op signal and
-                    # the `or 0` would clobber the real cumulative count.
+                    # Overwrite running totals only when upstream sends a value — some providers emit `0` mid-stream as a no-op, and the old `or 0` would clobber the real cumulative.
                     incoming = get_field(usage, "prompt_tokens")
                     if isinstance(incoming, (int, float)) and incoming:
                         input_tokens = int(incoming)
