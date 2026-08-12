@@ -7,6 +7,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal, Iterator
 import logging
 import json
+import re
 import os
 import sys
 import time
@@ -112,16 +113,13 @@ import uvicorn
 # TOML-loader section validator and the per-request tier lookup both read this.
 TIER_KEYS = ("haiku", "sonnet", "opus", "fable", "mythos")
 _VALID_TIERS = set(TIER_KEYS)
-# Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite —
-# the proxy owns these. Warn and skip rather than letting user config shadow
-# something we'd need to rebuild after.
+# Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite — the proxy owns these.
 _PROTECTED_KEYS = {"model", "messages", "stream", "tools"}
 _PROXY_KEYS = {
     "openai_api_key", "openai_base_url",
     "openai_tls_verify",
 }
-# haiku → small; everything else → big. Single source of truth for which bucket
-# a tier inherits from.
+# haiku → small; everything else → big. Single source of truth for which bucket a tier inherits from.
 _BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
 _VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 
@@ -434,6 +432,9 @@ DEFAULT_PORT = 8082
 
 MSG_ID_HEX_LEN = 24
 
+# Per-streak tolerance for transient chunk failures before surfacing an error.
+MAX_CONSECUTIVE_CHUNK_ERRORS = 5
+
 # Recognised bare names; anything else is opaque and passed through with openai/.
 OPENAI_MODELS = {
     "o3-mini",
@@ -457,6 +458,41 @@ def to_anthropic_stop_reason(finish_reason):
         "length": "max_tokens",
         "tool_calls": "tool_use",
     }.get(finish_reason or "", "end_turn")
+
+
+# Maps litellm exception class names to Anthropic error_type enum; unknown classes fall through to "api_error".
+_ANTHROPIC_ERROR_TYPES = {
+    "RateLimitError": "rate_limit_error",
+    "AuthenticationError": "authentication_error",
+    "PermissionDeniedError": "permission_error",
+    "NotFoundError": "not_found_error",
+    "UnprocessableEntityError": "invalid_request_error",
+    "BadRequestError": "invalid_request_error",
+    "Timeout": "timeout_error",
+    "APIConnectionError": "api_error",
+    "ContextWindowExceededError": "invalid_request_error",
+    "ServiceUnavailableError": "overloaded_error",
+    "InternalServerError": "api_error",
+}
+
+
+def _anthropic_error_type(exc: BaseException) -> str:
+    cls = type(exc).__name__
+    return _ANTHROPIC_ERROR_TYPES.get(cls, "api_error")
+
+
+# litellm/httpx exception messages echo upstream bodies verbatim and can carry credentials; redact before event:error.
+_CREDENTIAL_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"x-api-key=[A-Za-z0-9_-]{16,}"),
+    re.compile(r"://[^/\s]+:[^/\s]+@"),
+]
+
+
+def _sanitize_error_message(message: str) -> str:
+    for pat in _CREDENTIAL_PATTERNS:
+        message = pat.sub("[REDACTED]", message)
+    return message
 
 
 def get_field(obj, key, default=None):
@@ -1219,6 +1255,14 @@ class SseFormatter:
         return "data: [DONE]\n\n"
 
     @staticmethod
+    def error(error_type: str, message: str) -> str:
+        # Anthropic SDK raises APIStatusError on `event: error`.
+        return SseFormatter.event("error", {
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        })
+
+    @staticmethod
     def finish(stop_reason: str, output_tokens: int) -> List[str]:
         return [
             SseFormatter.message_delta(stop_reason, output_tokens),
@@ -1261,6 +1305,33 @@ def _translate_parser_events(
             yield tracker.delta({"type": "text_delta", "text": value})
 
 
+def _emit_failure(
+    parser: "ThinkStreamParser",
+    tracker: BlockTracker,
+    output_tokens: int,
+    exc: BaseException,
+    message_prefix: str,
+) -> Iterator[str]:
+    """Drain, close, message_delta → event:error → done. Per-step try-wrap
+    so a broken upstream can't mask the primary error."""
+    try:
+        for event in _translate_parser_events(parser.flush(), tracker):
+            yield event
+    except Exception:
+        logger.exception("draining parser on fail")
+    try:
+        for event in tracker.close():
+            yield event
+    except Exception:
+        logger.exception("closing tracker on fail")
+    yield SseFormatter.message_delta("end_turn", output_tokens)
+    yield SseFormatter.error(
+        _anthropic_error_type(exc),
+        _sanitize_error_message(f"{message_prefix}: {exc}"),
+    )
+    yield SseFormatter.done()
+
+
 def log_request(method, path, source_model, target_model, tier, num_messages, num_tools, status_code):
     endpoint = path.split("?", 1)[0] if "?" in path else path
     status_color = Colors.GREEN if status_code == 200 else Colors.RED
@@ -1287,6 +1358,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
     has_sent_stop_reason = False
     debug_first_chunk_logged = False
     debug_chunk_count = 0
+    consecutive_chunk_errors = 0
 
     def new_tool_id() -> str:
         return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
@@ -1333,8 +1405,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             logger.debug(f"litellm stream chunk dump failed: {e}")
                 usage = get_field(chunk, "usage")
                 if usage is not None:
-                    input_tokens = get_field(usage, "prompt_tokens", input_tokens) or 0
-                    output_tokens = get_field(usage, "completion_tokens", output_tokens) or 0
+                    # Overwrite running totals only when upstream sends a value — some providers emit `0` mid-stream as a no-op, and the old `or 0` would clobber the real cumulative.
+                    incoming = get_field(usage, "prompt_tokens")
+                    if isinstance(incoming, (int, float)) and incoming:
+                        input_tokens = int(incoming)
+                    incoming = get_field(usage, "completion_tokens")
+                    if isinstance(incoming, (int, float)) and incoming:
+                        output_tokens = int(incoming)
 
                 choices = get_field(chunk, "choices")
                 if not choices:
@@ -1408,9 +1485,21 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     for event in SseFormatter.finish(to_anthropic_stop_reason(finish_reason), output_tokens):
                         yield event
                     return
+                # Successful chunk — reset streak so tolerance is per-streak.
+                consecutive_chunk_errors = 0
             except Exception as e:
-                logger.error(f"Error processing chunk: {e}")
-                continue
+                # Tolerated: warning only, no traceback.
+                logger.warning(f"Error processing chunk ({consecutive_chunk_errors + 1}/{MAX_CONSECUTIVE_CHUNK_ERRORS + 1}): {e}")
+                consecutive_chunk_errors += 1
+                if consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
+                    continue
+                # Threshold tripped — escalate with traceback and surface error.
+                logger.exception("Chunk error threshold exceeded; surfacing error")
+                for event in _emit_failure(
+                    think_parser, tracker, output_tokens, e, "chunk processing failed"
+                ):
+                    yield event
+                return
 
         if not has_sent_stop_reason:
             for event in _translate_parser_events(think_parser.flush(), tracker):
@@ -1426,10 +1515,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             )
 
     except Exception as e:
-        logger.error(f"Error in streaming: {e}", exc_info=True)
-        yield SseFormatter.message_delta("error", 0)
-        yield SseFormatter.message_stop()
-        yield SseFormatter.done()
+        logger.exception("Error in streaming")
+        for event in _emit_failure(
+            think_parser, tracker, output_tokens, e, "upstream streaming failed"
+        ):
+            yield event
     finally:
         # Close so the internal httpx client releases deterministically —
         # otherwise mid-stream cancellation leaks it until GC.
