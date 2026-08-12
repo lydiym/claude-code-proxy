@@ -34,3 +34,7 @@ python-version = "3.12"
 
 [tool.ty.src]
 include = ["server.py"]
+
+[tool.ty.rules]
+missing-type-argument = "error"
+possibly-unresolved-reference = "warn"

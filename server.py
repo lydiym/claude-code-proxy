@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Literal
+from typing import Any, Literal, override
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -89,18 +89,23 @@ if TIKTOKEN_OFFLINE:
             # Override parent's __init__ to skip the required mergeable_ranks / special_tokens.
             pass
 
+        @override
         def encode(self, text, *args, **kwargs):
             return [1] * max(1, len(text) // 4)
 
+        @override
         def encode_ordinary(self, text, *args, **kwargs):
             return self.encode(text, *args, **kwargs)
 
+        @override
         def encode_single_token(self, token, *args, **kwargs):
             return [1]
 
+        @override
         def decode(self, tokens, *args, **kwargs):
             return ""
 
+        @override
         def decode_single_token_bytes(self, token):
             return b""
 
@@ -1305,7 +1310,7 @@ def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
     yield tracker.delta({"type": "thinking_delta", "thinking": text})
 
 
-def _translate_parser_events(events: list[tuple], tracker: BlockTracker) -> Iterator[str]:
+def _translate_parser_events(events: list[tuple[str, str]], tracker: BlockTracker) -> Iterator[str]:
     for kind, value in events:
         if kind == "open":
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
