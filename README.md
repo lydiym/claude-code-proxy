@@ -170,6 +170,9 @@ uv run ruff check --fix
 # Format.
 uv run ruff format
 
+# Type-check (ty config in pyproject.toml; checks server.py only).
+uv run ty check
+
 # Run the test suite (unit tests, no network needed).
 uv run python tests.py
 ```
