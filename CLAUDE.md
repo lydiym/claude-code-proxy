@@ -15,7 +15,7 @@ A FastAPI proxy that accepts Anthropic Messages API requests, translates them to
 - **All tests**: `python tests.py --all`
 - **Filter integration scenarios**: `--simple` (skip tool tests) or `--tools` (only tool tests)
 - **Add a unit test**: write a `test_*` function in `tests.py` — `discover_unit_tests()` collects them automatically, no decorators needed
-- **Dev tooling** (ruff, pre-commit): see `README.md` → Development
+- **Dev tooling** (ruff, ty, vulture, pre-commit): see `README.md` → Development
 
 ## Architecture
 

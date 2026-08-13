@@ -161,7 +161,7 @@ Tool calls round-trip natively: `assistant.tool_calls` and `role="tool"` message
 ## Development 🛠️
 
 ```bash
-# Install dev deps (ruff, etc.) — uv manages them via PEP 735 [dependency-groups].
+# Install dev deps (ruff, ty, vulture) — uv manages them via PEP 735 [dependency-groups].
 uv sync
 
 # Lint (autofix what's safe, suggest fixes for the rest).
@@ -173,18 +173,21 @@ uv run ruff format
 # Type-check (ty config in pyproject.toml; checks server.py only).
 uv run ty check
 
+# Find dead code (vulture config in pyproject.toml; false positives in vulture_whitelist.py).
+uv run vulture
+
 # Run the test suite (unit tests, no network needed).
 uv run python tests.py
 ```
 
-The pre-commit hook runs both ruff checks on every commit:
+The pre-commit hook runs ruff (check + format), ty, and vulture on every commit:
 
 ```bash
 uv tool install pre-commit
 pre-commit install
 ```
 
-`tests.py` is excluded from ruff — it's a top-level test runner, not production code.
+`tests.py` is excluded from ruff — it's a top-level test runner, not production code. `vulture_whitelist.py` is excluded from ruff for the same reason: it's a tool config file, not production code.
 
 ## Contributing 🤝
 

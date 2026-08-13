@@ -11,3 +11,7 @@ repos:
     rev: v0.0.70
     hooks:
       - id: ty
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.16
+    hooks:
+      - id: vulture

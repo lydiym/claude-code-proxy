@@ -16,12 +16,13 @@ dependencies = [
 dev = [
     "ruff>=0.16.2",
     "ty>=0.0.70",
+    "vulture>=2.16",
 ]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 120
-exclude = ["tests.py"]
+exclude = ["tests.py", "vulture_whitelist.py"]
 
 [tool.ruff.lint]
 preview = true
@@ -41,6 +42,7 @@ select = [
     "RUF", # ruff-specific
     "EM",  # exception messages
     "TRY", # tryceratops
+    "BLE", # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
 ]
 # False positives / intentional suppressions.
 ignore = [
@@ -60,3 +62,14 @@ include = ["server.py"]
 [tool.ty.rules]
 missing-type-argument = "error"
 possibly-unresolved-reference = "warn"
+
+[tool.vulture]
+paths = ["server.py", "vulture_whitelist.py"]
+min_confidence = 60
+# Decorators whose functions/classes vulture can't trace as used.
+ignore_decorators = [
+    "@app.*",          # FastAPI route handlers (`create_message`)
+    "@field_validator", # Pydantic v2 field validators
+    "@model_validator", # Pydantic v2 model validators
+    "@override",       # PEP 698 — base-class signature mirrors
+]

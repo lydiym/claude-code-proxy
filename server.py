@@ -61,6 +61,15 @@ def _litellm_debug_http_enabled() -> bool:
     return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
 
 
+def _debug_json_dump(label: str, obj: Any) -> None:
+    """Best-effort debug-level JSON dump. Logs the failure cause instead of
+    raising — debug logging must never crash the request."""
+    try:
+        logger.debug("%s: %s", label, json.dumps(obj, default=str, ensure_ascii=False))
+    except Exception as e:  # ruff: ignore[blind-except] — debug-only; never crash the request
+        logger.debug("%s dump failed: %s", label, e)
+
+
 def _resolve_tiktoken_offline() -> bool:
     """[proxy].tiktoken_offline from CONFIG_PATH, TIKTOKEN_OFFLINE env, then True."""
     path = os.environ.get("CONFIG_PATH", "./config.toml")
@@ -111,10 +120,10 @@ if TIKTOKEN_OFFLINE:
         def decode_single_token_bytes(self, token) -> bytes:
             return b""
 
-    def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
+    def _get_encoding(_encoding_name: str) -> tiktoken.Encoding:
         return _OfflineEncoding()
 
-    def _encoding_for_model(model_name: str) -> tiktoken.Encoding:
+    def _encoding_for_model(_model_name: str) -> tiktoken.Encoding:
         return _OfflineEncoding()
 
     # ty invalid-assignment: monkey-patching module functions, intentional.
@@ -817,11 +826,6 @@ def _extract_text(content) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def system_to_message(system):
-    text = _extract_text(system) if system else ""
-    return {"role": "system", "content": text} if text else None
-
-
 def _build_system_message(system_field, messages) -> dict[str, str] | None:
     """Combine the top-level system field with any in-band role='system' messages
     into a single OpenAI system message.
@@ -1201,10 +1205,6 @@ class BlockTracker:
         self._next_index = 0
         self._current: OpenBlock | None = None
 
-    @property
-    def current(self) -> OpenBlock | None:
-        return self._current
-
     def is_open(self, kind: str | None = None) -> bool:
         if kind is None:
             return self._current is not None
@@ -1446,13 +1446,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     # for the rest, litellm.set_verbose + httpx DEBUG cover it.
                     if not debug_first_chunk_logged:
                         debug_first_chunk_logged = True
-                        try:
-                            logger.debug(
-                                "litellm stream chunk #1 (first): %s",
-                                json.dumps(chunk, default=str, ensure_ascii=False),
-                            )
-                        except Exception as e:
-                            logger.debug("litellm stream chunk dump failed: %s", e)
+                        _debug_json_dump("litellm stream chunk #1 (first)", chunk)
                 usage = get_field(chunk, "usage")
                 if usage is not None:
                     # Overwrite only when upstream sends non-zero — some providers emit `0` mid-stream as a no-op.
@@ -1608,13 +1602,7 @@ async def create_message(request: MessagesRequest):
                 # Verbose: dump the entire kwargs dict going into litellm
                 # (messages, tools, tool_choice, …) so we can confirm the
                 # exact payload upstream sees, not just the sampling subset.
-                try:
-                    logger.debug(
-                        "litellm.completion kwargs (full): %s",
-                        json.dumps(litellm_request, default=str, ensure_ascii=False),
-                    )
-                except Exception as e:
-                    logger.debug("litellm.completion kwargs dump failed: %s", e)
+                _debug_json_dump("litellm.completion kwargs (full)", litellm_request)
 
         log_request(
             "POST",
@@ -1642,19 +1630,13 @@ async def create_message(request: MessagesRequest):
             time.time() - start_time,
         )
         if _litellm_debug_http_enabled():
-            try:
-                if hasattr(litellm_response, "model_dump"):
-                    payload = litellm_response.model_dump()
-                elif hasattr(litellm_response, "dict"):
-                    payload = litellm_response.dict()
-                else:
-                    payload = repr(litellm_response)
-                logger.debug(
-                    "litellm.completion response (full): %s",
-                    json.dumps(payload, default=str, ensure_ascii=False),
-                )
-            except Exception as e:
-                logger.debug("litellm.completion response dump failed: %s", e)
+            if hasattr(litellm_response, "model_dump"):
+                payload = litellm_response.model_dump()
+            elif hasattr(litellm_response, "dict"):
+                payload = litellm_response.dict()
+            else:
+                payload = repr(litellm_response)
+            _debug_json_dump("litellm.completion response (full)", payload)
         return convert_litellm_to_anthropic(litellm_response, request)
 
     except Exception as e:
