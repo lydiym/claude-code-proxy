@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-Tests for the Anthropic -> OpenAI proxy.
+"""Tests for the Anthropic -> OpenAI proxy.
 
 Includes integration smoke tests (require a running server on PROXY_URL)
 and unit tests for request/response translation (no network needed).
@@ -18,10 +17,12 @@ import asyncio
 import contextlib
 import json
 import os
+import pathlib
 import sys
 import tempfile
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
@@ -48,7 +49,7 @@ CALCULATOR_TOOL = {
     },
 }
 
-TEST_SCENARIOS: Dict[str, Dict[str, Any]] = {
+TEST_SCENARIOS: dict[str, dict[str, Any]] = {
     "simple": {
         "model": DEFAULT_MODEL,
         "max_tokens": 200,
@@ -103,7 +104,7 @@ REQUIRED_EVENT_TYPES = {
 import server as srv
 
 
-def _make_request(payload: Dict[str, Any]) -> srv.MessagesRequest:
+def _make_request(payload: dict[str, Any]) -> srv.MessagesRequest:
     return srv.MessagesRequest(**payload)
 
 
@@ -117,24 +118,24 @@ def _base_request(**overrides) -> srv.MessagesRequest:
     return _make_request(payload)
 
 
-async def _aiter(items: List[Any]) -> AsyncIterator[Any]:
+async def _aiter(items: list[Any]) -> AsyncIterator[Any]:
     for item in items:
         yield item
 
 
-def _parse_sse(raw_chunks: List[str]) -> List[Dict[str, Any]]:
+def _parse_sse(raw_chunks: list[str]) -> list[dict[str, Any]]:
     """Parse SSE blocks from a list of yielded strings into a list of events.
 
     Skips ``[DONE]`` sentinels; returns them as a dict with type="[DONE]"
     so tests can assert on their presence.
     """
-    events: List[Dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
     for raw in raw_chunks:
         for block in raw.split("\n\n"):
             if not block.strip():
                 continue
-            event_type: Optional[str] = None
-            data_lines: List[str] = []
+            event_type: str | None = None
+            data_lines: list[str] = []
             for line in block.splitlines():
                 if line.startswith("event: "):
                     event_type = line[len("event: "):]
@@ -148,7 +149,7 @@ def _parse_sse(raw_chunks: List[str]) -> List[Dict[str, Any]]:
                 continue
             try:
                 parsed = json.loads(payload)
-            except json.JSONError:
+            except json.JSONDecodeError:
                 continue
             if event_type and "type" not in parsed:
                 parsed = {"type": event_type, **parsed}
@@ -156,15 +157,15 @@ def _parse_sse(raw_chunks: List[str]) -> List[Dict[str, Any]]:
     return events
 
 
-async def _run_stream(chunks: List[Any], req: srv.MessagesRequest) -> List[Dict[str, Any]]:
+async def _run_stream(chunks: list[Any], req: srv.MessagesRequest) -> list[dict[str, Any]]:
     """Drive handle_streaming over a fake upstream and return parsed events."""
-    raw: List[str] = []
+    raw: list[str] = []
     async for piece in srv.handle_streaming(_aiter(chunks), req):
         raw.append(piece)
     return _parse_sse(raw)
 
 
-def _text_chunk(text: str, **extra) -> Dict[str, Any]:
+def _text_chunk(text: str, **extra) -> dict[str, Any]:
     chunk = {
         "choices": [{
             "delta": {"content": text},
@@ -179,17 +180,17 @@ def _text_chunk(text: str, **extra) -> Dict[str, Any]:
 def _tool_delta_chunk(
     index: int,
     *,
-    id: Optional[str] = None,
-    name: Optional[str] = None,
-    arguments: Optional[str] = None,
-    finish_reason: Optional[str] = None,
-) -> Dict[str, Any]:
-    function: Dict[str, Any] = {}
+    id: str | None = None,
+    name: str | None = None,
+    arguments: str | None = None,
+    finish_reason: str | None = None,
+) -> dict[str, Any]:
+    function: dict[str, Any] = {}
     if name is not None:
         function["name"] = name
     if arguments is not None:
         function["arguments"] = arguments
-    tool_call: Dict[str, Any] = {"index": index, "type": "function"}
+    tool_call: dict[str, Any] = {"index": index, "type": "function"}
     if id is not None:
         tool_call["id"] = id
     if function:
@@ -202,7 +203,7 @@ def _tool_delta_chunk(
     }
 
 
-def _finish_chunk(reason: str, *, output_tokens: int = 5) -> Dict[str, Any]:
+def _finish_chunk(reason: str, *, output_tokens: int = 5) -> dict[str, Any]:
     return {
         "choices": [{"delta": {}, "finish_reason": reason}],
         "usage": {"prompt_tokens": 10, "completion_tokens": output_tokens},
@@ -393,7 +394,7 @@ def test_validate_model_field_strips_gemini_prefix() -> None:
 
 def test_tls_verify_wiring_matches_module_setting() -> None:
     """OPENAI_TLS_VERIFY is read at import time and propagated to litellm."""
-    assert srv.OPENAI_TLS_VERIFY == srv.litellm.ssl_verify
+    assert srv.litellm.ssl_verify == srv.OPENAI_TLS_VERIFY
 
 
 # --- Message sanitization ---
@@ -420,7 +421,7 @@ def test_sanitize_messages_for_openai_keeps_allowed_keys() -> None:
             "tool_call_id": "abc",
             "content": "42",
             "foreign_field": "x",
-        }
+        },
     ]
     srv.sanitize_messages_for_openai(messages)
     assert "foreign_field" not in messages[0]
@@ -453,7 +454,8 @@ def test_convert_anthropic_to_litellm_minimal_request() -> None:
 
 def test_no_max_tokens_clamp() -> None:
     """Client max_tokens flows through unmodified — the proxy no longer caps at MAX_OUTPUT_TOKENS.
-    Users explicitly want 24000 when they ask for 24000."""
+    Users explicitly want 24000 when they ask for 24000.
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -537,7 +539,8 @@ def test_convert_anthropic_to_litellm_passes_optional_sampling() -> None:
 def test_explicit_null_sampling_is_dropped() -> None:
     """Explicit null in a sampling field (Pydantic v2 sets model_fields_set)
     must be treated as 'unset' → upstream uses its own default. Wire form
-    must not include the field."""
+    must not include the field.
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -632,7 +635,8 @@ def test_convert_image_block_unknown_source_falls_back_gracefully() -> None:
 
 def test_dangling_tool_use_folded_into_text() -> None:
     """A tool_use with no matching tool_result (truncated history) must be turned into prose,
-    not emitted as a tool_call — otherwise the model would have to answer for an unanswerable call."""
+    not emitted as a tool_call — otherwise the model would have to answer for an unanswerable call.
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -654,7 +658,8 @@ def test_dangling_tool_use_folded_into_text() -> None:
 
 def test_orphaned_tool_result_folded_into_user_text() -> None:
     """A tool_result with no matching tool_use must be folded into user text rather
-    than emitted as a role='tool' message (which would dangle)."""
+    than emitted as a role='tool' message (which would dangle).
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -676,7 +681,8 @@ def test_orphaned_tool_result_folded_into_user_text() -> None:
 def test_tool_use_and_tool_result_ordering() -> None:
     """When a user turn contains tool_results followed by user text, the tool message(s)
     must come BEFORE the user text — OpenAI requires tool messages to immediately follow
-    the assistant tool_call turn."""
+    the assistant tool_call turn.
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -951,7 +957,10 @@ def test_system_role_message_in_messages_array_is_hoisted() -> None:
         roles = [m["role"] for m in out["messages"]]
         assert roles == ["system", "user", "assistant", "user"], f"got {roles}"
         sys_content = out["messages"][0]["content"]
-        assert sys_content.index("[skill: foo]") < sys_content.index("[skill: baz]") < sys_content.index("You are concise.")
+        foo = sys_content.index("[skill: foo]")
+        baz = sys_content.index("[skill: baz]")
+        sys = sys_content.index("You are concise.")
+        assert foo < baz < sys
 
 
 def test_system_role_message_with_string_content_is_hoisted() -> None:
@@ -988,7 +997,7 @@ def test_build_content_blocks_reasoning_becomes_thinking_block() -> None:
 
 
 def test_build_content_blocks_reasoning_plus_tool_call() -> None:
-    """reasoning -> text -> tool_use in that order."""
+    """Reasoning -> text -> tool_use in that order."""
     blocks = srv._build_content_blocks(
         "answer",
         "thought",
@@ -1000,7 +1009,8 @@ def test_build_content_blocks_reasoning_plus_tool_call() -> None:
 
 def test_convert_litellm_to_anthropic_uses_reasoning_content() -> None:
     """When litellm has separated reasoning into reasoning_content, we emit a
-    thinking block before the text block — matching the Anthropic spec."""
+    thinking block before the text block — matching the Anthropic spec.
+    """
     req = _base_request()
     response = {
         "choices": [{
@@ -1023,7 +1033,8 @@ def test_request_accepts_thinking_block_in_history() -> None:
     """Claude Code echoes the assistant's previous thinking block back as part
     of the next turn. The proxy must accept it (signature optional) so the
     request validates, even though the block is dropped before the upstream
-    OpenAI call (OpenAI has no equivalent concept)."""
+    OpenAI call (OpenAI has no equivalent concept).
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -1144,7 +1155,8 @@ def test_think_stream_parser_empty_think_block() -> None:
 
 def test_think_stream_parser_unclosed_at_flush() -> None:
     """If the stream ends inside ``<think>`` with content still buffered, flush
-    must release everything as a thinking delta and emit close."""
+    must release everything as a thinking delta and emit close.
+    """
     p = srv.ThinkStreamParser()
     p.feed("<think>hello ")
     assert p.feed("<") == []
@@ -1186,7 +1198,8 @@ async def test_streaming_text_only_accumulates_text() -> None:
 
 async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
     """When the model emits text and then a tool call, the text block must be closed
-    before the tool_use block starts — Anthropic's SSE protocol requires this ordering."""
+    before the tool_use block starts — Anthropic's SSE protocol requires this ordering.
+    """
     req = _base_request(stream=True, tools=[{
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
@@ -1203,7 +1216,7 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
     text_close_idx = find(lambda e: e["type"] == "content_block_stop" and e.get("index") == 0)
     tool_start_idx = find(
         lambda e: e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "tool_use"
+        and (e.get("content_block") or {}).get("type") == "tool_use",
     )
     assert text_close_idx < tool_start_idx, (
         f"text block (idx {text_close_idx}) must close before tool block opens (idx {tool_start_idx})"
@@ -1266,7 +1279,8 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
 
 async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     """A chunk that crashes the inner pipeline must yield `event: error` so the
-    SDK raises APIStatusError instead of silently terminating the stream."""
+    SDK raises APIStatusError instead of silently terminating the stream.
+    """
     req = _base_request(stream=True)
 
     async def _bad_upstream():
@@ -1279,11 +1293,11 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     original = srv._translate_parser_events
 
     def _boom(*args, **kwargs):
-        raise RuntimeError("simulated chunk processing failure")
+        raise RuntimeError("simulated chunk processing failure")  # ruff: ignore[raw-string-in-exception,raise-vanilla-args] — test fixture; message is the test signal
 
-    srv._translate_parser_events = _boom
+    srv._translate_parser_events = _boom  # ty: ignore[invalid-assignment] — monkey-patch for error-path test
     try:
-        raw: List[str] = []
+        raw: list[str] = []
         async for piece in srv.handle_streaming(_bad_upstream(), req):
             raw.append(piece)
     finally:
@@ -1310,7 +1324,8 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
 
 async def test_streaming_tolerates_isolated_bad_chunks() -> None:
     """A single bad chunk in a stream of good ones must NOT surface as an
-    error frame — the counter resets on the next successful chunk."""
+    error frame — the counter resets on the next successful chunk.
+    """
     req = _base_request(stream=True)
 
     async def _mixed_upstream():
@@ -1327,12 +1342,12 @@ async def test_streaming_tolerates_isolated_bad_chunks() -> None:
     def _boom_once(*args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 2:
-            raise RuntimeError("single transient chunk failure")
+            raise RuntimeError("single transient chunk failure")  # ruff: ignore[raw-string-in-exception,raise-vanilla-args] — test fixture
         return original(*args, **kwargs)
 
-    srv._translate_parser_events = _boom_once
+    srv._translate_parser_events = _boom_once  # ty: ignore[invalid-assignment] — monkey-patch for transient-failure test
     try:
-        raw: List[str] = []
+        raw: list[str] = []
         async for piece in srv.handle_streaming(_mixed_upstream(), req):
             raw.append(piece)
     finally:
@@ -1351,13 +1366,16 @@ async def test_streaming_tolerates_isolated_bad_chunks() -> None:
         and e.get("delta", {}).get("type") == "text_delta"
     ]
     text_blob = "".join(d["delta"]["text"] for d in text_deltas)
-    assert "good1" in text_blob and "good2" in text_blob and "good3" in text_blob
+    assert "good1" in text_blob
+    assert "good2" in text_blob
+    assert "good3" in text_blob
 
 
 async def test_streaming_counter_resets_on_successful_chunks() -> None:
     """Tolerance is per-streak, not lifetime — a successful chunk must reset
     the error counter. Without reset, sparse bad chunks across a long stream
-    would accumulate and trip the threshold even though no two are adjacent."""
+    would accumulate and trip the threshold even though no two are adjacent.
+    """
     req = _base_request(stream=True)
 
     async def _interleaved():
@@ -1373,9 +1391,9 @@ async def test_streaming_counter_resets_on_successful_chunks() -> None:
         yield {"choices": [{"delta": {"content": "good2"}, "finish_reason": "stop"}]}
 
     original = srv._translate_parser_events
-    srv._translate_parser_events = lambda *a, **kw: iter(())
+    srv._translate_parser_events = lambda *a, **kw: iter(())  # ty: ignore[invalid-assignment] — monkey-patch for empty-stream test
     try:
-        raw: List[str] = []
+        raw: list[str] = []
         async for piece in srv.handle_streaming(_interleaved(), req):
             raw.append(piece)
     finally:
@@ -1393,14 +1411,15 @@ async def test_streaming_counter_resets_on_successful_chunks() -> None:
 async def test_streaming_emits_error_frame_on_upstream_failure() -> None:
     """A failure from the upstream async iterator itself (e.g. litellm
     connection error) is caught by the outer except — must still emit the
-    canonical failure shape in the same order as the inner path."""
+    canonical failure shape in the same order as the inner path.
+    """
     req = _base_request(stream=True)
 
     async def _exploding_upstream():
         yield {"choices": [{"delta": {"content": "partial"}}]}
-        raise RuntimeError("simulated upstream connection failure")
+        raise RuntimeError("simulated upstream connection failure")  # ruff: ignore[raw-string-in-exception,raise-vanilla-args] — test fixture
 
-    raw: List[str] = []
+    raw: list[str] = []
     async for piece in srv.handle_streaming(_exploding_upstream(), req):
         raw.append(piece)
     events = _parse_sse(raw)
@@ -1421,13 +1440,14 @@ async def test_streaming_emits_error_frame_on_upstream_failure() -> None:
 def test_emit_failure_flushes_buffered_think_content() -> None:
     """ThinkStreamParser holds content until </think> in thinking mode;
     _emit_failure must surface buffered thinking as a delta before the
-    error frame."""
+    error frame.
+    """
     parser = srv.ThinkStreamParser()
     parser.feed("<think>partial reasoning...")  # buffered, no closing tag
     tracker = srv.BlockTracker()
     exc = RuntimeError("test")
 
-    raw: List[str] = []
+    raw: list[str] = []
     for piece in srv._emit_failure(parser, tracker, 0, exc, "test failed"):
         raw.append(piece)
     events = _parse_sse(raw)
@@ -1450,7 +1470,8 @@ def test_emit_failure_flushes_buffered_think_content() -> None:
 
 def test_sse_formatter_error_emits_canonical_shape() -> None:
     """`event: error` payload must be {type, error: {type, message}} —
-    SDK looks up error.type to dispatch exception subclasses."""
+    SDK looks up error.type to dispatch exception subclasses.
+    """
     frame = srv.SseFormatter.error("overloaded_error", "try again later")
     assert frame.startswith("event: error\n")
     body = json.loads(frame.split("data: ", 1)[1].split("\n\n")[0])
@@ -1462,7 +1483,8 @@ def test_sse_formatter_error_emits_canonical_shape() -> None:
 
 async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     """Parallel tool calls must each get their own SSE block index, with
-    content_block_stop(N) emitted before content_block_start(N+1)."""
+    content_block_stop(N) emitted before content_block_start(N+1).
+    """
     req = _base_request(stream=True, tools=[{
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
@@ -1505,7 +1527,7 @@ async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
     }])
     chunks = [
         _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"x":'),
-        _tool_delta_chunk(0, arguments='1}'),
+        _tool_delta_chunk(0, arguments="1}"),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
@@ -1542,7 +1564,8 @@ async def test_streaming_message_id_format() -> None:
 async def test_streaming_emits_thinking_block_for_think_tags() -> None:
     """When the upstream stream contains ``<think>...</think>`` markers inside
     its content deltas, the proxy must surface them as a separate thinking
-    content block (not as plain text)."""
+    content block (not as plain text).
+    """
     req = _base_request(stream=True)
     chunks = [
         _text_chunk("<think>step 1; step 2;</think>final answer"),
@@ -1573,7 +1596,8 @@ async def test_streaming_emits_thinking_block_for_think_tags() -> None:
 
 async def test_streaming_emits_thinking_for_native_reasoning_content() -> None:
     """When the upstream delta has a structured reasoning_content field (some
-    providers expose it), route it to a thinking block too."""
+    providers expose it), route it to a thinking block too.
+    """
     req = _base_request(stream=True)
     chunk = {
         "choices": [{
@@ -1603,7 +1627,8 @@ def _patched_config(toml_text: str):
     The temp file is unlinked unconditionally — even if write or _load_config
     raise — so a CI failure storm doesn't leak .toml files into /tmp.
     Also clears _default_model_for_tier's lru_cache so tests that patch CONFIG
-    observe the override instead of the cached production value."""
+    observe the override instead of the cached production value.
+    """
     fd, path = tempfile.mkstemp(suffix=".toml")
     original = None
     try:
@@ -1618,14 +1643,15 @@ def _patched_config(toml_text: str):
         if original is not None:
             srv.CONFIG, srv.CONFIG_PATH = original
             srv._default_model_for_tier.cache_clear()
-        os.unlink(path)
+        pathlib.Path(path).unlink()
 
 
 @contextlib.contextmanager
 def _patched_empty_config():
     """Force an empty CONFIG (no proxy/global/big/small/tiers) without touching disk.
     Also clears the _default_model_for_tier lru_cache so any cached value from
-    before the patch is dropped — a caller can then observe the new (empty) state."""
+    before the patch is dropped — a caller can then observe the new (empty) state.
+    """
     original = srv.CONFIG
     srv.CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
     srv._default_model_for_tier.cache_clear()
@@ -1676,36 +1702,37 @@ def test_load_config_malformed_toml_returns_empty() -> None:
     try:
         cfg = srv._load_config(path)
     finally:
-        os.unlink(path)
+        pathlib.Path(path).unlink()
     assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
 
 
 def test_load_config_unknown_section_warns_and_skips() -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-        f.write('[bogus]\nextra_body = { temperature = 0.5 }\n[sonnet]\nextra_body = { temperature = 0.9 }\n')
+        f.write("[bogus]\nextra_body = { temperature = 0.5 }\n[sonnet]\nextra_body = { temperature = 0.9 }\n")
         path = f.name
     try:
         cfg = srv._load_config(path)
         assert "bogus" not in cfg["tiers"]
         assert cfg["tiers"]["sonnet"]["extra_body"]["temperature"] == 0.9
     finally:
-        os.unlink(path)
+        pathlib.Path(path).unlink()
 
 
 def test_load_config_bad_extra_body_warns_and_skips() -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-        f.write('[sonnet]\nextra_body = true\n')
+        f.write("[sonnet]\nextra_body = true\n")
         path = f.name
     try:
         cfg = srv._load_config(path)
         assert "extra_body" not in cfg["tiers"]["sonnet"]
     finally:
-        os.unlink(path)
+        pathlib.Path(path).unlink()
 
 
 def test_load_config_drops_top_level_sampling_keys() -> None:
     """Sampling keys at [tier] top level are no longer recognised — only extra_body is.
-    Users must put them inside extra_body."""
+    Users must put them inside extra_body.
+    """
     with _patched_config("""
         [sonnet]
         temperature = 0.5
@@ -1738,12 +1765,13 @@ def test_load_config_partial_failure_isolates_sections() -> None:
         assert "extra_body" not in cfg["tiers"]["sonnet"]
         assert cfg["tiers"]["opus"]["extra_body"]["temperature"] == 0.3
     finally:
-        os.unlink(path)
+        pathlib.Path(path).unlink()
 
 
 def test_load_config_rejects_non_string_proxy_keys() -> None:
     """api_key / base_url are strings — ints/arrays would corrupt the auth header
-    or api_base at runtime. Loader must reject, not silently store."""
+    or api_base at runtime. Loader must reject, not silently store.
+    """
     with _patched_config("""
         [proxy]
         openai_api_key = 12345
@@ -1780,7 +1808,8 @@ def test_proxy_value_none_in_config_falls_through_to_env() -> None:
 
 def test_convert_request_explicit_none_top_p_is_dropped() -> None:
     """Explicit top_p=null in request is in fields_set but must NOT be forwarded
-    to upstream — OpenAI-compatible backends reject null with 400."""
+    to upstream — OpenAI-compatible backends reject null with 400.
+    """
     with _patched_empty_config():
         req = _make_request({
             "model": "claude-3-5-sonnet-20241022",
@@ -1799,7 +1828,8 @@ def test_convert_request_explicit_none_top_p_is_dropped() -> None:
 def test_convert_config_empty_stop_in_extra_body_passes_through() -> None:
     """Config-side stop = [] via extra_body is forwarded as-is; the proxy no
     longer pre-validates per-key values. Upstream is the source of truth on
-    what's accepted."""
+    what's accepted.
+    """
     with _patched_config("""
         [sonnet]
         extra_body = { stop = [] }
@@ -1894,13 +1924,14 @@ def test_deep_merge_does_not_mutate_inputs() -> None:
 
 
 def test_proxy_bool_passes_through_toml_bool() -> None:
-    with _patched_config('[proxy]\nopenai_tls_verify = false'):
+    with _patched_config("[proxy]\nopenai_tls_verify = false"):
         assert srv._proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True) is False
 
 
 def test_proxy_bool_garbage_string_falls_back_to_caller_default() -> None:
     """A typo like OPENAI_TLS_VERIFY=garbage must use the caller's default,
-    not silently flip to False (which would disable TLS verification)."""
+    not silently flip to False (which would disable TLS verification).
+    """
     with _patched_config(""):
         original = os.environ.pop("OPENAI_TLS_VERIFY", None)
         os.environ["OPENAI_TLS_VERIFY"] = "garbage"
@@ -2018,9 +2049,10 @@ def test_resolve_tier_config_empty_when_nothing_loaded() -> None:
 
 def test_resolve_tier_config_handles_none_global() -> None:
     """If CONFIG['global'] is patched to None, must not crash on the deepcopy /
-    downstream .get access (regression — None guard added at the resolver)."""
+    downstream .get access (regression — None guard added at the resolver).
+    """
     with _patched_empty_config():
-        srv.CONFIG["global"] = None
+        srv.CONFIG["global"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
         req = _make_request({"model": "claude-3-5-haiku-20241022",
                               "max_tokens": 100,
                               "messages": [{"role": "user", "content": "hi"}]})
@@ -2030,7 +2062,8 @@ def test_resolve_tier_config_handles_none_global() -> None:
 
 def test_resolve_tier_config_handles_none_tier_value() -> None:
     """If CONFIG['tiers'][tier] is patched to None, must not crash on
-    ``_deep_merge(base, None)`` (regression — inner None guard added)."""
+    ``_deep_merge(base, None)`` (regression — inner None guard added).
+    """
     with _patched_empty_config():
         srv.CONFIG["tiers"] = {"haiku": None}
         req = _make_request({"model": "claude-3-5-haiku-20241022",
@@ -2042,7 +2075,8 @@ def test_resolve_tier_config_handles_none_tier_value() -> None:
 
 def test_convert_extra_body_non_dict_is_skipped() -> None:
     """If extra_body is a non-dict (runtime patch or future bug), must not
-    crash in _deep_merge (regression — isinstance guard added)."""
+    crash in _deep_merge (regression — isinstance guard added).
+    """
     with _patched_empty_config():
         srv.CONFIG["tiers"] = {"haiku": {"extra_body": "not-a-dict"}}
         req = _make_request({"model": "claude-3-5-haiku-20241022",
@@ -2054,7 +2088,8 @@ def test_convert_extra_body_non_dict_is_skipped() -> None:
 
 def test_validate_model_field_preserves_bare_name_case() -> None:
     """Custom (non-OpenAI) model names must keep their original case in the
-    rewritten upstream model."""
+    rewritten upstream model.
+    """
     req = _make_request({
         "model": "MyModel-V1",
         "max_tokens": 100,
@@ -2076,7 +2111,8 @@ def test_validate_model_field_openai_prefix_is_case_insensitive() -> None:
 def test_validate_model_field_anthropic_prefix_preserves_case() -> None:
     """anthropic/Claude-3-5-Sonnet should match the sonnet tier but the
     rewritten upstream model must use the resolved sonnet default (lowercased
-    because it's a known OpenAI model)."""
+    because it's a known OpenAI model).
+    """
     req = _make_request({
         "model": "anthropic/Claude-3-5-Sonnet",
         "max_tokens": 100,
@@ -2088,7 +2124,8 @@ def test_validate_model_field_anthropic_prefix_preserves_case() -> None:
 
 def test_proxy_value_raises_on_unknown_key() -> None:
     """A typo'd key (not in _PROXY_KEYS) must raise immediately instead of
-    silently falling through to env."""
+    silently falling through to env.
+    """
     with _patched_empty_config():
         raised = False
         try:
@@ -2100,7 +2137,8 @@ def test_proxy_value_raises_on_unknown_key() -> None:
 
 def test_extra_body_is_deep_copied_from_raw_toml() -> None:
     """Mutating CONFIG['tiers'][tier]['extra_body'] must not corrupt the
-    underlying tomllib dict (loader now deep-copies)."""
+    underlying tomllib dict (loader now deep-copies).
+    """
     with _patched_config("""
         [sonnet]
         extra_body = { cache_prompt = true, n_predict = 4096 }
@@ -2142,7 +2180,8 @@ def test_convert_request_sampling_preserved_when_config_omits_key() -> None:
 
 def test_convert_sampling_field_omitted_when_neither_set() -> None:
     """No defaults applied: when neither request nor config sets temperature,
-    the upstream call doesn't include it (was previously always set to 1.0)."""
+    the upstream call doesn't include it (was previously always set to 1.0).
+    """
     with _patched_empty_config():
         req = _make_request({"model": "claude-3-5-sonnet-20241022",
                               "max_tokens": 100,
@@ -2262,6 +2301,7 @@ def test_convert_with_full_llama_server_config() -> None:
         extra_body = { cache_prompt = true }
 
         [haiku]
+        # ruff: ignore[line-too-long] — TOML inline tables must be single-line
         extra_body = { temperature = 0.3, cache_prompt = true, n_predict = 4096, chat_template_kwargs = { enable_thinking = false } }
 
         [sonnet]
@@ -2429,7 +2469,8 @@ def test_load_config_parses_big_and_small_sections() -> None:
 
 def test_load_config_drops_unknown_keys_in_big_and_small() -> None:
     """Top-level sampling keys inside [big] / [small] are rejected — only
-    `model` and `extra_body` belong there."""
+    `model` and `extra_body` belong there.
+    """
     with _patched_config("""
         [big]
         temperature = 0.5
@@ -2487,7 +2528,8 @@ def test_global_section_accepts_model() -> None:
 
 def _scrub_model_envs():
     """Pop all model-related env vars so a test starts from a clean slate.
-    Returns a dict suitable for restoring in `finally`."""
+    Returns a dict suitable for restoring in `finally`.
+    """
     return {k: os.environ.pop(k, None) for k in (
         "BIG_MODEL", "SMALL_MODEL",
         "HAIKU_MODEL", "SONNET_MODEL", "OPUS_MODEL", "FABLE_MODEL", "MYTHOS_MODEL",
@@ -2640,7 +2682,7 @@ def test_default_model_for_tier_handles_none_bucket() -> None:
     try:
         with _patched_empty_config():
             srv._default_model_for_tier.cache_clear()
-            srv.CONFIG["big"] = None
+            srv.CONFIG["big"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
             assert srv._default_model_for_tier("sonnet") == "gpt-4.1"
     finally:
         for k, v in saved.items():
@@ -2778,7 +2820,7 @@ def test_resolve_tier_config_merges_global_bucket_tier_for_sonnet() -> None:
 
 
 def test_resolve_tier_config_merges_global_bucket_tier_for_haiku() -> None:
-    """haiku bucket is 'small' — verify [small] is the middle layer."""
+    """Haiku bucket is 'small' — verify [small] is the middle layer."""
     with _patched_config("""
         [global]
         extra_body = { from_global = 1 }
@@ -2855,7 +2897,7 @@ def test_resolve_tier_config_empty_and_unknown_tier() -> None:
 def test_resolve_tier_config_handles_none_global_cfg() -> None:
     """CONFIG['global'] patched to None — must not crash on `.is not None` guard."""
     with _patched_empty_config():
-        srv.CONFIG["global"] = None
+        srv.CONFIG["global"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
         srv.CONFIG["big"] = {"extra_body": {"from_big": 1}}
         req = _make_request({"model": "claude-3-5-sonnet-20241022",
                               "max_tokens": 100,
@@ -2883,7 +2925,7 @@ def test_resolve_tier_config_handles_none_tier_cfg() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _check_non_streaming(payload: Dict[str, Any], *, expect_tools: bool) -> None:
+def _check_non_streaming(payload: dict[str, Any], *, expect_tools: bool) -> None:
     assert payload.get("role") == "assistant", f"role={payload.get('role')!r}"
     assert payload.get("type") == "message", f"type={payload.get('type')!r}"
     assert payload.get("stop_reason") in {"end_turn", "max_tokens", "tool_use", "stop_sequence", None}
@@ -2899,7 +2941,7 @@ def _check_non_streaming(payload: Dict[str, Any], *, expect_tools: bool) -> None
         assert has_text, "expected a text block"
 
 
-async def run_non_streaming(name: str, payload: Dict[str, Any]) -> bool:
+async def run_non_streaming(name: str, payload: dict[str, Any]) -> bool:
     print(f"\n--- {name} (non-streaming) ---")
     start = time.time()
     async with httpx.AsyncClient(timeout=30) as client:
@@ -2917,10 +2959,10 @@ async def run_non_streaming(name: str, payload: Dict[str, Any]) -> bool:
     return True
 
 
-async def run_streaming(name: str, payload: Dict[str, Any]) -> bool:
+async def run_streaming(name: str, payload: dict[str, Any]) -> bool:
     print(f"\n--- {name} (streaming) ---")
     payload = {**payload, "stream": True}
-    event_types: set = set()
+    event_types: set[str] = set()
     text_content = ""
     saw_tool_use = False
     saw_done = False
@@ -2987,17 +3029,17 @@ async def run_streaming(name: str, payload: Dict[str, Any]) -> bool:
     return True
 
 
-async def run_one(name: str, payload: Dict[str, Any]) -> bool:
+async def run_one(name: str, payload: dict[str, Any]) -> bool:
     if payload.get("stream"):
         return await run_streaming(name, payload)
     return await run_non_streaming(name, payload)
 
 
-async def _run_integration_scenarios(scenarios: Dict[str, Dict[str, Any]]) -> List[bool]:
+async def _run_integration_scenarios(scenarios: dict[str, dict[str, Any]]) -> list[bool]:
     return [await run_one(name, payload) for name, payload in scenarios.items()]
 
 
-def filter_scenarios(scenarios: Dict[str, Dict[str, Any]], args: argparse.Namespace) -> Dict[str, Dict[str, Any]]:
+def filter_scenarios(scenarios: dict[str, dict[str, Any]], args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     if args.simple:
         return {k: v for k, v in scenarios.items() if "tools" not in v}
     if args.tools:
@@ -3010,16 +3052,16 @@ def filter_scenarios(scenarios: Dict[str, Dict[str, Any]], args: argparse.Namesp
 # ---------------------------------------------------------------------------
 
 
-def discover_unit_tests() -> List[str]:
+def discover_unit_tests() -> list[str]:
     """Collect every top-level test_* function defined in this module."""
     import inspect
     return [name for name, _ in inspect.getmembers(sys.modules[__name__], inspect.isfunction)
             if name.startswith("test_")]
 
 
-def run_unit_tests(names: List[str]) -> List[bool]:
+def run_unit_tests(names: list[str]) -> list[bool]:
     """Invoke each test_* function; await coroutines via a fresh event loop per test."""
-    results: List[bool] = []
+    results: list[bool] = []
     for name in names:
         try:
             fn = getattr(sys.modules[__name__], name)
@@ -3031,7 +3073,7 @@ def run_unit_tests(names: List[str]) -> List[bool]:
         except AssertionError as e:
             print(f"FAIL {name}: {e}")
             results.append(False)
-        except Exception as e:
+        except Exception as e:  # ruff: ignore[blind-except] — test harness: record any failure and continue
             print(f"ERROR {name}: {type(e).__name__}: {e}")
             results.append(False)
     return results
@@ -3050,13 +3092,13 @@ def main() -> int:
     run_units = args.all or (not args.integration)
     run_integration = args.all or args.integration
 
-    unit_results: List[bool] = []
+    unit_results: list[bool] = []
     if run_units:
         names = discover_unit_tests()
         print(f"--- unit tests ({len(names)}) ---")
         unit_results = run_unit_tests(names)
 
-    integration_results: List[bool] = []
+    integration_results: list[bool] = []
     if run_integration:
         scenarios = filter_scenarios(TEST_SCENARIOS, args)
         print(f"\n--- integration tests ({len(scenarios)}) ---")

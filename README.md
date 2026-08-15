@@ -170,7 +170,7 @@ uv run ruff check --fix
 # Format.
 uv run ruff format
 
-# Type-check (ty config in pyproject.toml; checks server.py only).
+# Type-check (ty config in pyproject.toml; checks server.py and tests.py).
 uv run ty check
 
 # Find dead code (vulture config in pyproject.toml; false positives in vulture_whitelist.py).
@@ -187,7 +187,7 @@ uv tool install pre-commit
 pre-commit install
 ```
 
-`tests.py` is excluded from ruff — it's a top-level test runner, not production code. `vulture_whitelist.py` is excluded from ruff for the same reason: it's a tool config file, not production code.
+`tests.py` is linted by ruff, ty, and vulture with the same curated rule set as `server.py` — per-file ignores in `pyproject.toml` (`unused-async`, `float-equality-comparison`, `module-import-not-at-top-of-file`) suppress test-context noise (async generators, TOML-roundtrip exact floats, intentional late `import server`). `vulture_whitelist.py` is excluded from ruff: it's a tool config file, not production code.
 
 ## Contributing 🤝
 

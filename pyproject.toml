@@ -21,8 +21,8 @@ dev = [
 
 [tool.ruff]
 target-version = "py312"
-line-length = 120
-exclude = ["tests.py", "vulture_whitelist.py"]
+line-length = 140
+exclude = ["vulture_whitelist.py"]
 
 [tool.ruff.lint]
 preview = true
@@ -53,18 +53,27 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["server", "tests"]
 
+[tool.ruff.lint.per-file-ignores]
+# Test-context suppressions. The same select list applies to tests.py as to
+# server.py; these rules fire on patterns that are intentional in tests.
+"tests.py" = [
+    "unused-async", # async generators (no `await`, `yield` only) — test fixture pattern
+    "float-equality-comparison", # float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic
+    "module-import-not-at-top-of-file",   # `import server as srv` is intentionally after `load_dotenv()` so env vars are loaded before server reads them at import time
+]
+
 [tool.ty.environment]
 python-version = "3.12"
 
 [tool.ty.src]
-include = ["server.py"]
+include = ["server.py", "tests.py"]
 
 [tool.ty.rules]
 missing-type-argument = "error"
 possibly-unresolved-reference = "warn"
 
 [tool.vulture]
-paths = ["server.py", "vulture_whitelist.py"]
+paths = ["server.py", "tests.py", "vulture_whitelist.py"]
 min_confidence = 60
 # Decorators whose functions/classes vulture can't trace as used.
 ignore_decorators = [
