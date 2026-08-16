@@ -73,6 +73,7 @@ select = [
     "C",     # legacy flake8-comprehensions (C4 is the modern subset; both is safer)
     "D",     # pydocstyle
     "FAST",  # FastAPI-specific (route signatures, unused path params)
+    "FBT",   # boolean positional args / defaults — catch call-site arg swaps
     "N",     # pep8-naming
     "PL",    # Pylint
     "T",     # T10 (debugger) + T20 (print in prod)

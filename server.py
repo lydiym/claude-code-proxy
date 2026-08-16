@@ -359,7 +359,7 @@ def _proxy_value(key: str, env_name: str, default: object = None) -> object:
     return default
 
 
-def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
+def _proxy_bool(key: str, env_name: str, *, default: bool = True) -> bool:
     """Resolve a boolean config value; unrecognised strings keep ``default``."""
     val = _proxy_value(key, env_name, default)
     if isinstance(val, bool):
@@ -507,7 +507,7 @@ OPENAI_API_KEY = _proxy_value("openai_api_key", "OPENAI_API_KEY")
 OPENAI_BASE_URL = _proxy_value("openai_base_url", "OPENAI_BASE_URL")
 
 # Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
-OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True)
+OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", default=True)
 litellm.ssl_verify = OPENAI_TLS_VERIFY
 if not OPENAI_TLS_VERIFY:
     logger.warning("OPENAI_TLS_VERIFY=false — TLS certificate validation is disabled. Do not use this in production.")

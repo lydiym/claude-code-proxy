@@ -1922,7 +1922,7 @@ def test_deep_merge_does_not_mutate_inputs() -> None:
 
 def test_proxy_bool_passes_through_toml_bool() -> None:
     with _patched_config("[proxy]\nopenai_tls_verify = false"):
-        assert srv._proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True) is False
+        assert srv._proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", default=True) is False
 
 
 def test_proxy_bool_garbage_string_falls_back_to_caller_default() -> None:
@@ -1933,7 +1933,7 @@ def test_proxy_bool_garbage_string_falls_back_to_caller_default() -> None:
         original = os.environ.pop("OPENAI_TLS_VERIFY", None)
         os.environ["OPENAI_TLS_VERIFY"] = "garbage"
         try:
-            assert srv._proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", True) is True
+            assert srv._proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", default=True) is True
         finally:
             if original is not None:
                 os.environ["OPENAI_TLS_VERIFY"] = original
