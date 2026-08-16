@@ -1385,7 +1385,7 @@ async def test_streaming_counter_resets_on_successful_chunks() -> None:
         yield {"choices": [{"delta": {"content": "good2"}, "finish_reason": "stop"}]}
 
     original = srv._translate_parser_events
-    srv._translate_parser_events = lambda *a, **kw: iter(())  # ty: ignore[invalid-assignment] — monkey-patch for empty-stream test
+    srv._translate_parser_events = lambda *_a, **_kw: iter(())  # ty: ignore[invalid-assignment] — monkey-patch for empty-stream test
     try:
         raw = [piece async for piece in srv.handle_streaming(_interleaved(), req)]
     finally:

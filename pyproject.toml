@@ -69,9 +69,10 @@ select = [
     "TRY",   # tryceratops
     "UP",    # pyupgrade
     "ANN",   # flake8-annotations
+    "ARG",   # flake8-unused-arguments
     "W",     # pycodestyle warnings
     # --- below: intentionally disabled. Uncomment to enable. ---
-    # "ARG",   # flake8-unused-arguments
+    # "C90",   # mccabe
     # "C90",   # mccabe
     # "D",     # pydocstyle
     # "DOC",   # pydocstyle-docstring
