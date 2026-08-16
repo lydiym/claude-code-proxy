@@ -7,12 +7,12 @@ import sys
 import time
 import tomllib
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Literal, override
+from typing import Any, Literal, cast, override
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _str_to_bool(value, *, default=False):
+def _str_to_bool(value: object, *, default: bool = False) -> bool:
     """Parse an env-style boolean; unrecognised strings fall back to ``default``."""
     if isinstance(value, bool):
         return value
@@ -62,7 +62,7 @@ def _litellm_debug_http_enabled() -> bool:
     return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
 
 
-def _debug_json_dump(label: str, obj: Any) -> None:
+def _debug_json_dump(label: str, obj: object) -> None:
     """Best-effort debug-level JSON dump.
 
     Logs the failure cause instead of raising — debug logging must never crash
@@ -105,23 +105,25 @@ if TIKTOKEN_OFFLINE:
             pass
 
         @override
-        def encode(self, text, *args, **kwargs):
+        def encode(
+            self, text: str, *, allowed_special: object = ..., disallowed_special: object = ...,
+        ) -> list[int]:
             return [1] * max(1, len(text) // 4)
 
         @override
-        def encode_ordinary(self, text, *args, **kwargs):
-            return self.encode(text, *args, **kwargs)
+        def encode_ordinary(self, text: str) -> list[int]:
+            return self.encode(text)
 
         @override
-        def encode_single_token(self, token, *args, **kwargs):
-            return [1]
+        def encode_single_token(self, text_or_bytes: str | bytes) -> int:
+            return 1
 
         @override
-        def decode(self, tokens, *args, **kwargs) -> str:
+        def decode(self, tokens: Sequence[int], errors: str = "replace") -> str:
             return ""
 
         @override
-        def decode_single_token_bytes(self, token) -> bytes:
+        def decode_single_token_bytes(self, token: int) -> bytes:
             return b""
 
     def _get_encoding(_encoding_name: str) -> tiktoken.Encoding:
@@ -245,7 +247,7 @@ _COERCE_DROP = object()  # sentinel: coercion failed, key should be dropped
 _BOOL_TLS_VERIFY = {"openai_tls_verify"}
 
 
-def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
+def _coerce_proxy_value(key: str, value: object, section: str) -> str | bool | object:
     """Coerce a [proxy] TOML value to the expected Python type.
 
     Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped.
@@ -331,7 +333,7 @@ logger.warning(
 )
 
 
-def _proxy_value(key: str, env_name: str, default: Any = None) -> Any:
+def _proxy_value(key: str, env_name: str, default: object = None) -> object:
     """Env var → CONFIG[proxy][key] → default. None / "" fall through."""
     if key not in _PROXY_KEYS:
         msg = f"_proxy_value: {key!r} is not a recognised proxy key"
@@ -422,24 +424,24 @@ class Colors:
     RESET = "\033[0m"
 
 
-def _color(code, text):
+def _color(code: str, text: str | int) -> str:
     """Wrap text in ANSI code when stderr is a TTY, otherwise return plain."""
     try:
         if sys.stderr.isatty():
             return f"{code}{text}{Colors.RESET}"
     except (ValueError, AttributeError):
         pass
-    return text
+    return str(text)
 
 
-def _reset_logger(name, *, propagate) -> None:
+def _reset_logger(name: str, *, propagate: bool) -> None:
     log = logging.getLogger(name)
     log.handlers.clear()
     log.propagate = propagate
 
 
 @asynccontextmanager
-async def _configure_logging(app: FastAPI):
+async def _configure_logging(app: FastAPI) -> AsyncIterator[None]:
     """Unify the log format and silence uvicorn.access.
 
     Runs after uvicorn's own configure_logging() so it overrides whatever
@@ -515,12 +517,14 @@ OPENAI_MODELS = {
 }
 
 
-def to_anthropic_stop_reason(finish_reason):
-    return {
+def to_anthropic_stop_reason(finish_reason: object) -> Literal["end_turn", "max_tokens", "tool_use"]:
+    mapping: dict[str, Literal["end_turn", "max_tokens", "tool_use"]] = {
         "stop": "end_turn",
         "length": "max_tokens",
         "tool_calls": "tool_use",
-    }.get(finish_reason or "", "end_turn")
+    }
+    key = str(finish_reason) if finish_reason else ""
+    return mapping.get(key, "end_turn")
 
 
 # Maps litellm exception class names to Anthropic error_type enum; unknown classes fall through to "api_error".
@@ -558,7 +562,7 @@ def _sanitize_error_message(message: str) -> str:
     return message
 
 
-def get_field(obj, key, default=None):
+def get_field(obj: object, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
@@ -568,7 +572,7 @@ def new_msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
 
-def short_model(name):
+def short_model(name: str) -> str:
     return name.split("/")[-1] if "/" in name else name
 
 
@@ -645,7 +649,7 @@ class MessagesRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def capture_original_model(cls, data):
+    def capture_original_model(cls, data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(data, dict) and "model" in data:
             data = dict(data)
             data["original_model"] = data["model"]
@@ -659,7 +663,7 @@ class MessagesRequest(BaseModel):
         return self  # tier stays None → falls back to [global] in lookup
 
     @field_validator("model")
-    def validate_model_field(cls, v):
+    def validate_model_field(cls, v: str) -> str:
         clean_v = _strip_provider_prefix(v)  # case preserved
 
         if tier := _match_tier(v):
@@ -716,13 +720,13 @@ class ThinkStreamParser:
         self.in_thinking = False
         self.buffer = ""
 
-    def feed(self, text):
+    def feed(self, text: object) -> list[tuple[str, str | None]]:
         """Consume a chunk of model output; return a list of (kind, value).
 
         kind is "text" or "thinking" for a delta, or "open" / "close" for a
         block transition (value is None for those).
         """
-        if not text:
+        if not isinstance(text, str) or not text:
             return []
         events = []
         self.buffer += text
@@ -730,7 +734,7 @@ class ThinkStreamParser:
             pass
         return events
 
-    def _drain(self, events) -> bool:
+    def _drain(self, events: list[tuple[str, str | None]]) -> bool:
         if not self.buffer:
             return False
         tag = THINK_CLOSE_TAG if self.in_thinking else THINK_OPEN_TAG
@@ -757,7 +761,7 @@ class ThinkStreamParser:
         self.buffer = self.buffer[idx + len(tag) :]
         return True
 
-    def flush(self):
+    def flush(self) -> list[tuple[str, str | None]]:
         if not self.buffer:
             return []
         events = [(("thinking" if self.in_thinking else "text"), self.buffer)]
@@ -768,7 +772,7 @@ class ThinkStreamParser:
         return events
 
 
-def parse_tool_result_content(content):
+def parse_tool_result_content(content: object) -> str:
     if content is None:
         return "No content provided"
 
@@ -811,7 +815,7 @@ def parse_tool_result_content(content):
         return "Unparseable content"
 
 
-def convert_image_block(source: Any) -> dict[str, Any]:
+def convert_image_block(source: object) -> dict[str, Any]:
     if isinstance(source, dict):
         if source.get("type") == "base64":
             media_type = source.get("media_type", "image/png")
@@ -825,7 +829,7 @@ def convert_image_block(source: Any) -> dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": str(source)}}
 
 
-def _extract_text(content) -> str:
+def _extract_text(content: object) -> str:
     """Pull plain text out of a content field — None, string, or list of blocks.
 
     Used for system messages (and any other role) whose text we want to
@@ -836,11 +840,16 @@ def _extract_text(content) -> str:
         return ""
     if isinstance(content, str):
         return content
-    parts = [get_field(block, "text", "") for block in content if get_field(block, "type") == "text"]
+    if not isinstance(content, list):
+        return ""
+    parts = [cast("str", get_field(block, "text", "")) for block in content if get_field(block, "type") == "text"]
     return "\n\n".join(p for p in parts if p)
 
 
-def _build_system_message(system_field, messages) -> dict[str, str] | None:
+def _build_system_message(
+    system_field: str | list[SystemContent] | None,
+    messages: list[Message],
+) -> dict[str, str] | None:
     """Combine the top-level system field with any in-band role='system' messages.
 
     Anthropic's spec only allows system at the top level, but Claude Code
@@ -859,7 +868,7 @@ def _build_system_message(system_field, messages) -> dict[str, str] | None:
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
-def collect_tool_ids(messages):
+def collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
     call_ids = set()
     result_ids = set()
     for msg in messages:
@@ -868,7 +877,7 @@ def collect_tool_ids(messages):
         for block in msg.content:
             block_type = get_field(block, "type")
             if block_type == "tool_use":
-                call_ids.add(block.id)
+                call_ids.add(cast("ContentBlockToolUse", block).id)
             elif block_type == "tool_result":
                 rid = get_field(block, "tool_use_id", "") or ""
                 if rid:
@@ -876,30 +885,31 @@ def collect_tool_ids(messages):
     return call_ids, result_ids
 
 
-def convert_assistant_message(msg, result_ids):
+def convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, Any]:
     text_parts = []
     tool_calls = []
 
     for block in msg.content:
         block_type = get_field(block, "type")
         if block_type == "text":
-            text_parts.append(block.text)
+            text_parts.append(cast("ContentBlockText", block).text)
         elif block_type == "tool_use":
-            if block.id in result_ids:
+            tool_block = cast("ContentBlockToolUse", block)
+            if tool_block.id in result_ids:
                 tool_calls.append(
                     {
-                        "id": block.id,
+                        "id": tool_block.id,
                         "type": "function",
                         "function": {
-                            "name": block.name,
-                            "arguments": json.dumps(block.input),
+                            "name": tool_block.name,
+                            "arguments": json.dumps(tool_block.input),
                         },
                     },
                 )
             else:
                 # Dangling call (result truncated from history): describe in
                 # prose — small models mimic tool-call syntax otherwise.
-                text_parts.append(f"(An earlier {block.name} tool call is missing its result in this context.)")
+                text_parts.append(f"(An earlier {tool_block.name} tool call is missing its result in this context.)")
 
     text = "\n".join(text_parts).strip()
     out = {"role": "assistant"}
@@ -910,16 +920,16 @@ def convert_assistant_message(msg, result_ids):
     return out
 
 
-def convert_user_message(msg, call_ids):
+def convert_user_message(msg: Message, call_ids: set[str]) -> list[dict[str, Any]]:
     tool_messages = []
     user_parts = []
 
     for block in msg.content:
         block_type = get_field(block, "type")
         if block_type == "text":
-            user_parts.append({"type": "text", "text": block.text})
+            user_parts.append({"type": "text", "text": cast("ContentBlockText", block).text})
         elif block_type == "image":
-            user_parts.append(convert_image_block(block.source))
+            user_parts.append(convert_image_block(cast("ContentBlockImage", block).source))
         elif block_type == "tool_result":
             tool_use_id = get_field(block, "tool_use_id", "") or ""
             result_text = parse_tool_result_content(get_field(block, "content"))
@@ -951,7 +961,11 @@ def convert_user_message(msg, call_ids):
     return out
 
 
-def _convert_message(msg, result_ids, call_ids) -> list[dict[str, Any]]:
+def _convert_message(
+    msg: Message,
+    result_ids: set[str],
+    call_ids: set[str],
+) -> list[dict[str, Any]]:
     if isinstance(msg.content, str):
         return [{"role": msg.role, "content": msg.content}]
     if msg.role == "assistant":
@@ -959,7 +973,7 @@ def _convert_message(msg, result_ids, call_ids) -> list[dict[str, Any]]:
     return convert_user_message(msg, call_ids)
 
 
-def convert_tool_definitions(tools):
+def convert_tool_definitions(tools: list[Tool]) -> list[dict[str, Any]]:
     return [
         {
             "type": "function",
@@ -973,7 +987,7 @@ def convert_tool_definitions(tools):
     ]
 
 
-def convert_tool_choice(choice):
+def convert_tool_choice(choice: dict[str, Any] | None) -> str | dict[str, Any]:
     choice_type = get_field(choice, "type")
     if choice_type == "auto":
         return "auto"
@@ -986,7 +1000,7 @@ def convert_tool_choice(choice):
     return "auto"
 
 
-def sanitize_messages_for_openai(messages) -> None:
+def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
     allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls"}
     for msg in messages:
         for key in list(msg.keys()):
@@ -1091,21 +1105,21 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     return litellm_request
 
 
-def _first_choice(response):
+def _first_choice(response: object) -> object:
     choices = get_field(response, "choices", [])
     if not choices:
         return None
     return choices[0]
 
 
-def _first_message(response):
+def _first_message(response: object) -> dict[str, object]:
     choice = _first_choice(response)
     if choice is None:
         return {}
     return get_field(choice, "message", {}) or {}
 
 
-def _extract_tool_calls(message):
+def _extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
     raw = get_field(message, "tool_calls")
     if not raw:
         return []
@@ -1114,7 +1128,7 @@ def _extract_tool_calls(message):
     return [raw]
 
 
-def _parse_tool_arguments(raw):
+def _parse_tool_arguments(raw: str | dict[str, object] | None) -> dict[str, object]:
     if not isinstance(raw, str):
         return raw if raw is not None else {}
     try:
@@ -1124,7 +1138,11 @@ def _parse_tool_arguments(raw):
         return {"raw": raw}
 
 
-def _build_content_blocks(text, reasoning, tool_calls):
+def _build_content_blocks(
+    text: str | None,
+    reasoning: str | None,
+    tool_calls: list[dict[str, object]],
+) -> list[dict[str, object]]:
     """Turn message text + reasoning + tool calls into Anthropic content blocks.
 
     For non-streaming responses, litellm has already extracted any
@@ -1133,7 +1151,7 @@ def _build_content_blocks(text, reasoning, tool_calls):
     Streaming responses are built incrementally in ``handle_streaming`` and do
     not go through this helper.
     """
-    blocks = []
+    blocks: list[dict[str, object]] = []
     if reasoning:
         blocks.append({"type": "thinking", "thinking": reasoning})
     if text:
@@ -1151,7 +1169,7 @@ def _build_content_blocks(text, reasoning, tool_calls):
     return blocks or [{"type": "text", "text": ""}]
 
 
-def _extract_usage(usage):
+def _extract_usage(usage: dict[str, object]) -> tuple[int, int]:
     return (
         get_field(usage, "prompt_tokens", 0) or 0,
         get_field(usage, "completion_tokens", 0) or 0,
@@ -1159,18 +1177,18 @@ def _extract_usage(usage):
 
 
 def convert_litellm_to_anthropic(
-    litellm_response: dict[str, Any] | Any,
+    litellm_response: object,
     original_request: MessagesRequest,
 ) -> MessagesResponse:
     try:
         message = _first_message(litellm_response)
-        text = get_field(message, "content") or ""
-        reasoning = get_field(message, "reasoning_content") or ""
+        text = str(get_field(message, "content") or "")
+        reasoning = str(get_field(message, "reasoning_content") or "")
         tool_calls = _extract_tool_calls(message)
         choice = _first_choice(litellm_response)
         finish_reason = get_field(choice, "finish_reason", "stop")
-        usage = get_field(litellm_response, "usage", {})
-        response_id = get_field(litellm_response, "id", new_msg_id())
+        usage = cast("dict[str, object]", get_field(litellm_response, "usage", {}))
+        response_id = str(get_field(litellm_response, "id", new_msg_id()))
         prompt_tokens, completion_tokens = _extract_usage(usage)
 
         return MessagesResponse(
@@ -1344,14 +1362,14 @@ def _open_block(tracker: BlockTracker, kind: str, block_dict: dict[str, Any]) ->
         yield SseFormatter.content_block_start(block.index, block_dict)
 
 
-def _emit_thinking(tracker: BlockTracker, text: str) -> Iterator[str]:
-    if not text:
+def _emit_thinking(tracker: BlockTracker, text: object) -> Iterator[str]:
+    if not isinstance(text, str) or not text:
         return
     yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
     yield tracker.delta({"type": "thinking_delta", "thinking": text})
 
 
-def _translate_parser_events(events: list[tuple[str, str]], tracker: BlockTracker) -> Iterator[str]:
+def _translate_parser_events(events: list[tuple[str, str | None]], tracker: BlockTracker) -> Iterator[str]:
     for kind, value in events:
         if kind == "open":
             yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
@@ -1394,7 +1412,16 @@ def _emit_failure(
     yield SseFormatter.done()
 
 
-def log_request(method, path, source_model, target_model, tier, num_messages, num_tools, status_code) -> None:
+def log_request(
+    method: str,
+    path: str,
+    source_model: str,
+    target_model: str,
+    tier: str | None,
+    num_messages: int,
+    num_tools: int,
+    status_code: int,
+) -> None:
     endpoint = path.split("?", 1)[0] if "?" in path else path
     status_color = Colors.GREEN if status_code == 200 else Colors.RED
     tier_str = f" tier={_color(Colors.YELLOW, tier)}" if tier else ""
@@ -1411,7 +1438,10 @@ def log_request(method, path, source_model, target_model, tier, num_messages, nu
     logger.info(line)
 
 
-async def handle_streaming(response_generator, original_request: MessagesRequest):
+async def handle_streaming(
+    response_generator: AsyncGenerator[Any, None],
+    original_request: MessagesRequest,
+) -> AsyncIterator[str]:
     tracker = BlockTracker()
     think_parser = ThinkStreamParser()
     tool_index: int | None = None
@@ -1473,7 +1503,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         output_tokens = int(incoming)
 
                 choices = get_field(chunk, "choices")
-                if not choices:
+                if not isinstance(choices, list) or not choices:
                     continue
                 choice = choices[0]
                 delta = get_field(choice, "delta") or get_field(choice, "message", {}) or {}
@@ -1509,7 +1539,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         delta_tool_calls = [delta_tool_calls]
 
                     for tool_call in delta_tool_calls:
-                        current_index = get_field(tool_call, "index", 0)
+                        raw_index = get_field(tool_call, "index", 0)
+                        current_index = raw_index if isinstance(raw_index, int) else 0
 
                         if tool_index is None or current_index != tool_index:
                             # Anthropic SSE requires content_block_stop(N) before
@@ -1594,8 +1625,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         await response_generator.aclose()
 
 
-@app.post("/v1/messages")
-async def create_message(request: MessagesRequest):
+@app.post("/v1/messages", response_model=None)
+async def create_message(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
     try:
         litellm_request = convert_anthropic_to_litellm(request)
 
@@ -1623,7 +1654,7 @@ async def create_message(request: MessagesRequest):
             "POST",
             "/v1/messages",
             request.original_model or "unknown",
-            litellm_request.get("model"),
+            litellm_request.get("model", "unknown"),
             request.tier,
             len(litellm_request["messages"]),
             len(request.tools) if request.tools else 0,
@@ -1662,7 +1693,7 @@ async def create_message(request: MessagesRequest):
 
 
 @app.get("/")
-async def root():
+async def root() -> dict[str, str]:
     return {"message": "Anthropic Proxy for LiteLLM"}
 
 

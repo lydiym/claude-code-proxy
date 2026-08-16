@@ -21,8 +21,8 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator
-from typing import Any
+from collections.abc import AsyncGenerator, Callable, Iterator
+from typing import Any, NoReturn
 
 import httpx
 from dotenv import load_dotenv
@@ -108,7 +108,7 @@ def _make_request(payload: dict[str, Any]) -> srv.MessagesRequest:
     return srv.MessagesRequest(**payload)
 
 
-def _base_request(**overrides) -> srv.MessagesRequest:
+def _base_request(**overrides: Any) -> srv.MessagesRequest:
     payload = {
         "model": "claude-3-5-sonnet-20241022",
         "max_tokens": 100,
@@ -118,7 +118,7 @@ def _base_request(**overrides) -> srv.MessagesRequest:
     return _make_request(payload)
 
 
-async def _aiter(items: list[Any]) -> AsyncIterator[Any]:
+async def _aiter(items: list[Any]) -> AsyncGenerator[Any, None]:
     for item in items:
         yield item
 
@@ -163,7 +163,7 @@ async def _run_stream(chunks: list[Any], req: srv.MessagesRequest) -> list[dict[
     return _parse_sse(raw)
 
 
-def _text_chunk(text: str, **extra) -> dict[str, Any]:
+def _text_chunk(text: str, **extra: Any) -> dict[str, Any]:
     chunk = {
         "choices": [{
             "delta": {"content": text},
@@ -1208,7 +1208,7 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
     ]
     events = await _run_stream(chunks, req)
 
-    def find(predicate):
+    def find(predicate: Callable[[dict[str, Any]], bool]) -> int:
         return next(i for i, e in enumerate(events) if predicate(e))
 
     text_close_idx = find(lambda e: e["type"] == "content_block_stop" and e.get("index") == 0)
@@ -1281,7 +1281,7 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     """
     req = _base_request(stream=True)
 
-    async def _bad_upstream():
+    async def _bad_upstream() -> AsyncGenerator[dict[str, Any], None]:
         # MAX_CONSECUTIVE_CHUNK_ERRORS+1 bad chunks to exceed the tolerance
         # threshold (single bad chunks are now tolerated — see
         # test_streaming_tolerates_isolated_bad_chunks).
@@ -1290,7 +1290,7 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
 
     original = srv._translate_parser_events
 
-    def _boom(*args, **kwargs):
+    def _boom(*args: Any, **kwargs: Any) -> NoReturn:
         raise RuntimeError("simulated chunk processing failure")
 
     srv._translate_parser_events = _boom  # ty: ignore[invalid-assignment] — monkey-patch for error-path test
@@ -1324,7 +1324,7 @@ async def test_streaming_tolerates_isolated_bad_chunks() -> None:
     """
     req = _base_request(stream=True)
 
-    async def _mixed_upstream():
+    async def _mixed_upstream() -> AsyncGenerator[dict[str, Any], None]:
         yield {"choices": [{"delta": {"content": "good1"}}]}
         # Bad chunk — _translate_parser_events raises once.
         yield {"choices": [{"delta": {"content": "bad"}}]}
@@ -1335,7 +1335,7 @@ async def test_streaming_tolerates_isolated_bad_chunks() -> None:
     original = srv._translate_parser_events
     call_count = {"n": 0}
 
-    def _boom_once(*args, **kwargs):
+    def _boom_once(*args: Any, **kwargs: Any) -> Any:
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise RuntimeError("single transient chunk failure")
@@ -1372,7 +1372,7 @@ async def test_streaming_counter_resets_on_successful_chunks() -> None:
     """
     req = _base_request(stream=True)
 
-    async def _interleaved():
+    async def _interleaved() -> AsyncGenerator[dict[str, Any], None]:
         # 5 bad chunks (counter → 5, all tolerated).
         for _ in range(srv.MAX_CONSECUTIVE_CHUNK_ERRORS):
             yield {"choices": [{"delta": {"content": "bad"}}]}
@@ -1407,7 +1407,7 @@ async def test_streaming_emits_error_frame_on_upstream_failure() -> None:
     """
     req = _base_request(stream=True)
 
-    async def _exploding_upstream():
+    async def _exploding_upstream() -> AsyncGenerator[dict[str, Any], None]:
         yield {"choices": [{"delta": {"content": "partial"}}]}
         raise RuntimeError("simulated upstream connection failure")
 
@@ -1608,7 +1608,7 @@ async def test_streaming_emits_thinking_for_native_reasoning_content() -> None:
 
 
 @contextlib.contextmanager
-def _patched_config(toml_text: str):
+def _patched_config(toml_text: str) -> Iterator[None]:
     """Write toml_text to a temp file, load it via srv._load_config, patch
     srv.CONFIG and srv.CONFIG_PATH for the duration of the test, then restore.
     Mirrors the try/finally patching idiom used elsewhere in this file.
@@ -1635,7 +1635,7 @@ def _patched_config(toml_text: str):
 
 
 @contextlib.contextmanager
-def _patched_empty_config():
+def _patched_empty_config() -> Iterator[None]:
     """Force an empty CONFIG (no proxy/global/big/small/tiers) without touching disk.
     Also clears the _default_model_for_tier lru_cache so any cached value from
     before the patch is dropped — a caller can then observe the new (empty) state.
@@ -2514,7 +2514,7 @@ def test_global_section_accepts_model() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _scrub_model_envs():
+def _scrub_model_envs() -> dict[str, str | None]:
     """Pop all model-related env vars so a test starts from a clean slate.
     Returns a dict suitable for restoring in `finally`.
     """

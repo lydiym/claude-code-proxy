@@ -49,6 +49,10 @@ MessagesResponse.stop_sequence
 token  # unused variable (server.py:112)
 tokens  # unused variable (server.py:116)
 token  # unused variable (server.py:120)
+allowed_special  # unused variable (server.py:109)
+disallowed_special  # unused variable (server.py:109)
+text_or_bytes  # unused variable (server.py:118)
+errors  # unused variable (server.py:122)
 
 # Test fixture lambda replaces `srv._translate_parser_events`; the
 # upstream signature is unknown to vulture and the params are positional/

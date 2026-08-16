@@ -68,9 +68,9 @@ select = [
     "TID",   # flake8-tidy-imports
     "TRY",   # tryceratops
     "UP",    # pyupgrade
+    "ANN",   # flake8-annotations
     "W",     # pycodestyle warnings
     # --- below: intentionally disabled. Uncomment to enable. ---
-    # "ANN",   # flake8-annotations
     # "ARG",   # flake8-unused-arguments
     # "C90",   # mccabe
     # "D",     # pydocstyle
@@ -82,6 +82,7 @@ select = [
 ignore = [
     "hardcoded-bind-all-interfaces",
     "unused-function-argument",
+    "any-type",               # `get_field` is duck-typed (dict | object) and propagates `Any`; typing it as `object` cascades into cast() at every call site.
     "raise-vanilla-args",     # user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
     "raw-string-in-exception", # same reason as raise-vanilla-args
 ]
