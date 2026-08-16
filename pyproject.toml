@@ -70,6 +70,7 @@ select = [
     "UP",    # pyupgrade
     "ANN",   # flake8-annotations
     "ARG",   # flake8-unused-arguments
+    "N",     # pep8-naming
     "W",     # pycodestyle warnings
     # --- below: intentionally disabled. Uncomment to enable. ---
     # "C90",   # mccabe
@@ -89,6 +90,11 @@ ignore = [
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.ruff.lint.pep8-naming]
+# Pydantic validators/methods use `cls`, not `self`. Tell N805 the
+# decorator names so it skips them.
+classmethod-decorators = ["field_validator", "model_validator", "pydantic_validator"]
 
 [tool.ruff.format]
 quote-style = "double"

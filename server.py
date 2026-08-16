@@ -656,7 +656,7 @@ class MessagesRequest(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def derive_tier(self) -> "MessagesRequest":
+    def derive_tier(self) -> "MessagesRequest":  # ruff: ignore[invalid-first-argument-name-for-class-method] — Pydantic model_validator(mode="after") is internally a classmethod that receives the instance
         """Identify the Anthropic tier from the pre-rewrite original_model."""
         if self.original_model:
             self.tier = _match_tier(self.original_model)
