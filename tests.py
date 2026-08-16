@@ -1290,7 +1290,7 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
 
     original = srv._translate_parser_events
 
-    def _boom(*args: Any, **kwargs: Any) -> NoReturn:
+    def _boom(*_args: Any, **_kwargs: Any) -> NoReturn:
         raise RuntimeError("simulated chunk processing failure")
 
     srv._translate_parser_events = _boom  # ty: ignore[invalid-assignment] — monkey-patch for error-path test

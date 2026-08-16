@@ -441,7 +441,7 @@ def _reset_logger(name: str, *, propagate: bool) -> None:
 
 
 @asynccontextmanager
-async def _configure_logging(app: FastAPI) -> AsyncIterator[None]:
+async def _configure_logging(_app: FastAPI) -> AsyncIterator[None]:
     """Unify the log format and silence uvicorn.access.
 
     Runs after uvicorn's own configure_logging() so it overrides whatever
