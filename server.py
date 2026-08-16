@@ -70,7 +70,7 @@ def _debug_json_dump(label: str, obj: object) -> None:
     """
     try:
         logger.debug("%s: %s", label, json.dumps(obj, default=str, ensure_ascii=False))
-    except Exception as e:  # ruff: ignore[blind-except] — debug-only; never crash the request
+    except Exception as e:
         logger.debug("%s dump failed: %s", label, e)
 
 
@@ -500,6 +500,8 @@ MSG_ID_HEX_LEN = 24
 # Per-streak tolerance for transient chunk failures before surfacing an error.
 MAX_CONSECUTIVE_CHUNK_ERRORS = 5
 
+STATUS_OK = 200
+
 # Recognised bare names; anything else is opaque and passed through with openai/.
 OPENAI_MODELS = {
     "o3-mini",
@@ -573,7 +575,7 @@ def new_msg_id() -> str:
 
 
 def short_model(name: str) -> str:
-    return name.split("/")[-1] if "/" in name else name
+    return name.rsplit("/", maxsplit=1)[-1] if "/" in name else name
 
 
 class ContentBlockText(BaseModel):
@@ -780,26 +782,7 @@ def parse_tool_result_content(content: object) -> str:
         return content
 
     if isinstance(content, list):
-        result = ""
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                result += item.get("text", "") + "\n"
-            elif isinstance(item, str):
-                result += item + "\n"
-            elif isinstance(item, dict):
-                if "text" in item:
-                    result += item.get("text", "") + "\n"
-                else:
-                    try:
-                        result += json.dumps(item) + "\n"
-                    except (TypeError, ValueError):
-                        result += str(item) + "\n"
-            else:
-                try:
-                    result += str(item) + "\n"
-                except (TypeError, ValueError):
-                    result += "Unparseable content\n"
-        return result.strip()
+        return _join_tool_result_items(content).strip()
 
     if isinstance(content, dict):
         if content.get("type") == "text":
@@ -813,6 +796,29 @@ def parse_tool_result_content(content: object) -> str:
         return str(content)
     except (TypeError, ValueError):
         return "Unparseable content"
+
+
+def _join_tool_result_items(items: list[object]) -> str:
+    result = ""
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "text":
+            result += item.get("text", "") + "\n"
+        elif isinstance(item, str):
+            result += item + "\n"
+        elif isinstance(item, dict):
+            if "text" in item:
+                result += item.get("text", "") + "\n"
+            else:
+                try:
+                    result += json.dumps(item) + "\n"
+                except (TypeError, ValueError):
+                    result += str(item) + "\n"
+        else:
+            try:
+                result += str(item) + "\n"
+            except (TypeError, ValueError):
+                result += "Unparseable content\n"
+    return result
 
 
 def convert_image_block(source: object) -> dict[str, Any]:
@@ -1181,40 +1187,47 @@ def convert_litellm_to_anthropic(
     original_request: MessagesRequest,
 ) -> MessagesResponse:
     try:
-        message = _first_message(litellm_response)
-        text = str(get_field(message, "content") or "")
-        reasoning = str(get_field(message, "reasoning_content") or "")
-        tool_calls = _extract_tool_calls(message)
-        choice = _first_choice(litellm_response)
-        finish_reason = get_field(choice, "finish_reason", "stop")
-        usage = cast("dict[str, object]", get_field(litellm_response, "usage", {}))
-        response_id = str(get_field(litellm_response, "id", new_msg_id()))
-        prompt_tokens, completion_tokens = _extract_usage(usage)
-
-        return MessagesResponse(
-            id=response_id,
-            model=original_request.model,
-            role="assistant",
-            content=_build_content_blocks(text, reasoning, tool_calls),
-            stop_reason=to_anthropic_stop_reason(finish_reason),
-            stop_sequence=None,
-            usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
-        )
+        return _build_anthropic_response(litellm_response, original_request)
     except Exception as e:
         logger.exception("Error converting response")
-        return MessagesResponse(
-            id=new_msg_id(),
-            model=original_request.model,
-            role="assistant",
-            content=[
-                {
-                    "type": "text",
-                    "text": f"Error converting response: {e}. Please check server logs.",
-                },
-            ],
-            stop_reason="end_turn",
-            usage=Usage(input_tokens=0, output_tokens=0),
-        )
+        return _build_error_response(original_request.model, e)
+
+
+def _build_anthropic_response(litellm_response: object, original_request: MessagesRequest) -> MessagesResponse:
+    message = _first_message(litellm_response)
+    text = str(get_field(message, "content") or "")
+    reasoning = str(get_field(message, "reasoning_content") or "")
+    tool_calls = _extract_tool_calls(message)
+    choice = _first_choice(litellm_response)
+    finish_reason = get_field(choice, "finish_reason", "stop")
+    usage = cast("dict[str, object]", get_field(litellm_response, "usage", {}))
+    response_id = str(get_field(litellm_response, "id", new_msg_id()))
+    prompt_tokens, completion_tokens = _extract_usage(usage)
+    return MessagesResponse(
+        id=response_id,
+        model=original_request.model,
+        role="assistant",
+        content=_build_content_blocks(text, reasoning, tool_calls),
+        stop_reason=to_anthropic_stop_reason(finish_reason),
+        stop_sequence=None,
+        usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
+    )
+
+
+def _build_error_response(model: str, error: Exception) -> MessagesResponse:
+    return MessagesResponse(
+        id=new_msg_id(),
+        model=model,
+        role="assistant",
+        content=[
+            {
+                "type": "text",
+                "text": f"Error converting response: {error}. Please check server logs.",
+            },
+        ],
+        stop_reason="end_turn",
+        usage=Usage(input_tokens=0, output_tokens=0),
+    )
 
 
 @dataclass
@@ -1423,7 +1436,7 @@ def log_request(
     status_code: int,
 ) -> None:
     endpoint = path.split("?", 1)[0] if "?" in path else path
-    status_color = Colors.GREEN if status_code == 200 else Colors.RED
+    status_color = Colors.GREEN if status_code == STATUS_OK else Colors.RED
     tier_str = f" tier={_color(Colors.YELLOW, tier)}" if tier else ""
     line = (
         f"{_color(Colors.BOLD, method)} {_color(Colors.BOLD, endpoint)} "
@@ -1438,186 +1451,262 @@ def log_request(
     logger.info(line)
 
 
+def _new_tool_id() -> str:
+    return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
+
+
+@dataclass
+class _StreamState:
+    """Mutable per-request state for the SSE stream. Lives only as long as
+    handle_streaming's iteration. `should_stop` is set by chunk processors
+    when they emit a finish_reason so the outer loop can break cleanly."""
+    tool_index: int | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    has_sent_stop_reason: bool = False
+    debug_first_chunk_logged: bool = False
+    debug_chunk_count: int = 0
+    consecutive_chunk_errors: int = 0
+    should_stop: bool = False
+
+
+def _stream_prologue(original_request: MessagesRequest, tracker: BlockTracker) -> Iterator[str]:
+    yield SseFormatter.event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": new_msg_id(),
+                "type": "message",
+                "role": "assistant",
+                "model": original_request.model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        },
+    )
+    # Always start with a text block; close-and-open transitions handle upstream switches.
+    yield from _open_block(tracker, "text", {"type": "text", "text": ""})
+    yield SseFormatter.ping()
+
+
+def _stream_epilogue(tracker: BlockTracker, think_parser: ThinkStreamParser, output_tokens: int) -> Iterator[str]:
+    yield from _translate_parser_events(think_parser.flush(), tracker)
+    yield from tracker.close()
+    yield from SseFormatter.finish("end_turn", output_tokens)
+
+
+def _log_stream_finished(state: _StreamState) -> None:
+    if not _litellm_debug_http_enabled():
+        return
+    logger.debug(
+        "litellm stream finished: %s chunks, input_tokens=%s, output_tokens=%s",
+        state.debug_chunk_count,
+        state.input_tokens,
+        state.output_tokens,
+    )
+
+
+def _record_chunk_debug(chunk: object, state: _StreamState) -> None:
+    if not _litellm_debug_http_enabled():
+        return
+    state.debug_chunk_count += 1
+    # Log the first chunk so we see the upstream's wire shape;
+    # for the rest, litellm.set_verbose + httpx DEBUG cover it.
+    if not state.debug_first_chunk_logged:
+        state.debug_first_chunk_logged = True
+        _debug_json_dump("litellm stream chunk #1 (first)", chunk)
+
+
+def _record_chunk_usage(chunk: object, state: _StreamState) -> None:
+    """Overwrite only when upstream sends non-zero — some providers emit `0`
+    mid-stream as a no-op and we don't want to clobber a real count with 0."""
+    usage = get_field(chunk, "usage")
+    if usage is None:
+        return
+    incoming = get_field(usage, "prompt_tokens")
+    if isinstance(incoming, (int, float)) and incoming:
+        state.input_tokens = int(incoming)
+    incoming = get_field(usage, "completion_tokens")
+    if isinstance(incoming, (int, float)) and incoming:
+        state.output_tokens = int(incoming)
+
+
+def _coerce_delta_field(delta: object, key: str) -> object:
+    """delta[key] with a defensive re-fetch: if delta has the key but
+    get_field returned None (some upstream quirk), grab it directly.
+    In practice delta.get(key) and delta[key] agree, but the belt-and-braces
+    fetch preserves the original behaviour."""
+    value = get_field(delta, key)
+    if value is None and isinstance(delta, dict) and key in delta:
+        value = delta[key]
+    return value
+
+
+def _process_chunk(
+    chunk: object,
+    tracker: BlockTracker,
+    think_parser: ThinkStreamParser,
+    state: _StreamState,
+) -> Iterator[str]:
+    _record_chunk_debug(chunk, state)
+    _record_chunk_usage(chunk, state)
+
+    choices = get_field(chunk, "choices")
+    if not isinstance(choices, list) or not choices:
+        return
+    choice = choices[0]
+    delta = get_field(choice, "delta") or get_field(choice, "message", {}) or {}
+    finish_reason = get_field(choice, "finish_reason")
+
+    if not isinstance(delta, dict):
+        delta = {}
+
+    # litellm exposes native reasoning as delta.reasoning_content on some providers;
+    # honour it before falling back to think-tag parsing.
+    delta_reasoning = _coerce_delta_field(delta, "reasoning_content")
+    if delta_reasoning:
+        yield from _emit_thinking(tracker, delta_reasoning)
+
+    # Text after a tool_use closes the tool block first; track
+    # "is a tool block open now" rather than "has one ever opened".
+    delta_content = _coerce_delta_field(delta, "content")
+    if delta_content:
+        yield from _translate_parser_events(think_parser.feed(delta_content), tracker)
+
+    delta_tool_calls = _coerce_delta_field(delta, "tool_calls")
+    if delta_tool_calls:
+        yield from _process_tool_calls(delta_tool_calls, tracker, state)
+
+    if finish_reason and not state.has_sent_stop_reason:
+        state.has_sent_stop_reason = True
+        yield from _translate_parser_events(think_parser.flush(), tracker)
+        yield from tracker.close()
+        yield from SseFormatter.finish(to_anthropic_stop_reason(finish_reason), state.output_tokens)
+        state.should_stop = True
+
+
+def _process_tool_calls(
+    delta_tool_calls: object,
+    tracker: BlockTracker,
+    state: _StreamState,
+) -> Iterator[str]:
+    if state.tool_index is None:
+        yield from tracker.close()
+    if not isinstance(delta_tool_calls, list):
+        delta_tool_calls = [delta_tool_calls]
+
+    for tool_call in delta_tool_calls:
+        yield from _process_single_tool_call(tool_call, tracker, state)
+
+
+def _process_single_tool_call(tool_call: object, tracker: BlockTracker, state: _StreamState) -> Iterator[str]:
+    raw_index = get_field(tool_call, "index", 0)
+    current_index = raw_index if isinstance(raw_index, int) else 0
+
+    if state.tool_index is None or current_index != state.tool_index:
+        # Anthropic SSE requires content_block_stop(N) before
+        # content_block_start(N+1); close the prior tool block
+        # when a parallel call arrives in the same delta.
+        if state.tool_index is not None:
+            yield from tracker.close()
+        state.tool_index = current_index
+        function = get_field(tool_call, "function", {}) or {}
+        name = get_field(function, "name", "")
+        tool_id = get_field(tool_call, "id") or _new_tool_id()
+        block = tracker.open("tool_use")
+        yield SseFormatter.content_block_start(
+            block.index,
+            {
+                "type": "tool_use",
+                "id": tool_id,
+                "name": name,
+                "input": {},
+            },
+        )
+
+    function = get_field(tool_call, "function", {}) or {}
+    arguments = get_field(function, "arguments", "")
+    if arguments:
+        if isinstance(arguments, str):
+            yield tracker.delta({"type": "input_json_delta", "partial_json": arguments})
+        else:
+            yield tracker.delta({"type": "input_json_delta", "partial_json": json.dumps(arguments)})
+
+
+def _handle_chunk_error(
+    exc: Exception,
+    tracker: BlockTracker,
+    think_parser: ThinkStreamParser,
+    state: _StreamState,
+) -> Iterator[str]:
+    logger.warning(
+        "Error processing chunk (%d/%d): %s",
+        state.consecutive_chunk_errors + 1,
+        MAX_CONSECUTIVE_CHUNK_ERRORS + 1,
+        exc,
+    )
+    state.consecutive_chunk_errors += 1
+    if state.consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
+        return
+    # Threshold tripped — escalate with traceback and surface error.
+    logger.error("Chunk error threshold exceeded; surfacing error", exc_info=exc)
+    yield from _emit_failure(think_parser, tracker, state.output_tokens, exc, "chunk processing failed")
+    state.should_stop = True
+
+
+async def _stream_chunks(
+    response_generator: AsyncGenerator[Any, None],
+    tracker: BlockTracker,
+    think_parser: ThinkStreamParser,
+    state: _StreamState,
+) -> AsyncIterator[str]:
+    """Drive the per-chunk loop with its own try/except so handle_streaming's
+    outer try stays under the PL statements-in-try-clause cap."""
+    async for chunk in response_generator:
+        try:
+            for event in _process_chunk(chunk, tracker, think_parser, state):
+                yield event
+            # Successful chunk — reset streak so tolerance is per-streak.
+            state.consecutive_chunk_errors = 0
+        except Exception as e:
+            for event in _handle_chunk_error(e, tracker, think_parser, state):
+                yield event
+        if state.should_stop:
+            return
+
+
 async def handle_streaming(
     response_generator: AsyncGenerator[Any, None],
     original_request: MessagesRequest,
 ) -> AsyncIterator[str]:
+    state = _StreamState()
     tracker = BlockTracker()
     think_parser = ThinkStreamParser()
-    tool_index: int | None = None
-    input_tokens = 0
-    output_tokens = 0
-    has_sent_stop_reason = False
-    debug_first_chunk_logged = False
-    debug_chunk_count = 0
-    consecutive_chunk_errors = 0
-
-    def new_tool_id() -> str:
-        return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
     try:
-        yield SseFormatter.event(
-            "message_start",
-            {
-                "type": "message_start",
-                "message": {
-                    "id": new_msg_id(),
-                    "type": "message",
-                    "role": "assistant",
-                    "model": original_request.model,
-                    "content": [],
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {
-                        "input_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 0,
-                    },
-                },
-            },
-        )
-
-        # Always start with a text block; close-and-open transitions handle upstream switches.
-        for event in _open_block(tracker, "text", {"type": "text", "text": ""}):
+        for event in _stream_prologue(original_request, tracker):
             yield event
-        yield SseFormatter.ping()
 
-        async for chunk in response_generator:
-            try:
-                if _litellm_debug_http_enabled():
-                    debug_chunk_count += 1
-                    # Log the first chunk so we see the upstream's wire shape;
-                    # for the rest, litellm.set_verbose + httpx DEBUG cover it.
-                    if not debug_first_chunk_logged:
-                        debug_first_chunk_logged = True
-                        _debug_json_dump("litellm stream chunk #1 (first)", chunk)
-                usage = get_field(chunk, "usage")
-                if usage is not None:
-                    # Overwrite only when upstream sends non-zero — some providers emit `0` mid-stream as a no-op.
-                    incoming = get_field(usage, "prompt_tokens")
-                    if isinstance(incoming, (int, float)) and incoming:
-                        input_tokens = int(incoming)
-                    incoming = get_field(usage, "completion_tokens")
-                    if isinstance(incoming, (int, float)) and incoming:
-                        output_tokens = int(incoming)
+        async for event in _stream_chunks(response_generator, tracker, think_parser, state):
+            yield event
 
-                choices = get_field(chunk, "choices")
-                if not isinstance(choices, list) or not choices:
-                    continue
-                choice = choices[0]
-                delta = get_field(choice, "delta") or get_field(choice, "message", {}) or {}
-                finish_reason = get_field(choice, "finish_reason")
-
-                # litellm exposes native reasoning as delta.reasoning_content on some providers;
-                # honour it before falling back to `` parsing.
-                delta_reasoning = get_field(delta, "reasoning_content")
-
-                delta_content = get_field(delta, "content")
-                if isinstance(delta, dict) and "content" in delta and delta_content is None:
-                    delta_content = delta["content"]
-
-                if delta_reasoning:
-                    for event in _emit_thinking(tracker, delta_reasoning):
-                        yield event
-
-                # Text after a tool_use closes the tool block first; track
-                # "is a tool block open now" rather than "has one ever opened".
-                if delta_content:
-                    for event in _translate_parser_events(think_parser.feed(delta_content), tracker):
-                        yield event
-
-                delta_tool_calls = get_field(delta, "tool_calls")
-                if isinstance(delta, dict) and "tool_calls" in delta and delta_tool_calls is None:
-                    delta_tool_calls = delta["tool_calls"]
-
-                if delta_tool_calls:
-                    if tool_index is None:
-                        for event in tracker.close():
-                            yield event
-                    if not isinstance(delta_tool_calls, list):
-                        delta_tool_calls = [delta_tool_calls]
-
-                    for tool_call in delta_tool_calls:
-                        raw_index = get_field(tool_call, "index", 0)
-                        current_index = raw_index if isinstance(raw_index, int) else 0
-
-                        if tool_index is None or current_index != tool_index:
-                            # Anthropic SSE requires content_block_stop(N) before
-                            # content_block_start(N+1); close the prior tool block
-                            # when a parallel call arrives in the same delta.
-                            if tool_index is not None:
-                                for event in tracker.close():
-                                    yield event
-                            tool_index = current_index
-                            function = get_field(tool_call, "function", {}) or {}
-                            name = get_field(function, "name", "")
-                            tool_id = get_field(tool_call, "id") or new_tool_id()
-                            block = tracker.open("tool_use")
-                            yield SseFormatter.content_block_start(
-                                block.index,
-                                {
-                                    "type": "tool_use",
-                                    "id": tool_id,
-                                    "name": name,
-                                    "input": {},
-                                },
-                            )
-
-                        function = get_field(tool_call, "function", {}) or {}
-                        arguments = get_field(function, "arguments", "")
-                        if arguments:
-                            if isinstance(arguments, str):
-                                yield tracker.delta({"type": "input_json_delta", "partial_json": arguments})
-                            else:
-                                yield tracker.delta({"type": "input_json_delta", "partial_json": json.dumps(arguments)})
-
-                if finish_reason and not has_sent_stop_reason:
-                    has_sent_stop_reason = True
-                    for event in _translate_parser_events(think_parser.flush(), tracker):
-                        yield event
-                    for event in tracker.close():
-                        yield event
-                    for event in SseFormatter.finish(to_anthropic_stop_reason(finish_reason), output_tokens):
-                        yield event
-                    return
-                # Successful chunk — reset streak so tolerance is per-streak.
-                consecutive_chunk_errors = 0
-            except Exception as e:
-                # Tolerated: warning only, no traceback.
-                logger.warning(
-                    "Error processing chunk (%d/%d): %s",
-                    consecutive_chunk_errors + 1,
-                    MAX_CONSECUTIVE_CHUNK_ERRORS + 1,
-                    e,
-                )
-                consecutive_chunk_errors += 1
-                if consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
-                    continue
-                # Threshold tripped — escalate with traceback and surface error.
-                logger.exception("Chunk error threshold exceeded; surfacing error")
-                for event in _emit_failure(think_parser, tracker, output_tokens, e, "chunk processing failed"):
-                    yield event
-                return
-
-        if not has_sent_stop_reason:
-            for event in _translate_parser_events(think_parser.flush(), tracker):
+        # Skip epilogue if chunk loop already terminated the stream via _emit_failure
+        # — calling _translate_parser_events again here would re-emit the error frame.
+        if not state.has_sent_stop_reason and not state.should_stop:
+            for event in _stream_epilogue(tracker, think_parser, state.output_tokens):
                 yield event
-            for event in tracker.close():
-                yield event
-            for event in SseFormatter.finish("end_turn", output_tokens):
-                yield event
-        if _litellm_debug_http_enabled():
-            logger.debug(
-                "litellm stream finished: %s chunks, input_tokens=%s, output_tokens=%s",
-                debug_chunk_count,
-                input_tokens,
-                output_tokens,
-            )
-
+        _log_stream_finished(state)
     except Exception as e:
         logger.exception("Error in streaming")
-        for event in _emit_failure(think_parser, tracker, output_tokens, e, "upstream streaming failed"):
+        for event in _emit_failure(think_parser, tracker, state.output_tokens, e, "upstream streaming failed"):
             yield event
     finally:
         # Close so the internal httpx client releases deterministically —
@@ -1625,66 +1714,76 @@ async def handle_streaming(
         await response_generator.aclose()
 
 
+def _prepare_litellm_request(request: MessagesRequest) -> dict[str, Any]:
+    litellm_request = convert_anthropic_to_litellm(request)
+    # After validation every model has the openai/ prefix, so this is the only branch we need.
+    litellm_request["api_key"] = OPENAI_API_KEY
+    if OPENAI_BASE_URL:
+        litellm_request["api_base"] = OPENAI_BASE_URL
+    sanitize_messages_for_openai(litellm_request["messages"])
+    return litellm_request
+
+
+def _log_upstream_params_debug(litellm_request: dict[str, Any]) -> None:
+    # Skip the bulky fields (messages, tools) — they dominate the dump and
+    # are visible in litellm.set_verbose anyway.
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools"}}
+    logger.debug("upstream params: %s", debug)
+    if _litellm_debug_http_enabled():
+        # Verbose: dump the entire kwargs dict going into litellm
+        # (messages, tools, tool_choice, …) so we can confirm the
+        # exact payload upstream sees, not just the sampling subset.
+        _debug_json_dump("litellm.completion kwargs (full)", litellm_request)
+
+
+def _log_response_debug(litellm_response: object, model: str, start_time: float) -> None:
+    logger.debug("Response received: model=%s, time=%.2fs", model, time.time() - start_time)
+    if not _litellm_debug_http_enabled():
+        return
+    payload: object
+    response = cast("Any", litellm_response)
+    if hasattr(response, "model_dump"):
+        payload = response.model_dump()
+    elif hasattr(response, "dict"):
+        payload = response.dict()
+    else:
+        payload = repr(response)
+    _debug_json_dump("litellm.completion response (full)", payload)
+
+
+async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
+    litellm_request = _prepare_litellm_request(request)
+    _log_upstream_params_debug(litellm_request)
+    log_request(
+        "POST",
+        "/v1/messages",
+        request.original_model or "unknown",
+        litellm_request.get("model", "unknown"),
+        request.tier,
+        len(litellm_request["messages"]),
+        len(request.tools) if request.tools else 0,
+        STATUS_OK,
+    )
+
+    if request.stream:
+        response_generator = await litellm.acompletion(**litellm_request)
+        return StreamingResponse(
+            handle_streaming(response_generator, request),
+            media_type="text/event-stream",
+        )
+
+    start_time = time.time()
+    litellm_response = litellm.completion(**litellm_request)
+    _log_response_debug(litellm_response, str(litellm_request.get("model") or ""), start_time)
+    return convert_litellm_to_anthropic(litellm_response, request)
+
+
 @app.post("/v1/messages", response_model=None)
 async def create_message(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
     try:
-        litellm_request = convert_anthropic_to_litellm(request)
-
-        # After validation every model has the openai/ prefix, so this is the only branch we need.
-        litellm_request["api_key"] = OPENAI_API_KEY
-        if OPENAI_BASE_URL:
-            litellm_request["api_base"] = OPENAI_BASE_URL
-
-        sanitize_messages_for_openai(litellm_request["messages"])
-
-        # DEBUG: dump effective upstream params (request or config source).
-        # Skip the bulky fields (messages, tools) — they dominate the dump and
-        # are visible in litellm.set_verbose anyway.
-        if logger.isEnabledFor(logging.DEBUG):
-            debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools"}}
-            logger.debug("upstream params: %s", debug)
-
-            if _litellm_debug_http_enabled():
-                # Verbose: dump the entire kwargs dict going into litellm
-                # (messages, tools, tool_choice, …) so we can confirm the
-                # exact payload upstream sees, not just the sampling subset.
-                _debug_json_dump("litellm.completion kwargs (full)", litellm_request)
-
-        log_request(
-            "POST",
-            "/v1/messages",
-            request.original_model or "unknown",
-            litellm_request.get("model", "unknown"),
-            request.tier,
-            len(litellm_request["messages"]),
-            len(request.tools) if request.tools else 0,
-            200,
-        )
-
-        if request.stream:
-            response_generator = await litellm.acompletion(**litellm_request)
-            return StreamingResponse(
-                handle_streaming(response_generator, request),
-                media_type="text/event-stream",
-            )
-
-        start_time = time.time()
-        litellm_response = litellm.completion(**litellm_request)
-        logger.debug(
-            "Response received: model=%s, time=%.2fs",
-            litellm_request.get("model"),
-            time.time() - start_time,
-        )
-        if _litellm_debug_http_enabled():
-            if hasattr(litellm_response, "model_dump"):
-                payload = litellm_response.model_dump()
-            elif hasattr(litellm_response, "dict"):
-                payload = litellm_response.dict()
-            else:
-                payload = repr(litellm_response)
-            _debug_json_dump("litellm.completion response (full)", payload)
-        return convert_litellm_to_anthropic(litellm_response, request)
-
+        return await _handle_request(request)
     except Exception as e:
         logger.exception("Error processing request")
         status_code = getattr(e, "status_code", 500)

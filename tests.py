@@ -15,6 +15,7 @@ Usage:
 import argparse
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import pathlib
@@ -1684,7 +1685,7 @@ def test_load_config_missing_file_returns_empty() -> None:
 
 def test_load_config_malformed_toml_returns_empty() -> None:
     # unclosed array — must not crash; the loader fail-opens and returns empty.
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as f:
         f.write("[sonnet\ntemperature = 0.5")
         path = f.name
     try:
@@ -1695,7 +1696,7 @@ def test_load_config_malformed_toml_returns_empty() -> None:
 
 
 def test_load_config_unknown_section_warns_and_skips() -> None:
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as f:
         f.write("[bogus]\nextra_body = { temperature = 0.5 }\n[sonnet]\nextra_body = { temperature = 0.9 }\n")
         path = f.name
     try:
@@ -1707,7 +1708,7 @@ def test_load_config_unknown_section_warns_and_skips() -> None:
 
 
 def test_load_config_bad_extra_body_warns_and_skips() -> None:
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as f:
         f.write("[sonnet]\nextra_body = true\n")
         path = f.name
     try:
@@ -1744,7 +1745,7 @@ def test_load_config_partial_failure_isolates_sections() -> None:
         [opus]
         extra_body = { temperature = 0.3 }
     """
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False, encoding="utf-8") as f:
         f.write(toml)
         path = f.name
     try:
@@ -2948,7 +2949,7 @@ async def run_non_streaming(name: str, payload: dict[str, Any]) -> bool:
     return True
 
 
-async def run_streaming(name: str, payload: dict[str, Any]) -> bool:
+async def run_streaming(name: str, payload: dict[str, Any]) -> bool:  # ruff: ignore[too-many-locals] — streaming-event assertions naturally track many flags
     print(f"\n--- {name} (streaming) ---")
     payload = {**payload, "stream": True}
     event_types: set[str] = set()
@@ -3041,7 +3042,6 @@ def filter_scenarios(scenarios: dict[str, dict[str, Any]], args: argparse.Namesp
 
 def discover_unit_tests() -> list[str]:
     """Collect every top-level test_* function defined in this module."""
-    import inspect
     return [name for name, _ in inspect.getmembers(sys.modules[__name__], inspect.isfunction)
             if name.startswith("test_")]
 
@@ -3051,19 +3051,23 @@ def run_unit_tests(names: list[str]) -> list[bool]:
     results: list[bool] = []
     for name in names:
         try:
-            fn = getattr(sys.modules[__name__], name)
-            result = fn()
-            if asyncio.iscoroutine(result):
-                asyncio.run(result)
-            print(f"OK   {name}")
+            run_one_unit_test(name)
             results.append(True)
         except AssertionError as e:
             print(f"FAIL {name}: {e}")
             results.append(False)
-        except Exception as e:  # ruff: ignore[blind-except] — test harness: record any failure and continue
+        except Exception as e:  # test harness: record any failure and continue
             print(f"ERROR {name}: {type(e).__name__}: {e}")
             results.append(False)
     return results
+
+
+def run_one_unit_test(name: str) -> None:
+    fn = getattr(sys.modules[__name__], name)
+    result = fn()
+    if asyncio.iscoroutine(result):
+        asyncio.run(result)
+    print(f"OK   {name}")
 
 
 def main() -> int:
