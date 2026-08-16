@@ -26,15 +26,11 @@ exclude = ["vulture_whitelist.py"]
 
 [tool.ruff.lint]
 preview = true
-# Active rule set. Categories below are kept enabled even when they don't
-# currently fire (so future code that triggers them is caught). Categories
-# in the commented block at the bottom are intentionally disabled — see the
-# rationale on each line for when to flip them back on.
 select = [
     "A",     # builtin shadowing
     "ASYNC", # flake8-async
     "B",     # bugbear
-    "BLE",   # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
+    "BLE",   # blind-except
     "C4",    # comprehensions
     "COM",   # commas
     "DTZ",   # flake8-datetimez
@@ -57,7 +53,7 @@ select = [
     "PERF",  # perflint
     "PGH",   # pygrep-hooks
     "PIE",   # flake8-pie
-    "PT",    # pytest-style (per-file-ignored on server.py; enabled in tests.py)
+    "PT",    # pytest-style
     "PTH",   # pathlib
     "Q",     # quotes
     "RET",   # return-statement
@@ -65,7 +61,7 @@ select = [
     "RUF",   # ruff-specific
     "S",     # flake8-bandit
     "SIM",   # simplify
-    "SLF",   # private-member-access (allowed via per-file-ignores in tests.py)
+    "SLF",   # private-member-access
     "SLOT",  # flake8-slots
     "TCH",   # flake8-type-checking
     "TD",    # flake8-todos
@@ -73,21 +69,21 @@ select = [
     "TRY",   # tryceratops
     "UP",    # pyupgrade
     "W",     # pycodestyle warnings
-    # --- below: categories commented out by triage. Uncomment to enable ---
-    # "ANN",   # flake8-annotations — would force annotations on @override mirror methods; add case-by-case
-    # "ARG",   # flake8-unused-arguments — ARG001 fires on mirror signatures; use the specific `unused-function-argument` ignore below instead
-    # "C90",   # mccabe (max-complexity=10) — handle_streaming is intentionally long; refactor separately before enabling
-    # "D",     # pydocstyle — would force docstrings on every Pydantic validator / helper / @override mirror; add case-by-case
-    # "DOC",   # pydocstyle-docstring — subset of D; same rationale
-    # "N",     # pep8-naming — N805 fires on Pydantic @field_validator (uses `cls`); if re-enabled, configure `classmethod-decorators = ["field_validator", "model_validator"]`
-    # "PL",    # Pylint (PLR0911-0917, PLR1702, PLW*) — too-many-* are refactoring opportunities on handle_streaming; revisit when refactored
+    # --- below: intentionally disabled. Uncomment to enable. ---
+    # "ANN",   # flake8-annotations
+    # "ARG",   # flake8-unused-arguments
+    # "C90",   # mccabe
+    # "D",     # pydocstyle
+    # "DOC",   # pydocstyle-docstring
+    # "N",     # pep8-naming
+    # "PL",    # Pylint
 ]
 # False positives / intentional suppressions.
 ignore = [
-    "hardcoded-bind-all-interfaces",   # S104 — dev-server default (0.0.0.0)
-    "unused-function-argument",        # ARG001 — `_get_encoding`/`_encoding_for_model`/`_configure_logging` mirror upstream signatures
-    "raise-vanilla-args",              # TRY003 — user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
-    "raw-string-in-exception",         # EM101 — same reason as TRY003
+    "hardcoded-bind-all-interfaces",
+    "unused-function-argument",
+    "raise-vanilla-args",     # user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
+    "raw-string-in-exception", # same reason as raise-vanilla-args
 ]
 
 [tool.ruff.lint.mccabe]
@@ -101,14 +97,12 @@ indent-style = "space"
 known-first-party = ["server", "tests"]
 
 [tool.ruff.lint.per-file-ignores]
-# Test-context suppressions. The same select list applies to tests.py as to
-# server.py; these rules fire on patterns that are intentional in tests.
 "tests.py" = [
-    "assert",                       # S101 — asserts are the test pattern
-    "private-member-access",        # SLF001 — tests poke srv._internal for monkey-patches
-    "unused-async",                 # RUF029 — async generators (no `await`, `yield` only) — test fixture pattern
-    "float-equality-comparison",    # RUF069 — float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic
-    "module-import-not-at-top-of-file",   # E402 — `import server as srv` is intentionally after `load_dotenv()` so env vars are loaded before server reads them at import time
+    "assert",
+    "private-member-access",
+    "unused-async",
+    "float-equality-comparison",
+    "module-import-not-at-top-of-file",
 ]
 
 [tool.ty.environment]
@@ -124,10 +118,9 @@ possibly-unresolved-reference = "warn"
 [tool.vulture]
 paths = ["server.py", "tests.py", "vulture_whitelist.py"]
 min_confidence = 60
-# Decorators whose functions/classes vulture can't trace as used.
 ignore_decorators = [
-    "@app.*",          # FastAPI route handlers (`create_message`)
-    "@field_validator", # Pydantic v2 field validators
-    "@model_validator", # Pydantic v2 model validators
-    "@override",       # PEP 698 — base-class signature mirrors
+    "@app.*",
+    "@field_validator",
+    "@model_validator",
+    "@override",
 ]
