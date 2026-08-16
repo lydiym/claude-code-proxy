@@ -70,9 +70,12 @@ select = [
     "UP",    # pyupgrade
     "ANN",   # flake8-annotations
     "ARG",   # flake8-unused-arguments
+    "C",     # legacy flake8-comprehensions (C4 is the modern subset; both is safer)
     "D",     # pydocstyle
+    "FAST",  # FastAPI-specific (route signatures, unused path params)
     "N",     # pep8-naming
     "PL",    # Pylint
+    "T",     # T10 (debugger) + T20 (print in prod)
     "W",     # pycodestyle warnings
     # --- below: intentionally disabled. Uncomment to enable. ---
 ]
@@ -117,6 +120,7 @@ known-first-party = ["server", "tests"]
     "module-import-not-at-top-of-file",
     "magic-value-comparison", # tests assert against literal sampling temps/byte sizes/HTTP codes — naming each one adds ceremony without clarity
     "D",     # tests.py has its own module docstring already; per-test docstrings are noise
+    "T20",   # integration runner prints scenarios + pass/fail lines
 ]
 
 [tool.ty.environment]
