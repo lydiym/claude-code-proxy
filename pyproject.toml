@@ -26,29 +26,65 @@ exclude = ["vulture_whitelist.py"]
 
 [tool.ruff.lint]
 preview = true
-# Curated strict set: original Recommended + the high-value categories
-# the max-strict triage surfaced (G=logging, PTH=pathlib, FURB=refurb,
-# COM=commas, RUF=ruff-specific). Pedantic families (D, ANN, C901, N,
-# FBT, PLR091x, etc.) stay disabled to avoid noise.
+# Curated strict set: high-signal rules from Bugbear, pycodestyle, pyflakes,
+# pyupgrade, and the categories the max-strict triage surfaced as
+# high-value (G=logging, PTH=pathlib, FURB=refurb, BLE=blind-except).
+# Pedantic / verbose categories (D=docstring, ANN=annotations, PL/C90/Pylint
+# refactor, N=naming, N805=Pydantic cls, FBT, PT=pytest-style, COM) stay
+# disabled to avoid noisy rewrites of working code. Docstrings/annotations
+# are added case-by-case, not blanket-enforced.
 select = [
-    "E",   # pycodestyle errors
-    "F",   # pyflakes
-    "I",   # isort
-    "B",   # bugbear
-    "UP",  # pyupgrade
-    "G",   # logging — caught 32 lazy-f-string issues
-    "PTH", # pathlib — caught 4 os.path uses
-    "FURB",# refurb — caught 1 if/else→or
-    "RUF", # ruff-specific
-    "EM",  # exception messages
-    "TRY", # tryceratops
-    "BLE", # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
+    "A",    # builtin shadowing
+    "B",    # bugbear
+    "BLE",  # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
+    "C4",   # comprehensions
+    "COM",  # commas
+    "E",    # pycodestyle errors
+    "EM",   # exception messages
+    "ERA",  # commented-out-code
+    "EXE",  # executable
+    "F",    # pyflakes
+    "FA",   # flake8-future-annotations
+    "FLY",  # flynt — f-string conversions
+    "FURB", # refurb — caught 1 if/else→or
+    "G",    # logging — caught 32 lazy-f-string issues
+    "I",    # isort
+    "ICN",  # flake8-import-conventions
+    "ISC",  # implicit string concat
+    "LOG",  # flake8-logging
+    "PERF", # perflint
+    "PGH",  # pygrep-hooks
+    "PIE",  # flake8-pie
+    "PT",   # pytest-style (applied via per-file-ignores on non-test files)
+    "PTH",  # pathlib — caught 4 os.path uses
+    "Q",    # quotes
+    "RET",  # return-statement
+    "RSE",  # flake8-raise
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit
+    "SIM",  # simplify
+    "SLF",  # private-member-access (allowed via per-file-ignores in tests.py)
+    "TCH",  # flake8-type-checking
+    "TID",  # flake8-tidy-imports
+    "TRY",  # tryceratops
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
 ]
 # False positives / intentional suppressions.
 ignore = [
     "hardcoded-bind-all-interfaces",   # dev-server default (0.0.0.0)
     "unused-function-argument",        # `_get_encoding`/`_encoding_for_model`/`_configure_logging` mirror upstream signatures
+    "raise-vanilla-args",   # raise-vanilla-args — user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
+    "raw-string-in-exception",    # raw-string-in-exception — same reason as TRY003
+    "magic-value-comparison",  # magic-value-comparison — better per-file (tests verify TOML-roundtrip exact floats, not FP arithmetic)
 ]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
 
 [tool.ruff.lint.isort]
 known-first-party = ["server", "tests"]
@@ -57,8 +93,10 @@ known-first-party = ["server", "tests"]
 # Test-context suppressions. The same select list applies to tests.py as to
 # server.py; these rules fire on patterns that are intentional in tests.
 "tests.py" = [
-    "unused-async", # async generators (no `await`, `yield` only) — test fixture pattern
-    "float-equality-comparison", # float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic
+    "assert",                       # asserts are the test pattern (337 hits)
+    "private-member-access",        # tests poke srv._internal for monkey-patches
+    "unused-async",                 # async generators (no `await`, `yield` only) — test fixture pattern
+    "float-equality-comparison",    # float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic
     "module-import-not-at-top-of-file",   # `import server as srv` is intentionally after `load_dotenv()` so env vars are loaded before server reads them at import time
 ]
 

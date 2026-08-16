@@ -55,15 +55,19 @@ def _str_to_bool(value, *, default=False):
 
 
 def _litellm_debug_http_enabled() -> bool:
-    """LITELLM_DEBUG_HTTP=1 turns on verbose litellm + httpx/httpcore logging
-    so we can see the actual wire payload sent to the upstream OpenAI endpoint.
+    """LITELLM_DEBUG_HTTP=1 turns on verbose litellm + httpx/httpcore logging.
+
+    Surfaces the actual wire payload sent to the upstream OpenAI endpoint.
     """
     return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
 
 
 def _debug_json_dump(label: str, obj: Any) -> None:
-    """Best-effort debug-level JSON dump. Logs the failure cause instead of
-    raising — debug logging must never crash the request."""
+    """Best-effort debug-level JSON dump.
+
+    Logs the failure cause instead of raising — debug logging must never crash
+    the request.
+    """
     try:
         logger.debug("%s: %s", label, json.dumps(obj, default=str, ensure_ascii=False))
     except Exception as e:  # ruff: ignore[blind-except] — debug-only; never crash the request
@@ -157,6 +161,7 @@ _VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge: base + override, where override wins per leaf.
+
     Used at request time to layer tier config over [global] and to merge
     config extra_body into the upstream body.
     """
@@ -182,6 +187,7 @@ def _strip_provider_prefix(name: str) -> str:
 
 def _match_tier(name: str) -> str | None:
     """First TIER_KEYS substring that appears in the lower-cased name.
+
     Returns None when no tier matches.
     """
     lower = name.lower()
@@ -192,8 +198,9 @@ def _match_tier(name: str) -> str | None:
 
 
 def _parse_tier_section(body: dict[str, Any], section: str) -> dict[str, Any]:
-    """Parse [global]. Accepts `model` (str) + `extra_body` (dict). Bad
-    values are warned and skipped so one error doesn't drop the rest.
+    """Parse [global]. Accepts `model` (str) + `extra_body` (dict).
+
+    Bad values are warned and skipped so one error doesn't drop the rest.
     """
     out: dict[str, Any] = {}
     for k, v in body.items():
@@ -213,8 +220,9 @@ def _parse_tier_section(body: dict[str, Any], section: str) -> dict[str, Any]:
 
 
 def _parse_bucket_section(body: dict[str, Any], section: str) -> dict[str, Any]:
-    """Parse [big], [small], or a per-tier section. Accepts `model` (str) and
-    `extra_body` (dict). Bad values warned and skipped.
+    """Parse [big], [small], or a per-tier section. Accepts `model` (str) and `extra_body` (dict).
+
+    Bad values warned and skipped.
     """
     out: dict[str, Any] = {}
     for k, v in body.items():
@@ -239,6 +247,7 @@ _BOOL_TLS_VERIFY = {"openai_tls_verify"}
 
 def _coerce_proxy_value(key: str, value: Any, section: str) -> Any:
     """Coerce a [proxy] TOML value to the expected Python type.
+
     Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped.
     """
     if isinstance(value, str):
@@ -348,13 +357,16 @@ def _proxy_bool(key: str, env_name: str, default: bool = True) -> bool:
 
 @cache
 def _default_model_for_tier(tier: str | None) -> str:
-    """Per-tier upstream model. Lookup order:
+    """Per-tier upstream model.
+
+    Lookup order:
       1. {TIER}_MODEL env (e.g. HAIKU_MODEL; skipped when tier=None)
       2. {BIG|SMALL}_MODEL env — bucket-level (haiku → SMALL_MODEL, others → BIG_MODEL)
       3. [tier].model config (skipped when tier=None)
       4. [bucket].model config (haiku → small, others → big; bucket skipped when tier=None)
       5. [global].model config — fallback for any model
       6. Built-in default (gpt-4.1-mini for haiku bucket, gpt-4.1 otherwise)
+
     Cached at first call — env or CONFIG.toml edits after import require restart.
     Live edits to [tier].extra_body still take effect via the per-call
     _resolve_tier_config.
@@ -428,8 +440,10 @@ def _reset_logger(name, *, propagate) -> None:
 
 @asynccontextmanager
 async def _configure_logging(app: FastAPI):
-    """Unify the log format and silence uvicorn.access. Runs after uvicorn's
-    own configure_logging() so it overrides whatever uvicorn set up.
+    """Unify the log format and silence uvicorn.access.
+
+    Runs after uvicorn's own configure_logging() so it overrides whatever
+    uvicorn set up.
     """
     root = logging.getLogger()
     root.handlers.clear()
@@ -437,12 +451,12 @@ async def _configure_logging(app: FastAPI):
     handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
     root.addHandler(handler)
 
-    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     try:
-        logger.setLevel(LOG_LEVEL)
+        logger.setLevel(log_level)
     except ValueError:
         logger.setLevel(logging.INFO)
-        logger.warning("Invalid LOG_LEVEL=%r; falling back to INFO", LOG_LEVEL)
+        logger.warning("Invalid LOG_LEVEL=%r; falling back to INFO", log_level)
     for noisy in ("LiteLLM", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -827,8 +841,7 @@ def _extract_text(content) -> str:
 
 
 def _build_system_message(system_field, messages) -> dict[str, str] | None:
-    """Combine the top-level system field with any in-band role='system' messages
-    into a single OpenAI system message.
+    """Combine the top-level system field with any in-band role='system' messages.
 
     Anthropic's spec only allows system at the top level, but Claude Code
     2.1.154+ has started embedding system reminders inline. We hoist them all
@@ -986,6 +999,7 @@ def sanitize_messages_for_openai(messages) -> None:
 
 def _resolve_tier_config(request: "MessagesRequest") -> dict[str, Any]:
     """extra_body merge chain: [global] → [bucket] → [tier].
+
     haiku → small bucket; others → big bucket; tier=None → no bucket or tier.
     `model` is consumed by _default_model_for_tier and stripped from the result.
     Deep-copied so downstream mutations can't corrupt CONFIG's nested dicts.
@@ -1358,8 +1372,9 @@ def _emit_failure(
     exc: BaseException,
     message_prefix: str,
 ) -> Iterator[str]:
-    """Drain, close, message_delta → event:error → done. Per-step try-wrap
-    so a broken upstream can't mask the primary error.
+    """Drain, close, message_delta → event:error → done.
+
+    Per-step try-wrap so a broken upstream can't mask the primary error.
     """
     try:
         for event in _translate_parser_events(parser.flush(), tracker):

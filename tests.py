@@ -159,9 +159,7 @@ def _parse_sse(raw_chunks: list[str]) -> list[dict[str, Any]]:
 
 async def _run_stream(chunks: list[Any], req: srv.MessagesRequest) -> list[dict[str, Any]]:
     """Drive handle_streaming over a fake upstream and return parsed events."""
-    raw: list[str] = []
-    async for piece in srv.handle_streaming(_aiter(chunks), req):
-        raw.append(piece)
+    raw = [piece async for piece in srv.handle_streaming(_aiter(chunks), req)]
     return _parse_sse(raw)
 
 
@@ -180,7 +178,7 @@ def _text_chunk(text: str, **extra) -> dict[str, Any]:
 def _tool_delta_chunk(
     index: int,
     *,
-    id: str | None = None,
+    tool_id: str | None = None,
     name: str | None = None,
     arguments: str | None = None,
     finish_reason: str | None = None,
@@ -191,8 +189,8 @@ def _tool_delta_chunk(
     if arguments is not None:
         function["arguments"] = arguments
     tool_call: dict[str, Any] = {"index": index, "type": "function"}
-    if id is not None:
-        tool_call["id"] = id
+    if tool_id is not None:
+        tool_call["id"] = tool_id
     if function:
         tool_call["function"] = function
     return {
@@ -1205,7 +1203,7 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
     }])
     chunks = [
         _text_chunk("Let me calculate"),
-        _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"x":1}'),
+        _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":1}'),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
@@ -1229,7 +1227,7 @@ async def test_streaming_tool_call_then_text_opens_new_block() -> None:
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
     chunks = [
-        _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"x":1}'),
+        _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":1}'),
         _text_chunk("after tool"),
         _finish_chunk("tool_calls"),
     ]
@@ -1251,7 +1249,7 @@ async def test_streaming_tool_only_no_text() -> None:
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
     chunks = [
-        _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"x":1}'),
+        _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":1}'),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
@@ -1293,13 +1291,11 @@ async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     original = srv._translate_parser_events
 
     def _boom(*args, **kwargs):
-        raise RuntimeError("simulated chunk processing failure")  # ruff: ignore[raw-string-in-exception,raise-vanilla-args] — test fixture; message is the test signal
+        raise RuntimeError("simulated chunk processing failure")
 
     srv._translate_parser_events = _boom  # ty: ignore[invalid-assignment] — monkey-patch for error-path test
     try:
-        raw: list[str] = []
-        async for piece in srv.handle_streaming(_bad_upstream(), req):
-            raw.append(piece)
+        raw = [piece async for piece in srv.handle_streaming(_bad_upstream(), req)]
     finally:
         srv._translate_parser_events = original
 
@@ -1342,14 +1338,12 @@ async def test_streaming_tolerates_isolated_bad_chunks() -> None:
     def _boom_once(*args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 2:
-            raise RuntimeError("single transient chunk failure")  # ruff: ignore[raw-string-in-exception,raise-vanilla-args] — test fixture
+            raise RuntimeError("single transient chunk failure")
         return original(*args, **kwargs)
 
     srv._translate_parser_events = _boom_once  # ty: ignore[invalid-assignment] — monkey-patch for transient-failure test
     try:
-        raw: list[str] = []
-        async for piece in srv.handle_streaming(_mixed_upstream(), req):
-            raw.append(piece)
+        raw = [piece async for piece in srv.handle_streaming(_mixed_upstream(), req)]
     finally:
         srv._translate_parser_events = original
 
@@ -1393,9 +1387,7 @@ async def test_streaming_counter_resets_on_successful_chunks() -> None:
     original = srv._translate_parser_events
     srv._translate_parser_events = lambda *a, **kw: iter(())  # ty: ignore[invalid-assignment] — monkey-patch for empty-stream test
     try:
-        raw: list[str] = []
-        async for piece in srv.handle_streaming(_interleaved(), req):
-            raw.append(piece)
+        raw = [piece async for piece in srv.handle_streaming(_interleaved(), req)]
     finally:
         srv._translate_parser_events = original
 
@@ -1417,11 +1409,9 @@ async def test_streaming_emits_error_frame_on_upstream_failure() -> None:
 
     async def _exploding_upstream():
         yield {"choices": [{"delta": {"content": "partial"}}]}
-        raise RuntimeError("simulated upstream connection failure")  # ruff: ignore[raw-string-in-exception,raise-vanilla-args] — test fixture
+        raise RuntimeError("simulated upstream connection failure")
 
-    raw: list[str] = []
-    async for piece in srv.handle_streaming(_exploding_upstream(), req):
-        raw.append(piece)
+    raw = [piece async for piece in srv.handle_streaming(_exploding_upstream(), req)]
     events = _parse_sse(raw)
     types = [e["type"] for e in events]
     assert types.count("error") == 1
@@ -1447,9 +1437,7 @@ def test_emit_failure_flushes_buffered_think_content() -> None:
     tracker = srv.BlockTracker()
     exc = RuntimeError("test")
 
-    raw: list[str] = []
-    for piece in srv._emit_failure(parser, tracker, 0, exc, "test failed"):
-        raw.append(piece)
+    raw = list(srv._emit_failure(parser, tracker, 0, exc, "test failed"))
     events = _parse_sse(raw)
 
     thinking_deltas = [
@@ -1489,8 +1477,8 @@ async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
     chunks = [
-        _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"a":1}'),
-        _tool_delta_chunk(1, id="call_2", name="calc", arguments='{"b":2}'),
+        _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"a":1}'),
+        _tool_delta_chunk(1, tool_id="call_2", name="calc", arguments='{"b":2}'),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
@@ -1526,7 +1514,7 @@ async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
         "name": "calc", "description": "calc", "input_schema": {"type": "object"},
     }])
     chunks = [
-        _tool_delta_chunk(0, id="call_1", name="calc", arguments='{"x":'),
+        _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":'),
         _tool_delta_chunk(0, arguments="1}"),
         _finish_chunk("tool_calls"),
     ]
@@ -2440,11 +2428,11 @@ def test_global_extra_body_precedes_tier() -> None:
                               "max_tokens": 100,
                               "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
-        # x: tier wins over global
+        # 'x' is overridden by the tier (wins over global)
         assert out["x"] == 2
-        # y: tier-only
+        # 'y' is tier-only (not set in global)
         assert out["y"] == 3
-        # shared: global-only
+        # 'shared' comes from global (not overridden)
         assert out["shared"] == "global"
 
 
@@ -2522,7 +2510,7 @@ def test_global_section_accepts_model() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Resolver: _default_model_for_tier
+# Resolver tests
 # ---------------------------------------------------------------------------
 
 
@@ -2930,7 +2918,8 @@ def _check_non_streaming(payload: dict[str, Any], *, expect_tools: bool) -> None
     assert payload.get("type") == "message", f"type={payload.get('type')!r}"
     assert payload.get("stop_reason") in {"end_turn", "max_tokens", "tool_use", "stop_sequence", None}
     content = payload.get("content") or []
-    assert isinstance(content, list) and content, "content must be a non-empty list"
+    assert isinstance(content, list), "content must be a list"
+    assert content, "content must be non-empty"
 
     has_tool_use = any(block.get("type") == "tool_use" for block in content)
     has_text = any(block.get("type") == "text" for block in content)
@@ -2968,45 +2957,43 @@ async def run_streaming(name: str, payload: dict[str, Any]) -> bool:
     saw_done = False
 
     start = time.time()
-    async with httpx.AsyncClient(timeout=30) as client:
-        async with client.stream("POST", PROXY_URL, headers=HEADERS, json=payload) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                print(f"FAIL: HTTP {response.status_code} {body.decode('utf-8', 'replace')[:300]}")
-                return False
+    async with httpx.AsyncClient(timeout=30) as client, client.stream("POST", PROXY_URL, headers=HEADERS, json=payload) as response:
+        if response.status_code != 200:
+            body = await response.aread()
+            print(f"FAIL: HTTP {response.status_code} {body.decode('utf-8', 'replace')[:300]}")
+            return False
 
-            buffer = ""
-            async for chunk in response.aiter_text():
-                buffer += chunk
-                while "\n\n" in buffer:
-                    event, buffer = buffer.split("\n\n", 1)
-                    if not event.strip():
-                        continue
-                    data_lines = [
-                        line[len("data: "):]
-                        for line in event.splitlines()
-                        if line.startswith("data: ")
-                    ]
-                    if not data_lines:
-                        continue
-                    data_str = "".join(data_lines)
-                    if data_str == "[DONE]":
-                        saw_done = True
-                        continue
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    event_type = data.get("type")
-                    if event_type:
-                        event_types.add(event_type)
-                    if event_type == "content_block_delta":
-                        delta = data.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text_content += delta.get("text", "")
-                    if event_type == "content_block_start":
-                        if (data.get("content_block") or {}).get("type") == "tool_use":
-                            saw_tool_use = True
+        buffer = ""
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            while "\n\n" in buffer:
+                event, buffer = buffer.split("\n\n", 1)
+                if not event.strip():
+                    continue
+                data_lines = [
+                    line[len("data: "):]
+                    for line in event.splitlines()
+                    if line.startswith("data: ")
+                ]
+                if not data_lines:
+                    continue
+                data_str = "".join(data_lines)
+                if data_str == "[DONE]":
+                    saw_done = True
+                    continue
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                event_type = data.get("type")
+                if event_type:
+                    event_types.add(event_type)
+                if event_type == "content_block_delta":
+                    delta = data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text_content += delta.get("text", "")
+                if event_type == "content_block_start" and (data.get("content_block") or {}).get("type") == "tool_use":
+                    saw_tool_use = True
 
     elapsed = time.time() - start
     print(f"stream finished in {elapsed:.2f}s, events={sorted(event_types)}, text_len={len(text_content)}")
