@@ -26,31 +26,39 @@ exclude = ["vulture_whitelist.py"]
 
 [tool.ruff.lint]
 preview = true
-# Active rule set. Commented-out categories below are intentionally disabled
-# with a rationale — uncomment when ready.
+# Active rule set. Categories below are kept enabled even when they don't
+# currently fire (so future code that triggers them is caught). Categories
+# in the commented block at the bottom are intentionally disabled — see the
+# rationale on each line for when to flip them back on.
 select = [
     "A",     # builtin shadowing
+    "ASYNC", # flake8-async
     "B",     # bugbear
     "BLE",   # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
     "C4",    # comprehensions
     "COM",   # commas
+    "DTZ",   # flake8-datetimez
     "E",     # pycodestyle errors
     "EM",    # exception messages
     "ERA",   # commented-out-code
+    "EXE",   # executable
     "F",     # pyflakes
     "FA",    # flake8-future-annotations
-    "FLY",   # flynt — f-string conversions
-    "FURB",  # refurb — caught 1 if/else→or
-    "G",     # logging — caught lazy-f-string issues
+    "FIX",   # flake8-fixme
+    "FLY",   # flynt
+    "FURB",  # refurb
+    "G",     # logging
     "I",     # isort
     "ICN",   # flake8-import-conventions
+    "INP",   # flake8-no-pep420
+    "INT",   # flake8-gettext
     "ISC",   # implicit string concat
     "LOG",   # flake8-logging
     "PERF",  # perflint
     "PGH",   # pygrep-hooks
     "PIE",   # flake8-pie
     "PT",    # pytest-style (per-file-ignored on server.py; enabled in tests.py)
-    "PTH",   # pathlib — caught os.path uses
+    "PTH",   # pathlib
     "Q",     # quotes
     "RET",   # return-statement
     "RSE",   # flake8-raise
@@ -58,7 +66,9 @@ select = [
     "S",     # flake8-bandit
     "SIM",   # simplify
     "SLF",   # private-member-access (allowed via per-file-ignores in tests.py)
+    "SLOT",  # flake8-slots
     "TCH",   # flake8-type-checking
+    "TD",    # flake8-todos
     "TID",   # flake8-tidy-imports
     "TRY",   # tryceratops
     "UP",    # pyupgrade
@@ -66,19 +76,11 @@ select = [
     # --- below: categories commented out by triage. Uncomment to enable ---
     # "ANN",   # flake8-annotations — would force annotations on @override mirror methods; add case-by-case
     # "ARG",   # flake8-unused-arguments — ARG001 fires on mirror signatures; use the specific `unused-function-argument` ignore below instead
-    # "ASYNC", # flake8-async — no async-specific findings in this codebase
     # "C90",   # mccabe (max-complexity=10) — handle_streaming is intentionally long; refactor separately before enabling
     # "D",     # pydocstyle — would force docstrings on every Pydantic validator / helper / @override mirror; add case-by-case
     # "DOC",   # pydocstyle-docstring — subset of D; same rationale
-    # "DTZ",   # flake8-datetimez — no datetime usage in this codebase
-    # "EXE",   # executable — shebang handling
-    # "FIX",   # flake8-fixme — no FIXME/TODO/XXX blocks
-    # "INP",   # flake8-no-pep420 — no implicit namespace packages
-    # "INT",   # flake8-gettext — no i18n usage
     # "N",     # pep8-naming — N805 fires on Pydantic @field_validator (uses `cls`); if re-enabled, configure `classmethod-decorators = ["field_validator", "model_validator"]`
     # "PL",    # Pylint (PLR0911-0917, PLR1702, PLW*) — too-many-* are refactoring opportunities on handle_streaming; revisit when refactored
-    # "SLOT",  # flake8-slots — no class slots design
-    # "TD",    # flake8-todos — duplicate of FIX
 ]
 # False positives / intentional suppressions.
 ignore = [
