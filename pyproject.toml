@@ -27,9 +27,7 @@ exclude = ["vulture_whitelist.py"]
 [tool.ruff.lint]
 preview = true
 # Active rule set. Commented-out categories below are intentionally disabled
-# with a rationale — uncomment when ready. Each entry mirrors the user's
-# original broad proposal; only the most verbose / refactor-out-of-scope
-# categories are turned off.
+# with a rationale — uncomment when ready.
 select = [
     "A",     # builtin shadowing
     "B",     # bugbear
@@ -43,7 +41,7 @@ select = [
     "FA",    # flake8-future-annotations
     "FLY",   # flynt — f-string conversions
     "FURB",  # refurb — caught 1 if/else→or
-    "G",     # logging — caught 32 lazy-f-string issues
+    "G",     # logging — caught lazy-f-string issues
     "I",     # isort
     "ICN",   # flake8-import-conventions
     "ISC",   # implicit string concat
@@ -52,7 +50,7 @@ select = [
     "PGH",   # pygrep-hooks
     "PIE",   # flake8-pie
     "PT",    # pytest-style (per-file-ignored on server.py; enabled in tests.py)
-    "PTH",   # pathlib — caught 4 os.path uses
+    "PTH",   # pathlib — caught os.path uses
     "Q",     # quotes
     "RET",   # return-statement
     "RSE",   # flake8-raise
@@ -66,20 +64,20 @@ select = [
     "UP",    # pyupgrade
     "W",     # pycodestyle warnings
     # --- below: categories commented out by triage. Uncomment to enable ---
-    # "ANN",   # flake8-annotations — 96 hits, mostly on @override mirror methods where ty already forbids renaming params; add case-by-case, not blanket-enforce
-    # "ARG",   # flake8-unused-arguments — ARG001 fires on mirror signatures; instead, specific `unused-function-argument` ignore below
+    # "ANN",   # flake8-annotations — would force annotations on @override mirror methods; add case-by-case
+    # "ARG",   # flake8-unused-arguments — ARG001 fires on mirror signatures; use the specific `unused-function-argument` ignore below instead
     # "ASYNC", # flake8-async — no async-specific findings in this codebase
     # "C90",   # mccabe (max-complexity=10) — handle_streaming is intentionally long; refactor separately before enabling
-    # "D",     # pydocstyle — 84 hits on server.py, would force adding docstrings to every Pydantic validator / helper / @override mirror; docstrings added case-by-case, not blanket-enforce
+    # "D",     # pydocstyle — would force docstrings on every Pydantic validator / helper / @override mirror; add case-by-case
     # "DOC",   # pydocstyle-docstring — subset of D; same rationale
     # "DTZ",   # flake8-datetimez — no datetime usage in this codebase
-    # "EXE",   # executable — shebang handling; no findings
-    # "FIX",   # flake8-fixme — no FIXME/TODO/XXX blocks in production code
+    # "EXE",   # executable — shebang handling
+    # "FIX",   # flake8-fixme — no FIXME/TODO/XXX blocks
     # "INP",   # flake8-no-pep420 — no implicit namespace packages
     # "INT",   # flake8-gettext — no i18n usage
     # "N",     # pep8-naming — N805 fires on Pydantic @field_validator (uses `cls`); if re-enabled, configure `classmethod-decorators = ["field_validator", "model_validator"]`
-    # "PL",    # Pylint (PLR0911-0917, PLR1702, PLW*) — too-many-* are refactoring opportunities on handle_streaming; revisit when that gets refactored
-    # "SLOT",  # flake8-slots — no class slots design; out of scope
+    # "PL",    # Pylint (PLR0911-0917, PLR1702, PLW*) — too-many-* are refactoring opportunities on handle_streaming; revisit when refactored
+    # "SLOT",  # flake8-slots — no class slots design
     # "TD",    # flake8-todos — duplicate of FIX
 ]
 # False positives / intentional suppressions.
@@ -104,10 +102,10 @@ known-first-party = ["server", "tests"]
 # Test-context suppressions. The same select list applies to tests.py as to
 # server.py; these rules fire on patterns that are intentional in tests.
 "tests.py" = [
-    "assert",                       # S101 — asserts are the test pattern (337 hits)
-    "private-member-access",        # SLF001 — tests poke srv._internal for monkey-patches (104 hits)
+    "assert",                       # S101 — asserts are the test pattern
+    "private-member-access",        # SLF001 — tests poke srv._internal for monkey-patches
     "unused-async",                 # RUF029 — async generators (no `await`, `yield` only) — test fixture pattern
-    "float-equality-comparison",    # RUF069 — float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic (14 hits)
+    "float-equality-comparison",    # RUF069 — float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic
     "module-import-not-at-top-of-file",   # E402 — `import server as srv` is intentionally after `load_dotenv()` so env vars are loaded before server reads them at import time
 ]
 
