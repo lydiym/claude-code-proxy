@@ -516,6 +516,7 @@ if not OPENAI_TLS_VERIFY:
 MAX_OUTPUT_TOKENS = 16384
 
 DEFAULT_PORT = 8082
+DEFAULT_HOST = "127.0.0.1"
 
 MSG_ID_HEX_LEN = 24
 
@@ -1927,4 +1928,4 @@ async def root() -> dict[str, str]:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=DEFAULT_PORT)
+    uvicorn.run(app, host=os.environ.get("HOST", DEFAULT_HOST), port=DEFAULT_PORT)

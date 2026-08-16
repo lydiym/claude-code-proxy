@@ -82,7 +82,6 @@ select = [
 ]
 # False positives / intentional suppressions.
 ignore = [
-    "hardcoded-bind-all-interfaces",
     "blind-except",           # top-level error wrappers intentionally catch everything; per-call catches narrow where the exception type is known
     "any-type",               # `get_field` is duck-typed (dict | object) and propagates `Any`; typing it as `object` cascades into cast() at every call site.
     "EM",                     # user prefers `raise X("msg")` inline — EM (raw/f-string/dot-format in exception) flags exactly that
