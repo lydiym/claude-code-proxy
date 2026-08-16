@@ -26,57 +26,68 @@ exclude = ["vulture_whitelist.py"]
 
 [tool.ruff.lint]
 preview = true
-# Curated strict set: high-signal rules from Bugbear, pycodestyle, pyflakes,
-# pyupgrade, and the categories the max-strict triage surfaced as
-# high-value (G=logging, PTH=pathlib, FURB=refurb, BLE=blind-except).
-# Pedantic / verbose categories (D=docstring, ANN=annotations, PL/C90/Pylint
-# refactor, N=naming, N805=Pydantic cls, FBT, PT=pytest-style, COM) stay
-# disabled to avoid noisy rewrites of working code. Docstrings/annotations
-# are added case-by-case, not blanket-enforced.
+# Active rule set. Commented-out categories below are intentionally disabled
+# with a rationale — uncomment when ready. Each entry mirrors the user's
+# original broad proposal; only the most verbose / refactor-out-of-scope
+# categories are turned off.
 select = [
-    "A",    # builtin shadowing
-    "B",    # bugbear
-    "BLE",  # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
-    "C4",   # comprehensions
-    "COM",  # commas
-    "E",    # pycodestyle errors
-    "EM",   # exception messages
-    "ERA",  # commented-out-code
-    "EXE",  # executable
-    "F",    # pyflakes
-    "FA",   # flake8-future-annotations
-    "FLY",  # flynt — f-string conversions
-    "FURB", # refurb — caught 1 if/else→or
-    "G",    # logging — caught 32 lazy-f-string issues
-    "I",    # isort
-    "ICN",  # flake8-import-conventions
-    "ISC",  # implicit string concat
-    "LOG",  # flake8-logging
-    "PERF", # perflint
-    "PGH",  # pygrep-hooks
-    "PIE",  # flake8-pie
-    "PT",   # pytest-style (applied via per-file-ignores on non-test files)
-    "PTH",  # pathlib — caught 4 os.path uses
-    "Q",    # quotes
-    "RET",  # return-statement
-    "RSE",  # flake8-raise
-    "RUF",  # ruff-specific
-    "S",    # flake8-bandit
-    "SIM",  # simplify
-    "SLF",  # private-member-access (allowed via per-file-ignores in tests.py)
-    "TCH",  # flake8-type-checking
-    "TID",  # flake8-tidy-imports
-    "TRY",  # tryceratops
-    "UP",   # pyupgrade
-    "W",    # pycodestyle warnings
+    "A",     # builtin shadowing
+    "B",     # bugbear
+    "BLE",   # blind-except: catches `except Exception:` not gated by `_debug_*` helpers
+    "C4",    # comprehensions
+    "COM",   # commas
+    "E",     # pycodestyle errors
+    "EM",    # exception messages
+    "ERA",   # commented-out-code
+    "F",     # pyflakes
+    "FA",    # flake8-future-annotations
+    "FLY",   # flynt — f-string conversions
+    "FURB",  # refurb — caught 1 if/else→or
+    "G",     # logging — caught 32 lazy-f-string issues
+    "I",     # isort
+    "ICN",   # flake8-import-conventions
+    "ISC",   # implicit string concat
+    "LOG",   # flake8-logging
+    "PERF",  # perflint
+    "PGH",   # pygrep-hooks
+    "PIE",   # flake8-pie
+    "PT",    # pytest-style (per-file-ignored on server.py; enabled in tests.py)
+    "PTH",   # pathlib — caught 4 os.path uses
+    "Q",     # quotes
+    "RET",   # return-statement
+    "RSE",   # flake8-raise
+    "RUF",   # ruff-specific
+    "S",     # flake8-bandit
+    "SIM",   # simplify
+    "SLF",   # private-member-access (allowed via per-file-ignores in tests.py)
+    "TCH",   # flake8-type-checking
+    "TID",   # flake8-tidy-imports
+    "TRY",   # tryceratops
+    "UP",    # pyupgrade
+    "W",     # pycodestyle warnings
+    # --- below: categories commented out by triage. Uncomment to enable ---
+    # "ANN",   # flake8-annotations — 96 hits, mostly on @override mirror methods where ty already forbids renaming params; add case-by-case, not blanket-enforce
+    # "ARG",   # flake8-unused-arguments — ARG001 fires on mirror signatures; instead, specific `unused-function-argument` ignore below
+    # "ASYNC", # flake8-async — no async-specific findings in this codebase
+    # "C90",   # mccabe (max-complexity=10) — handle_streaming is intentionally long; refactor separately before enabling
+    # "D",     # pydocstyle — 84 hits on server.py, would force adding docstrings to every Pydantic validator / helper / @override mirror; docstrings added case-by-case, not blanket-enforce
+    # "DOC",   # pydocstyle-docstring — subset of D; same rationale
+    # "DTZ",   # flake8-datetimez — no datetime usage in this codebase
+    # "EXE",   # executable — shebang handling; no findings
+    # "FIX",   # flake8-fixme — no FIXME/TODO/XXX blocks in production code
+    # "INP",   # flake8-no-pep420 — no implicit namespace packages
+    # "INT",   # flake8-gettext — no i18n usage
+    # "N",     # pep8-naming — N805 fires on Pydantic @field_validator (uses `cls`); if re-enabled, configure `classmethod-decorators = ["field_validator", "model_validator"]`
+    # "PL",    # Pylint (PLR0911-0917, PLR1702, PLW*) — too-many-* are refactoring opportunities on handle_streaming; revisit when that gets refactored
+    # "SLOT",  # flake8-slots — no class slots design; out of scope
+    # "TD",    # flake8-todos — duplicate of FIX
 ]
 # False positives / intentional suppressions.
 ignore = [
-    "hardcoded-bind-all-interfaces",   # dev-server default (0.0.0.0)
-    "unused-function-argument",        # `_get_encoding`/`_encoding_for_model`/`_configure_logging` mirror upstream signatures
-    "raise-vanilla-args",   # raise-vanilla-args — user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
-    "raw-string-in-exception",    # raw-string-in-exception — same reason as TRY003
-    "magic-value-comparison",  # magic-value-comparison — better per-file (tests verify TOML-roundtrip exact floats, not FP arithmetic)
+    "hardcoded-bind-all-interfaces",   # S104 — dev-server default (0.0.0.0)
+    "unused-function-argument",        # ARG001 — `_get_encoding`/`_encoding_for_model`/`_configure_logging` mirror upstream signatures
+    "raise-vanilla-args",              # TRY003 — user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
+    "raw-string-in-exception",         # EM101 — same reason as TRY003
 ]
 
 [tool.ruff.lint.mccabe]
@@ -93,11 +104,11 @@ known-first-party = ["server", "tests"]
 # Test-context suppressions. The same select list applies to tests.py as to
 # server.py; these rules fire on patterns that are intentional in tests.
 "tests.py" = [
-    "assert",                       # asserts are the test pattern (337 hits)
-    "private-member-access",        # tests poke srv._internal for monkey-patches
-    "unused-async",                 # async generators (no `await`, `yield` only) — test fixture pattern
-    "float-equality-comparison",    # float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic
-    "module-import-not-at-top-of-file",   # `import server as srv` is intentionally after `load_dotenv()` so env vars are loaded before server reads them at import time
+    "assert",                       # S101 — asserts are the test pattern (337 hits)
+    "private-member-access",        # SLF001 — tests poke srv._internal for monkey-patches (104 hits)
+    "unused-async",                 # RUF029 — async generators (no `await`, `yield` only) — test fixture pattern
+    "float-equality-comparison",    # RUF069 — float == on TOML-parsed config values — verifies parser fidelity, not FP arithmetic (14 hits)
+    "module-import-not-at-top-of-file",   # E402 — `import server as srv` is intentionally after `load_dotenv()` so env vars are loaded before server reads them at import time
 ]
 
 [tool.ty.environment]
