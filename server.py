@@ -839,23 +839,39 @@ class _ThinkStreamParser:
 
 
 def _parse_tool_result_content(content: object) -> str:
-    if content is None:
-        return "No content provided"
+    """Normalise a tool_result ``content`` field into a plain string.
 
-    if isinstance(content, str):
-        return content
+    Anthropic allows None, str, list of blocks, or a single dict (sometimes
+    ``{"type": "text", ...}``). We stringify whatever shape we get so the
+    model sees prose rather than a raw JSON blob.
+    """
+    match content:
+        case None:
+            return "No content provided"
+        case str():
+            return content
+        case list():
+            return _join_tool_result_items(content).strip()
+        case dict() as d:
+            return _parse_tool_result_dict(d)
+        case _:
+            return _str_or_unparseable(content)
 
-    if isinstance(content, list):
-        return _join_tool_result_items(content).strip()
 
-    if isinstance(content, dict):
-        if content.get("type") == "text":
-            return content.get("text", "")
-        try:
-            return json.dumps(content)
-        except (TypeError, ValueError):
-            return str(content)
+def _parse_tool_result_dict(content: dict[str, object]) -> str:
+    """Render a dict-shaped tool_result content.
 
+    Prefers ``text`` field, falls back to JSON, then to ``str()``.
+    """
+    if content.get("type") == "text":
+        return str(content.get("text", ""))
+    try:
+        return json.dumps(content)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _str_or_unparseable(content: object) -> str:
     try:
         return str(content)
     except (TypeError, ValueError):
@@ -1528,28 +1544,38 @@ def _emit_failure(
     yield _SseFormatter.done()
 
 
-def _log_request(
-    method: str,
-    path: str,
-    source_model: str,
-    target_model: str,
-    tier: str | None,
-    num_messages: int,
-    num_tools: int,
-    status_code: int,
-) -> None:
-    endpoint = path.split("?", 1)[0] if "?" in path else path
-    status_color = _Colors.GREEN if status_code == STATUS_OK else _Colors.RED
-    tier_str = f" tier={_color(_Colors.YELLOW, tier)}" if tier else ""
+@dataclass
+class _LogContext:
+    """Per-request fields needed to format the ``log_request`` line.
+
+    A dataclass beats 8 positional args when callers span many sites and the
+    field set is stable.
+    """
+
+    method: str
+    path: str
+    source_model: str
+    target_model: str
+    tier: str | None
+    num_messages: int
+    num_tools: int
+    status_code: int
+
+
+def _log_request(ctx: _LogContext) -> None:
+    """Emit the per-request log line. Pure formatter — no side effects beyond ``logger.info``."""
+    endpoint = ctx.path.split("?", 1)[0] if "?" in ctx.path else ctx.path
+    status_color = _Colors.GREEN if ctx.status_code == STATUS_OK else _Colors.RED
+    tier_str = f" tier={_color(_Colors.YELLOW, ctx.tier)}" if ctx.tier else ""
     line = (
-        f"{_color(_Colors.BOLD, method)} {_color(_Colors.BOLD, endpoint)} "
-        f"{_color(status_color, status_code)} "
-        f"{_color(_Colors.CYAN, _short_model(source_model))} "
+        f"{_color(_Colors.BOLD, ctx.method)} {_color(_Colors.BOLD, endpoint)} "
+        f"{_color(status_color, ctx.status_code)} "
+        f"{_color(_Colors.CYAN, _short_model(ctx.source_model))} "
         f"{_color(_Colors.BOLD, '→')} "
-        f"{_color(_Colors.GREEN, _short_model(target_model))}"
+        f"{_color(_Colors.GREEN, _short_model(ctx.target_model))}"
         f"{tier_str} "
-        f"({_color(_Colors.MAGENTA, f'{num_tools} tools')}, "
-        f"{_color(_Colors.BLUE, f'{num_messages} messages')})"
+        f"({_color(_Colors.MAGENTA, f'{ctx.num_tools} tools')}, "
+        f"{_color(_Colors.BLUE, f'{ctx.num_messages} messages')})"
     )
     logger.info(line)
 
@@ -1880,14 +1906,16 @@ async def _handle_request(request: MessagesRequest) -> MessagesResponse | Stream
     litellm_request = _prepare_litellm_request(request)
     _log_upstream_params_debug(litellm_request)
     _log_request(
-        "POST",
-        "/v1/messages",
-        request.original_model or "unknown",
-        litellm_request.get("model", "unknown"),
-        request.tier,
-        len(litellm_request["messages"]),
-        len(request.tools) if request.tools else 0,
-        STATUS_OK,
+        _LogContext(
+            "POST",
+            "/v1/messages",
+            request.original_model or "unknown",
+            litellm_request.get("model", "unknown"),
+            request.tier,
+            len(litellm_request["messages"]),
+            len(request.tools) if request.tools else 0,
+            STATUS_OK,
+        ),
     )
 
     if request.stream:

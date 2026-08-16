@@ -93,11 +93,11 @@ ignore = [
 max-complexity = 10
 
 [tool.ruff.lint.pylint]
-max-branches = 15
-max-returns = 10
-max-args = 8
-max-positional-args = 8
-max-statements = 60
+max-branches = 12
+max-returns = 6
+max-args = 5
+max-positional-args = 5
+max-statements = 50
 
 [tool.ruff.lint.pep8-naming]
 # Pydantic validators/methods use `cls`, not `self`. Tell N805 the
