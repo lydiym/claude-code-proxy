@@ -74,7 +74,6 @@ select = [
     "PL",    # Pylint
     "W",     # pycodestyle warnings
     # --- below: intentionally disabled. Uncomment to enable. ---
-    # "C90",   # mccabe
     # "D",     # pydocstyle
     # "DOC",   # pydocstyle-docstring
 ]

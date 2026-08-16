@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 from collections.abc import AsyncGenerator, Callable, Iterator
+from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
 import httpx
@@ -133,29 +134,36 @@ def _parse_sse(raw_chunks: list[str]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for raw in raw_chunks:
         for block in raw.split("\n\n"):
-            if not block.strip():
-                continue
-            event_type: str | None = None
-            data_lines: list[str] = []
-            for line in block.splitlines():
-                if line.startswith("event: "):
-                    event_type = line[len("event: "):]
-                elif line.startswith("data: "):
-                    data_lines.append(line[len("data: "):])
-            if not data_lines:
-                continue
-            payload = "".join(data_lines)
-            if payload == "[DONE]":
-                events.append({"type": "[DONE]"})
-                continue
-            try:
-                parsed = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            if event_type and "type" not in parsed:
-                parsed = {"type": event_type, **parsed}
-            events.append(parsed)
+            event = _parse_sse_block(block)
+            if event is not None:
+                events.append(event)
     return events
+
+
+def _parse_sse_block(block: str) -> dict[str, Any] | None:
+    """Parse one ``event:\\ndata:\\n\\n`` block; return None to skip (empty
+    block, no data line, malformed JSON)."""
+    if not block.strip():
+        return None
+    event_type: str | None = None
+    data_lines: list[str] = []
+    for line in block.splitlines():
+        if line.startswith("event: "):
+            event_type = line[len("event: "):]
+        elif line.startswith("data: "):
+            data_lines.append(line[len("data: "):])
+    if not data_lines:
+        return None
+    payload = "".join(data_lines)
+    if payload == "[DONE]":
+        return {"type": "[DONE]"}
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if event_type and "type" not in parsed:
+        parsed = {"type": event_type, **parsed}
+    return parsed
 
 
 async def _run_stream(chunks: list[Any], req: srv.MessagesRequest) -> list[dict[str, Any]]:
@@ -2949,13 +2957,21 @@ async def run_non_streaming(name: str, payload: dict[str, Any]) -> bool:
     return True
 
 
-async def run_streaming(name: str, payload: dict[str, Any]) -> bool:  # ruff: ignore[too-many-locals] — streaming-event assertions naturally track many flags
+@dataclass
+class _StreamAgg:
+    """Aggregated state from consuming an SSE stream: set of seen event
+    types, accumulated text, whether a tool_use block opened, whether
+    [DONE] arrived. Lives only as long as one integration scenario."""
+    event_types: set[str] = field(default_factory=set)
+    text_content: str = ""
+    saw_tool_use: bool = False
+    saw_done: bool = False
+
+
+async def run_streaming(name: str, payload: dict[str, Any]) -> bool:
+    """Run one streaming integration scenario end-to-end and print pass/fail."""
     print(f"\n--- {name} (streaming) ---")
     payload = {**payload, "stream": True}
-    event_types: set[str] = set()
-    text_content = ""
-    saw_tool_use = False
-    saw_done = False
 
     start = time.time()
     async with httpx.AsyncClient(timeout=30) as client, client.stream("POST", PROXY_URL, headers=HEADERS, json=payload) as response:
@@ -2963,56 +2979,74 @@ async def run_streaming(name: str, payload: dict[str, Any]) -> bool:  # ruff: ig
             body = await response.aread()
             print(f"FAIL: HTTP {response.status_code} {body.decode('utf-8', 'replace')[:300]}")
             return False
-
-        buffer = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n\n" in buffer:
-                event, buffer = buffer.split("\n\n", 1)
-                if not event.strip():
-                    continue
-                data_lines = [
-                    line[len("data: "):]
-                    for line in event.splitlines()
-                    if line.startswith("data: ")
-                ]
-                if not data_lines:
-                    continue
-                data_str = "".join(data_lines)
-                if data_str == "[DONE]":
-                    saw_done = True
-                    continue
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-                event_type = data.get("type")
-                if event_type:
-                    event_types.add(event_type)
-                if event_type == "content_block_delta":
-                    delta = data.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        text_content += delta.get("text", "")
-                if event_type == "content_block_start" and (data.get("content_block") or {}).get("type") == "tool_use":
-                    saw_tool_use = True
+        agg = await _collect_stream_events(response)
 
     elapsed = time.time() - start
-    print(f"stream finished in {elapsed:.2f}s, events={sorted(event_types)}, text_len={len(text_content)}")
+    print(f"stream finished in {elapsed:.2f}s, events={sorted(agg.event_types)}, text_len={len(agg.text_content)}")
 
-    missing = REQUIRED_EVENT_TYPES - event_types
+    return _assert_streaming_ok(payload, agg)
+
+
+async def _collect_stream_events(response: httpx.Response) -> _StreamAgg:
+    """Buffer the SSE stream and aggregate into a _StreamAgg."""
+    agg = _StreamAgg()
+    buffer = ""
+    async for chunk in response.aiter_text():
+        buffer += chunk
+        while "\n\n" in buffer:
+            event, buffer = buffer.split("\n\n", 1)
+            if not event.strip():
+                continue
+            data_str = _extract_sse_data(event)
+            if data_str is None:
+                continue
+            if data_str == "[DONE]":
+                agg.saw_done = True
+                continue
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            _record_stream_event(data, agg)
+    return agg
+
+
+def _record_stream_event(data: dict[str, Any], agg: _StreamAgg) -> None:
+    """Apply one parsed SSE event to the aggregator (in-place)."""
+    event_type = data.get("type")
+    if event_type:
+        agg.event_types.add(event_type)
+    if event_type == "content_block_delta":
+        delta = data.get("delta", {})
+        if delta.get("type") == "text_delta":
+            agg.text_content += delta.get("text", "")
+    if event_type == "content_block_start" and (data.get("content_block") or {}).get("type") == "tool_use":
+        agg.saw_tool_use = True
+
+
+def _extract_sse_data(event_block: str) -> str | None:
+    """Concatenate ``data: <line>`` lines from a single SSE event block;
+    return None for blocks with no data line."""
+    data_lines = [line[len("data: "):] for line in event_block.splitlines() if line.startswith("data: ")]
+    if not data_lines:
+        return None
+    return "".join(data_lines)
+
+
+def _assert_streaming_ok(payload: dict[str, Any], agg: _StreamAgg) -> bool:
+    missing = REQUIRED_EVENT_TYPES - agg.event_types
     if missing:
         print(f"FAIL: missing event types: {missing}")
         return False
-    if not saw_done:
+    if not agg.saw_done:
         print("FAIL: no [DONE] sentinel")
         return False
-    if "tools" in payload and not saw_tool_use:
+    if "tools" in payload and not agg.saw_tool_use:
         print("FAIL: expected a tool_use block in streaming response")
         return False
-    if "tools" not in payload and not text_content:
+    if "tools" not in payload and not agg.text_content:
         print("FAIL: expected text content in streaming response")
         return False
-
     print("OK")
     return True
 

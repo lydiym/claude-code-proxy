@@ -295,21 +295,27 @@ def _load_config(path: str) -> dict[str, Any]:
             logger.warning("[%s] must be a table, got %s; ignoring", section, type(body).__name__)
             continue
         if section == "proxy":
-            allowed = _PROXY_KEYS
-            for k, v in body.items():
-                if k not in allowed:
-                    logger.warning("[%s].%s is not a recognised key; ignoring", section, k)
-                    continue
-                coerced = _coerce_proxy_value(k, v, section)
-                if coerced is _COERCE_DROP:
-                    continue
-                out["proxy"][k] = coerced
+            out["proxy"] = _parse_proxy_section(body)
         elif section in {"big", "small"}:
             out[section] = _parse_bucket_section(body, section)
         elif section == "global":
             out["global"] = _parse_tier_section(body, section)
         else:  # per-tier section
             out["tiers"][section] = _parse_bucket_section(body, section)
+    return out
+
+
+def _parse_proxy_section(body: dict[str, object]) -> dict[str, object]:
+    """Pick out the keys we recognise from [proxy]; warn and skip the rest."""
+    out: dict[str, object] = {}
+    for k, v in body.items():
+        if k not in _PROXY_KEYS:
+            logger.warning("[proxy].%s is not a recognised key; ignoring", k)
+            continue
+        coerced = _coerce_proxy_value(k, v, "proxy")
+        if coerced is _COERCE_DROP:
+            continue
+        out[k] = coerced
     return out
 
 
@@ -373,42 +379,51 @@ def _default_model_for_tier(tier: str | None) -> str:
     Live edits to [tier].extra_body still take effect via the per-call
     _resolve_tier_config.
     """
-    if tier == "haiku":
-        bucket = "small"
-    elif tier is None:
-        bucket = None
-    else:
-        bucket = "big"
+    bucket = _bucket_for_tier(tier)
     built_in = "gpt-4.1-mini" if bucket == "small" else "gpt-4.1"
 
     if tier:
-        env_val = os.environ.get(f"{tier.upper()}_MODEL")
-        if env_val not in {None, ""}:
+        env_val = _env_nonempty(f"{tier.upper()}_MODEL")
+        if env_val is not None:
             return env_val
-    if bucket:
-        bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
-        env_val = os.environ.get(bucket_env)
-        if env_val not in {None, ""}:
-            return env_val
-    else:
-        # tier=None: no specific bucket; treat as "big" for env lookup so BIG_MODEL
-        # still applies (and SMALL_MODEL would be wrong here).
-        env_val = os.environ.get("BIG_MODEL")
-        if env_val not in {None, ""}:
-            return env_val
+    bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
+    env_val = _env_nonempty(bucket_env)
+    if env_val is not None:
+        return env_val
 
     if tier:
-        tier_cfg = (CONFIG.get("tiers") or {}).get(tier) or {}
-        if isinstance(tier_cfg.get("model"), str) and tier_cfg["model"]:
-            return tier_cfg["model"]
+        cfg_model = _config_model((CONFIG.get("tiers") or {}).get(tier) or {})
+        if cfg_model is not None:
+            return cfg_model
     if bucket:
-        bucket_cfg = CONFIG.get(bucket) or {}
-        if isinstance(bucket_cfg.get("model"), str) and bucket_cfg["model"]:
-            return bucket_cfg["model"]
-    global_cfg = CONFIG.get("global") or {}
-    if isinstance(global_cfg.get("model"), str) and global_cfg["model"]:
-        return global_cfg["model"]
+        cfg_model = _config_model(CONFIG.get(bucket) or {})
+        if cfg_model is not None:
+            return cfg_model
+    cfg_model = _config_model(CONFIG.get("global") or {})
+    if cfg_model is not None:
+        return cfg_model
     return built_in
+
+
+def _bucket_for_tier(tier: str | None) -> str | None:
+    """haiku → small; any other named tier → big; tier=None → None.
+    Returns None for tier=None so an unmapped model skips the bucket config
+    lookup and falls through to [global].model (the catch-all)."""
+    if tier == "haiku":
+        return "small"
+    if tier is None:
+        return None
+    return "big"
+
+
+def _env_nonempty(name: str) -> str | None:
+    val = os.environ.get(name) if name else None
+    return val or None
+
+
+def _config_model(section: dict[str, object]) -> str | None:
+    val = section.get("model")
+    return val if isinstance(val, str) and val else None
 
 
 class Colors:
@@ -1069,8 +1084,20 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     if anthropic_request.tool_choice:
         litellm_request["tool_choice"] = convert_tool_choice(anthropic_request.tool_choice)
 
-    # Forward sampling fields only if the client sent them; None means
-    # "use the upstream's own default" rather than MessagesRequest's.
+    _apply_sampling_fields(litellm_request, anthropic_request)
+
+    # Tier config applied after client sampling fields → config wins per leaf.
+    # Client extra_body merged in before tier extra_body → config wins there too.
+    tier_cfg = _resolve_tier_config(anthropic_request)
+    if "seed" in tier_cfg:
+        litellm_request["seed"] = tier_cfg["seed"]
+    _apply_merged_extra_body(litellm_request, anthropic_request, tier_cfg)
+    return litellm_request
+
+
+def _apply_sampling_fields(litellm_request: dict[str, Any], anthropic_request: MessagesRequest) -> None:
+    """Forward sampling fields only if the client sent them; None means
+    "use the upstream's own default" rather than MessagesRequest's default."""
     fields_set = anthropic_request.model_fields_set
     if "temperature" in fields_set and anthropic_request.temperature is not None:
         litellm_request["temperature"] = anthropic_request.temperature
@@ -1081,12 +1108,17 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     if "stop_sequences" in fields_set and anthropic_request.stop_sequences:
         litellm_request["stop"] = anthropic_request.stop_sequences
 
-    # Tier config applied after client sampling fields → config wins per leaf.
-    # Client extra_body merged in before tier extra_body → config wins there too.
-    tier_cfg = _resolve_tier_config(anthropic_request)
-    if "seed" in tier_cfg:
-        litellm_request["seed"] = tier_cfg["seed"]
 
+def _apply_merged_extra_body(
+    litellm_request: dict[str, Any],
+    anthropic_request: MessagesRequest,
+    tier_cfg: dict[str, Any],
+) -> None:
+    """Merge client extra_body under tier extra_body (config wins per leaf);
+    lift every key to top-level kwargs on the upstream call and publish the
+    whitelist twice — top-level so litellm extends supported_params
+    (utils.py:3877), and inside extra_body so cascade proxies forward vendor
+    keys instead of filtering them (openai_like/chat/handler.py:241,254-259)."""
     merged_extra: dict[str, Any] = {}
     if anthropic_request.extra_body:
         merged_extra = _deep_merge(merged_extra, anthropic_request.extra_body)
@@ -1100,15 +1132,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
             continue
         litellm_request[k] = v
 
-    # Publish whitelist twice: top-level extends litellm's supported_params
-    # (utils.py:3877); inside extra_body lands in the wire body so cascade
-    # proxies forward vendor keys instead of filtering them.
     if merged_extra:
         keys = list(merged_extra.keys())
         litellm_request["allowed_openai_params"] = keys
         litellm_request["extra_body"] = {"allowed_openai_params": keys}
-
-    return litellm_request
 
 
 def _first_choice(response: object) -> object:
