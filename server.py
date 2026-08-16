@@ -348,8 +348,7 @@ logger.warning(
 def _proxy_value(key: str, env_name: str, default: object = None) -> object:
     """Env var → CONFIG[proxy][key] → default. None / "" fall through."""
     if key not in _PROXY_KEYS:
-        msg = f"_proxy_value: {key!r} is not a recognised proxy key"
-        raise ValueError(msg)
+        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy key")
     env_val = os.environ.get(env_name)
     if env_val not in {None, ""}:
         return env_val
@@ -1372,8 +1371,7 @@ class _BlockTracker:
 
     def delta(self, delta_payload: dict[str, Any]) -> str:
         if self._current is None:
-            msg = "no block is open; call open() first"
-            raise RuntimeError(msg)
+            raise RuntimeError("no block is open; call open() first")
         return _SseFormatter.content_block_delta(self._current.index, delta_payload)
 
     def close(self) -> list[str]:

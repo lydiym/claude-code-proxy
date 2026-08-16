@@ -85,8 +85,8 @@ ignore = [
     "hardcoded-bind-all-interfaces",
     "blind-except",           # top-level error wrappers intentionally catch everything; per-call catches narrow where the exception type is known
     "any-type",               # `get_field` is duck-typed (dict | object) and propagates `Any`; typing it as `object` cascades into cast() at every call site.
-    "raise-vanilla-args",     # user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
-    "raw-string-in-exception", # same reason as raise-vanilla-args
+    "EM",                     # user prefers `raise X("msg")` inline — EM (raw/f-string/dot-format in exception) flags exactly that
+    "raise-vanilla-args",     # user prefers `raise X("msg")` inline over `msg = "..."; raise X(msg)`
     "undocumented-public-init",    # __init__ docstrings are noise — the class docstring covers the constructor's contract
 ]
 
