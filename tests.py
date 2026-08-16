@@ -1066,7 +1066,7 @@ def test_request_accepts_thinking_block_in_history() -> None:
 
 def test_think_stream_parser_text_only() -> None:
     """Plain text with no tags passes through verbatim."""
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     assert p.feed("hello ") == [("text", "hello ")]
     assert p.feed("world") == [("text", "world")]
     assert p.flush() == []
@@ -1079,7 +1079,7 @@ def test_think_stream_parser_single_think_block() -> None:
     what prevents the parser from prematurely committing answer text to a
     thinking block when chunks split a word.
     """
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     events = p.feed("<think>reasoning here</think>answer") + p.flush()
     assert events == [
         ("open", None),
@@ -1090,7 +1090,7 @@ def test_think_stream_parser_single_think_block() -> None:
 
 
 def test_think_stream_parser_text_around_block() -> None:
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     events = p.feed("before<think>x</think>after") + p.flush()
     assert events == [
         ("text", "before"),
@@ -1108,7 +1108,7 @@ def test_think_stream_parser_think_split_across_chunks() -> None:
     word before it could be emitted safely. Otherwise, splitting a word
     like "Hello" across chunks would misclassify "Hel" as thinking.
     """
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     assert p.feed("hello <") == [("text", "hello ")]
     assert p.feed("think>Hel") == [("open", None)]
     assert p.feed("lo!</thin") == []
@@ -1121,7 +1121,7 @@ def test_think_stream_parser_think_split_across_chunks() -> None:
 
 def test_think_stream_parser_multiple_think_blocks() -> None:
     """Two separate think blocks round-trip cleanly."""
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     events = p.feed("a<think>1</think>b<think>2</think>c") + p.flush()
     assert events == [
         ("text", "a"),
@@ -1138,7 +1138,7 @@ def test_think_stream_parser_multiple_think_blocks() -> None:
 
 def test_think_stream_parser_holds_until_close() -> None:
     """Thinking content must NOT be emitted chunk-by-chunk before ``."""
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     assert p.feed("<think>a") == [("open", None)]
     assert p.feed("b") == []
     assert p.feed("c") == []
@@ -1150,7 +1150,7 @@ def test_think_stream_parser_holds_until_close() -> None:
 
 
 def test_think_stream_parser_empty_think_block() -> None:
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     events = p.feed("a<think></think>b") + p.flush()
     assert events == [
         ("text", "a"),
@@ -1164,7 +1164,7 @@ def test_think_stream_parser_unclosed_at_flush() -> None:
     """If the stream ends inside ``<think>`` with content still buffered, flush
     must release everything as a thinking delta and emit close.
     """
-    p = srv.ThinkStreamParser()
+    p = srv._ThinkStreamParser()
     p.feed("<think>hello ")
     assert p.feed("<") == []
     assert p.flush() == [("thinking", "hello <"), ("close", None)]
@@ -1441,9 +1441,9 @@ def test_emit_failure_flushes_buffered_think_content() -> None:
     _emit_failure must surface buffered thinking as a delta before the
     error frame.
     """
-    parser = srv.ThinkStreamParser()
+    parser = srv._ThinkStreamParser()
     parser.feed("<think>partial reasoning...")  # buffered, no closing tag
-    tracker = srv.BlockTracker()
+    tracker = srv._BlockTracker()
     exc = RuntimeError("test")
 
     raw = list(srv._emit_failure(parser, tracker, 0, exc, "test failed"))
@@ -1469,7 +1469,7 @@ def test_sse_formatter_error_emits_canonical_shape() -> None:
     """`event: error` payload must be {type, error: {type, message}} —
     SDK looks up error.type to dispatch exception subclasses.
     """
-    frame = srv.SseFormatter.error("overloaded_error", "try again later")
+    frame = srv._SseFormatter.error("overloaded_error", "try again later")
     assert frame.startswith("event: error\n")
     body = json.loads(frame.split("data: ", 1)[1].split("\n\n")[0])
     assert body == {

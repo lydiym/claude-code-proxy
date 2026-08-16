@@ -70,12 +70,11 @@ select = [
     "UP",    # pyupgrade
     "ANN",   # flake8-annotations
     "ARG",   # flake8-unused-arguments
+    "D",     # pydocstyle
     "N",     # pep8-naming
     "PL",    # Pylint
     "W",     # pycodestyle warnings
     # --- below: intentionally disabled. Uncomment to enable. ---
-    # "D",     # pydocstyle
-    # "DOC",   # pydocstyle-docstring
 ]
 # False positives / intentional suppressions.
 ignore = [
@@ -84,6 +83,7 @@ ignore = [
     "any-type",               # `get_field` is duck-typed (dict | object) and propagates `Any`; typing it as `object` cascades into cast() at every call site.
     "raise-vanilla-args",     # user prefers `raise RuntimeError("msg")` inline over `msg = "..."; raise RuntimeError(msg)`
     "raw-string-in-exception", # same reason as raise-vanilla-args
+    "undocumented-public-init",    # __init__ docstrings are noise — the class docstring covers the constructor's contract
 ]
 
 [tool.ruff.lint.mccabe]
@@ -116,6 +116,7 @@ known-first-party = ["server", "tests"]
     "float-equality-comparison",
     "module-import-not-at-top-of-file",
     "magic-value-comparison", # tests assert against literal sampling temps/byte sizes/HTTP codes — naming each one adds ceremony without clarity
+    "D",     # tests.py has its own module docstring already; per-test docstrings are noise
 ]
 
 [tool.ty.environment]
