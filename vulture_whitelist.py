@@ -24,9 +24,8 @@ tiktoken.encoding_for_model  # server.py:131 sets this to server._encoding_for_m
 litellm.set_verbose  # server.py:452 sets this to True
 litellm.ssl_verify  # server.py:472 sets this to OPENAI_TLS_VERIFY
 
-# Documented OpenAI cap; the proxy no longer enforces it (see CLAUDE.md —
-# "MAX_OUTPUT_TOKENS = 16384 is the documented OpenAI cap; the proxy no
-# longer clamps"). Kept for clarity; will go live again if we ever clamp.
+# Documented OpenAI cap. Referenced so the limit surfaces in code search;
+# the clamping path is dormant.
 from server import MAX_OUTPUT_TOKENS
 
 MAX_OUTPUT_TOKENS
@@ -54,8 +53,8 @@ disallowed_special  # unused variable (server.py:109)
 text_or_bytes  # unused variable (server.py:118)
 errors  # unused variable (server.py:122)
 
-# Test fixture lambda replaces `srv._translate_parser_events`; the
-# upstream signature is unknown to vulture and the params are positional/
-# keyword placeholders.
+# Test fixture lambda for `srv._translate_parser_events`; the upstream
+# signature is unknown to vulture and the params are positional/keyword
+# placeholders.
 a  # unused variable (tests.py:1394)
 kw  # unused variable (tests.py:1394)

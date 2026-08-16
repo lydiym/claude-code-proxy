@@ -71,8 +71,7 @@ def _litellm_debug_http_enabled() -> bool:
 def _debug_json_dump(label: str, obj: object) -> None:
     """Best-effort debug-level JSON dump.
 
-    Logs the failure cause instead of raising — debug logging must never crash
-    the request.
+    Logs the failure cause — debug logging must never crash the request.
     """
     try:
         logger.debug("%s: %s", label, json.dumps(obj, default=str, ensure_ascii=False))
@@ -380,9 +379,9 @@ def _default_model_for_tier(tier: str | None) -> str:
       5. [global].model config — fallback for any model
       6. Built-in default (gpt-4.1-mini for haiku bucket, gpt-4.1 otherwise)
 
-    Cached at first call — env or CONFIG.toml edits after import require restart.
-    Live edits to [tier].extra_body still take effect via the per-call
-    _resolve_tier_config.
+    Cached at first call — env or CONFIG.toml edits require restart for
+    these lookups. ``[tier].extra_body`` edits apply live via the per-call
+    ``_resolve_tier_config``.
     """
     bucket = _bucket_for_tier(tier)
     built_in = "gpt-4.1-mini" if bucket == "small" else "gpt-4.1"
