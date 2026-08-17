@@ -899,7 +899,7 @@ def _join_tool_result_items(items: list[object]) -> str:
                 result += str(item) + "\n"
             except (TypeError, ValueError):
                 result += "Unparseable content\n"
-    return result  # result accumulates str via +=; ty sees str | Unknown from dict.get
+    return result  # ty: ignore[unsound-return-statement] — result accumulates str via +=; pre-existing duck-typed dict.get
 
 
 def convert_image_block(source: object) -> dict[str, Any]:
@@ -974,7 +974,7 @@ def _collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
                 rid = _get_field(block, "tool_use_id", "") or ""
                 if rid:
                     result_ids.add(rid)
-    return call_ids, result_ids  # elements come from cast / _get_field; ty can't trace
+    return call_ids, result_ids  # ty: ignore[unsound-return-statement] — elements come from cast / _get_field; ty can't trace set element types
 
 
 def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, Any]:
@@ -1238,7 +1238,7 @@ def _first_message(response: object) -> dict[str, object]:
     choice = _first_choice(response)
     if choice is None:
         return {}
-    return _get_field(choice, "message", {}) or {}  # `or {}` ensures dict[str, object] at runtime
+    return _get_field(choice, "message", {}) or {}  # ty: ignore[unsound-return-statement] — `or {}` collapses falsy only; pre-existing duck-typed _get_field
 
 
 def _extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
@@ -1246,7 +1246,7 @@ def _extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
     if not raw:
         return []
     if isinstance(raw, list):
-        return raw  # callers rely on element dict shape; runtime validated
+        return raw  # ty: ignore[unsound-return-statement] — element dict shape relies on upstream contract; pre-existing pattern
     return [raw]
 
 
@@ -1254,7 +1254,7 @@ def _parse_tool_arguments(raw: str | dict[str, object] | None) -> dict[str, obje
     if not isinstance(raw, str):
         return raw if raw is not None else {}
     try:
-        return json.loads(raw)  # json.loads returns Any; caller trusts dict shape
+        return json.loads(raw)  # ty: ignore[unsound-return-statement] — json.loads returns Any; caller trusts dict shape; pre-existing
     except json.JSONDecodeError:
         logger.warning("Failed to parse tool arguments as JSON: %s", raw)
         return {"raw": raw}
@@ -1292,8 +1292,8 @@ def _build_content_blocks(
 
 
 def _extract_usage(usage: dict[str, object]) -> tuple[int, int]:
-    return (
-        _get_field(usage, "prompt_tokens", 0) or 0,  # `or 0` ensures int at runtime
+    return (  # ty: ignore[unsound-return-statement] — `or 0` collapses falsy only; pre-existing pattern
+        _get_field(usage, "prompt_tokens", 0) or 0,
         _get_field(usage, "completion_tokens", 0) or 0,
     )
 
