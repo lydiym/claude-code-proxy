@@ -21,6 +21,12 @@ import litellm
 
 tiktoken.get_encoding  # server.py:130 sets this to server._get_encoding
 tiktoken.encoding_for_model  # server.py:131 sets this to server._encoding_for_model
+
+# _OfflineEncoding methods mirror the tiktoken.Encoding signature; litellm
+# dispatches into them, but vulture can't see cross-class attribute calls.
+_OfflineEncoding.encode_ordinary
+_OfflineEncoding.encode_single_token
+_OfflineEncoding.decode_single_token_bytes
 litellm.set_verbose  # server.py:452 sets this to True
 litellm.ssl_verify  # server.py:472 sets this to OPENAI_TLS_VERIFY
 

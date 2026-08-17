@@ -13,12 +13,12 @@ import sys
 import time
 import tomllib
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Literal, cast, override
+from typing import Any, Literal, cast
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -104,37 +104,34 @@ if TIKTOKEN_OFFLINE:
     # Token counts are approximate; real counts come from upstream usage.
     import tiktoken
 
-    class _OfflineEncoding(tiktoken.Encoding):
-        def __init__(self) -> None:
-            # Override parent's __init__ to skip the required mergeable_ranks / special_tokens.
-            pass
+    class _OfflineEncoding:
+        # Duck-typed stand-in for ``tiktoken.Encoding``. NOT a subclass — that
+        # would make ``isinstance(enc, tiktoken.Encoding)`` True and dispatch
+        # into non-overridden parent methods that dereference uninitialised
+        # ``_mergeable_ranks`` / ``_special_tokens``. Keeping the class untyped
+        # means litellm only exercises the methods we explicitly define.
+        # ``*args, **kwargs`` mirror the tiktoken.Encoding signature; litellm
+        # dispatches into these methods.
 
-        @override
-        def encode(
-            self, text: str, *, allowed_special: object = ..., disallowed_special: object = ...,
-        ) -> list[int]:
+        def encode(self, text: str, *args: object, **kwargs: object) -> list[int]:  # ruff: ignore[unused-method-argument, no-self-use]
             return [1] * max(1, len(text) // 4)
 
-        @override
-        def encode_ordinary(self, text: str) -> list[int]:
-            return self.encode(text)
+        def encode_ordinary(self, text: str, *args: object, **kwargs: object) -> list[int]:
+            return self.encode(text, *args, **kwargs)
 
-        @override
-        def encode_single_token(self, text_or_bytes: str | bytes) -> int:
+        def encode_single_token(self, token: object, *args: object, **kwargs: object) -> int:  # ruff: ignore[unused-method-argument, no-self-use]
             return 1
 
-        @override
-        def decode(self, tokens: Sequence[int], errors: str = "replace") -> str:
+        def decode(self, tokens: object, *args: object, **kwargs: object) -> str:  # ruff: ignore[unused-method-argument, no-self-use]
             return ""
 
-        @override
-        def decode_single_token_bytes(self, token: int) -> bytes:
+        def decode_single_token_bytes(self, token: int, *args: object, **kwargs: object) -> bytes:  # ruff: ignore[unused-method-argument, no-self-use]
             return b""
 
-    def _get_encoding(_encoding_name: str) -> tiktoken.Encoding:
+    def _get_encoding(_encoding_name: str) -> _OfflineEncoding:
         return _OfflineEncoding()
 
-    def _encoding_for_model(_model_name: str) -> tiktoken.Encoding:
+    def _encoding_for_model(_model_name: str) -> _OfflineEncoding:
         return _OfflineEncoding()
 
     # ty invalid-assignment: monkey-patching module functions, intentional.
@@ -790,9 +787,14 @@ class _ThinkStreamParser:
 
         kind is "text" or "thinking" for a delta, or "open" / "close" for a
         block transition (value is None for those).
+
+        Truthy non-strings fall through to ``self.buffer += text`` and raise
+        ``TypeError``; the chunk-handler tolerance catches that and eventually
+        surfaces an ``event:error`` frame.
         """
-        if not isinstance(text, str) or not text:
+        if not text:
             return []
+        text = cast("str", text)  # narrow for += below; truthy non-strings raise TypeError caught by chunk tolerance
         events = []
         self.buffer += text
         while self._drain(events):
@@ -1494,7 +1496,7 @@ def _open_block(tracker: _BlockTracker, kind: str, block_dict: dict[str, Any]) -
 
 
 def _emit_thinking(tracker: _BlockTracker, text: object) -> Iterator[str]:
-    if not isinstance(text, str) or not text:
+    if not text:
         return
     yield from _open_block(tracker, "thinking", {"type": "thinking", "thinking": ""})
     yield tracker.delta({"type": "thinking_delta", "thinking": text})
@@ -1704,9 +1706,6 @@ def _process_chunk(
     delta = _get_field(choice, "delta") or _get_field(choice, "message", {}) or {}
     finish_reason = _get_field(choice, "finish_reason")
 
-    if not isinstance(delta, dict):
-        delta = {}
-
     # litellm exposes native reasoning as delta.reasoning_content on some providers;
     # honour it before falling back to think-tag parsing.
     delta_reasoning = _coerce_delta_field(delta, "reasoning_content")
@@ -1795,9 +1794,11 @@ def _handle_chunk_error(
     if state.consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
         return
     # Threshold tripped — escalate with traceback and surface error.
+    # should_stop is set before the yield-from so an exception mid-emission
+    # still leaves the loop guard set.
+    state.should_stop = True
     logger.error("Chunk error threshold exceeded; surfacing error", exc_info=exc)
     yield from _emit_failure(think_parser, tracker, state.output_tokens, exc, "chunk processing failed")
-    state.should_stop = True
 
 
 async def _stream_chunks(
