@@ -130,8 +130,17 @@ python-version = "3.12"
 include = ["server.py", "tests.py"]
 
 [tool.ty.rules]
+# Opt-in: `list` instead of `list[X]` etc. — Easy to introduce, hard to spot.
 missing-type-argument = "error"
+# Opt-in: a name that should resolve but doesn't — typically a typo or a
+# missing import that ruff's F401 doesn't catch (different linter, different
+# scope — ty sees through protocols and re-exports).
 possibly-unresolved-reference = "warn"
+# Sister rule to `unsound-return-statement` (default: ignore). Both flag
+# `Any`-leakage from helper functions into typed return sites. Sentinel:
+# zero findings today, but turning it on catches regressions without
+# breaking the build.
+unsound-yield = "warn"
 
 [tool.vulture]
 paths = ["server.py", "tests.py", "vulture_whitelist.py"]

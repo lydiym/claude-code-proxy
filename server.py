@@ -899,7 +899,7 @@ def _join_tool_result_items(items: list[object]) -> str:
                 result += str(item) + "\n"
             except (TypeError, ValueError):
                 result += "Unparseable content\n"
-    return result
+    return result  # result accumulates str via +=; ty sees str | Unknown from dict.get
 
 
 def convert_image_block(source: object) -> dict[str, Any]:
@@ -974,7 +974,7 @@ def _collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
                 rid = _get_field(block, "tool_use_id", "") or ""
                 if rid:
                     result_ids.add(rid)
-    return call_ids, result_ids
+    return call_ids, result_ids  # elements come from cast / _get_field; ty can't trace
 
 
 def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, Any]:
@@ -1238,7 +1238,7 @@ def _first_message(response: object) -> dict[str, object]:
     choice = _first_choice(response)
     if choice is None:
         return {}
-    return _get_field(choice, "message", {}) or {}
+    return _get_field(choice, "message", {}) or {}  # `or {}` ensures dict[str, object] at runtime
 
 
 def _extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
@@ -1246,7 +1246,7 @@ def _extract_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
     if not raw:
         return []
     if isinstance(raw, list):
-        return raw
+        return raw  # callers rely on element dict shape; runtime validated
     return [raw]
 
 
@@ -1254,7 +1254,7 @@ def _parse_tool_arguments(raw: str | dict[str, object] | None) -> dict[str, obje
     if not isinstance(raw, str):
         return raw if raw is not None else {}
     try:
-        return json.loads(raw)
+        return json.loads(raw)  # json.loads returns Any; caller trusts dict shape
     except json.JSONDecodeError:
         logger.warning("Failed to parse tool arguments as JSON: %s", raw)
         return {"raw": raw}
@@ -1293,7 +1293,7 @@ def _build_content_blocks(
 
 def _extract_usage(usage: dict[str, object]) -> tuple[int, int]:
     return (
-        _get_field(usage, "prompt_tokens", 0) or 0,
+        _get_field(usage, "prompt_tokens", 0) or 0,  # `or 0` ensures int at runtime
         _get_field(usage, "completion_tokens", 0) or 0,
     )
 
