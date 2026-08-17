@@ -141,6 +141,17 @@ possibly-unresolved-reference = "warn"
 # zero findings today, but turning it on catches regressions without
 # breaking the build.
 unsound-yield = "warn"
+# All default-ignore rules, promoted to `warn`. Sentinel config — zero
+# findings today, but every regression in duck-typing, dataclass misuse,
+# silent imports, or unsound narrows becomes visible without breaking
+# the build. Promote to `error` once the codebase stays clean.
+blanket-ignore-comment = "warn"
+division-by-zero = "warn"
+missing-override-decorator = "warn"
+possibly-missing-attribute = "warn"
+possibly-missing-import = "warn"
+unsound-return-statement = "warn"
+unsupported-dynamic-base = "warn"
 
 [tool.vulture]
 paths = ["server.py", "tests.py", "vulture_whitelist.py"]
