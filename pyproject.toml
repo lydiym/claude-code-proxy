@@ -130,8 +130,7 @@ python-version = "3.12"
 include = ["server.py", "tests.py"]
 
 [tool.ty.rules]
-# Every default-ignore ty rule, opt-in so future regressions in `Any`-leakage
-# or duck-typing surface as warnings. Sentinel — zero findings today.
+# Opt-in every default-ignore rule so Any-leakage / duck-typing regressions surface as warnings.
 missing-type-argument = "error"
 blanket-ignore-comment = "warn"
 division-by-zero = "warn"
