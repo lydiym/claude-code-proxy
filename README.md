@@ -190,6 +190,8 @@ pre-commit install
 
 `tests.py` is linted by ruff, ty, and vulture with the same active rule set as `server.py` — per-file ignores in `pyproject.toml` (`assert`, `private-member-access`, `unused-async`, `float-equality-comparison`, `module-import-not-at-top-of-file`) suppress test-context noise (asserts are the test pattern, monkey-patching internals, async generators as fixtures, TOML-roundtrip exact floats, intentional late `import server`). `vulture_whitelist.py` is excluded from ruff: it's a tool config file, not production code.
 
+A handful of duck-typed call sites in `server.py` carry `# ty: ignore[unsound-return-statement]` — they're documented latent bugs in [`bugtracker.md`](bugtracker.md) (pre-existing in `main`, refactored but not fixed). The rule stays active so any new unsound-return at a different site still warns; the explicit ignores keep `ty check` clean and pre-commit green.
+
 ## Contributing 🤝
 
 Pull requests welcome. 🎁

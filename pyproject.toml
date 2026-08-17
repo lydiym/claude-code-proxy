@@ -130,7 +130,7 @@ python-version = "3.12"
 include = ["server.py", "tests.py"]
 
 [tool.ty.rules]
-# Opt-in every default-ignore rule so Any-leakage / duck-typing regressions surface as warnings.
+# Promote every ty default-ignore rule to warn (or error for missing-type-argument) so future regressions surface. Server-side ignores use `# ty: ignore[...]`.
 missing-type-argument = "error"
 blanket-ignore-comment = "warn"
 division-by-zero = "warn"
