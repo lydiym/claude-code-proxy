@@ -141,25 +141,73 @@ if TIKTOKEN_OFFLINE:
 # These imports must come after the env-var + tiktoken patch above.
 import litellm  # ruff: ignore[module-import-not-at-top-of-file]
 
+# Constants (pure — no function calls, no I/O). Derived values that resolve via
+# helpers (`CONFIG_PATH`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_TLS_VERIFY`)
+# stay near the functions they call — Python can't evaluate them before the
+# function objects exist.
+
+# Tier resolution — single source of truth for routing priority + bucket lookup
+TIER_KEYS = ("haiku", "sonnet", "opus", "fable", "mythos")
+_VALID_TIERS = set(TIER_KEYS)
+_VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
+_PROXY_KEYS = {"openai_api_key", "openai_base_url", "openai_tls_verify"}
+_PROTECTED_KEYS = {"model", "messages", "stream", "tools"}  # OpenAI Chat Completions keys the proxy owns
+_BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
+_PROVIDER_PREFIXES = ("anthropic/", "openai/", "gemini/")
+_BOOL_TLS_VERIFY = {"openai_tls_verify"}
+_COERCE_DROP = object()  # sentinel: coercion failed, key should be dropped
+
+# Output / formatting limits
+MAX_OUTPUT_TOKENS = 16384  # OpenAI caps max_completion_tokens at this for most current models
+MSG_ID_HEX_LEN = 24
+MAX_CONSECUTIVE_CHUNK_ERRORS = 5  # per-streak tolerance before surfacing chunk failures
+STATUS_OK = 200
+
+# Recognised bare names; anything else gets `openai/` prefix.
+OPENAI_MODELS = {
+    "o3-mini",
+    "o1",
+    "o1-mini",
+    "o1-pro",
+    "gpt-4.5-preview",
+    "gpt-4o",
+    "gpt-4o-audio-preview",
+    "chatgpt-4o-latest",
+    "gpt-4o-mini",
+    "gpt-4o-mini-audio-preview",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+}
+
+# litellm exception class name → Anthropic error_type enum
+_ANTHROPIC_ERROR_TYPES = {
+    "RateLimitError": "rate_limit_error",
+    "AuthenticationError": "authentication_error",
+    "PermissionDeniedError": "permission_error",
+    "NotFoundError": "not_found_error",
+    "UnprocessableEntityError": "invalid_request_error",
+    "BadRequestError": "invalid_request_error",
+    "Timeout": "timeout_error",
+    "APIConnectionError": "api_error",
+    "ContextWindowExceededError": "invalid_request_error",
+    "ServiceUnavailableError": "overloaded_error",
+    "InternalServerError": "api_error",
+}
+
+# Redacted before `event:error` so credentials don't leak into the wire response.
+_CREDENTIAL_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"x-api-key=[A-Za-z0-9_-]{16,}"),
+    re.compile(r"://[^/\s]+:[^/\s]+@"),
+]
+
+# Stream split markers — see _ThinkStreamParser
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
 # ---------------------------------------------------------------------------
 # Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
 # ---------------------------------------------------------------------------
-
-# Tier names. Insertion order is the routing priority (haiku is checked first so
-# it wins over big tiers in substring matches). Single source of truth — the
-# TOML-loader section validator and the per-request tier lookup both read this.
-TIER_KEYS = ("haiku", "sonnet", "opus", "fable", "mythos")
-_VALID_TIERS = set(TIER_KEYS)
-# Top-level OpenAI Chat Completions keys that `extra_body` must never overwrite — the proxy owns these.
-_PROTECTED_KEYS = {"model", "messages", "stream", "tools"}
-_PROXY_KEYS = {
-    "openai_api_key",
-    "openai_base_url",
-    "openai_tls_verify",
-}
-# haiku → small; everything else → big. Single source of truth for which bucket a tier inherits from.
-_BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
-_VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -175,9 +223,6 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             out[k] = v
     return out
-
-
-_PROVIDER_PREFIXES = ("anthropic/", "openai/", "gemini/")
 
 
 def _strip_provider_prefix(name: str) -> str:
@@ -242,10 +287,6 @@ def _parse_bucket_section(body: dict[str, Any], section: str) -> dict[str, Any]:
         else:
             logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
     return out
-
-
-_COERCE_DROP = object()  # sentinel: coercion failed, key should be dropped
-_BOOL_TLS_VERIFY = {"openai_tls_verify"}
 
 
 def _coerce_proxy_value(key: str, value: object, section: str) -> str | bool | object:
@@ -506,33 +547,6 @@ litellm.ssl_verify = OPENAI_TLS_VERIFY
 if not OPENAI_TLS_VERIFY:
     logger.warning("OPENAI_TLS_VERIFY=false — TLS certificate validation is disabled. Do not use this in production.")
 
-# OpenAI Chat Completions caps max_completion_tokens at this value for most
-# current models; over it the API rejects the request.
-MAX_OUTPUT_TOKENS = 16384
-
-MSG_ID_HEX_LEN = 24
-
-# Per-streak tolerance for transient chunk failures before surfacing an error.
-MAX_CONSECUTIVE_CHUNK_ERRORS = 5
-
-STATUS_OK = 200
-
-# Recognised bare names; anything else is opaque and passed through with openai/.
-OPENAI_MODELS = {
-    "o3-mini",
-    "o1",
-    "o1-mini",
-    "o1-pro",
-    "gpt-4.5-preview",
-    "gpt-4o",
-    "gpt-4o-audio-preview",
-    "chatgpt-4o-latest",
-    "gpt-4o-mini",
-    "gpt-4o-mini-audio-preview",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-}
-
 
 def _to_anthropic_stop_reason(finish_reason: object) -> Literal["end_turn", "max_tokens", "tool_use"]:
     mapping: dict[str, Literal["end_turn", "max_tokens", "tool_use"]] = {
@@ -544,33 +558,9 @@ def _to_anthropic_stop_reason(finish_reason: object) -> Literal["end_turn", "max
     return mapping.get(key, "end_turn")
 
 
-# Maps litellm exception class names to Anthropic error_type enum; unknown classes fall through to "api_error".
-_ANTHROPIC_ERROR_TYPES = {
-    "RateLimitError": "rate_limit_error",
-    "AuthenticationError": "authentication_error",
-    "PermissionDeniedError": "permission_error",
-    "NotFoundError": "not_found_error",
-    "UnprocessableEntityError": "invalid_request_error",
-    "BadRequestError": "invalid_request_error",
-    "Timeout": "timeout_error",
-    "APIConnectionError": "api_error",
-    "ContextWindowExceededError": "invalid_request_error",
-    "ServiceUnavailableError": "overloaded_error",
-    "InternalServerError": "api_error",
-}
-
-
 def _anthropic_error_type(exc: BaseException) -> str:
     cls = type(exc).__name__
     return _ANTHROPIC_ERROR_TYPES.get(cls, "api_error")
-
-
-# litellm/httpx exception messages echo upstream bodies verbatim and can carry credentials; redact before event:error.
-_CREDENTIAL_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"x-api-key=[A-Za-z0-9_-]{16,}"),
-    re.compile(r"://[^/\s]+:[^/\s]+@"),
-]
 
 
 def _sanitize_error_message(message: str) -> str:
@@ -757,12 +747,6 @@ class MessagesResponse(BaseModel):
     stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
     stop_sequence: str | None = None
     usage: Usage
-
-
-# Anthropic wants `type: "thinking"` blocks; some backends fold reasoning
-# into `<think>...</think>` inside `content` and the parser below splits them out.
-_THINK_OPEN_TAG = "<think>"
-_THINK_CLOSE_TAG = "</think>"
 
 
 class _ThinkStreamParser:
