@@ -947,7 +947,7 @@ def _collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
     return call_ids, result_ids  # ty: ignore[unsound-return-statement] — elements come from cast / _get_field; ty can't trace set element types
 
 
-def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, Any]:
+def _convert_assistant_message(msg: Message, result_ids: set[str], id_map: dict[str, str]) -> dict[str, Any]:
     text_parts = []
     tool_calls = []
 
@@ -960,11 +960,18 @@ def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, 
             if tool_block.id in result_ids:
                 tool_calls.append(
                     {
-                        "id": tool_block.id,
+                        "id": id_map[tool_block.id],
                         "type": "function",
                         "function": {
                             "name": tool_block.name,
-                            "arguments": json.dumps(tool_block.input),
+                            # Compact JSON: cache-stable rendering when llama-server's
+                            # chat template interpolates the arguments string.
+                            "arguments": json.dumps(
+                                tool_block.input,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            ),
                         },
                     },
                 )
@@ -982,7 +989,7 @@ def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, 
     return out
 
 
-def _convert_user_message(msg: Message, call_ids: set[str]) -> list[dict[str, Any]]:
+def _convert_user_message(msg: Message, call_ids: set[str], id_map: dict[str, str]) -> list[dict[str, Any]]:
     tool_messages = []
     user_parts = []
 
@@ -999,7 +1006,7 @@ def _convert_user_message(msg: Message, call_ids: set[str]) -> list[dict[str, An
                 tool_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_use_id,
+                        "tool_call_id": id_map[tool_use_id],
                         "content": result_text,
                     },
                 )
@@ -1027,12 +1034,18 @@ def _convert_message(
     msg: Message,
     result_ids: set[str],
     call_ids: set[str],
+    id_map: dict[str, str],
 ) -> list[dict[str, Any]]:
     if isinstance(msg.content, str):
         return [{"role": msg.role, "content": msg.content}]
     if msg.role == "assistant":
-        return [_convert_assistant_message(msg, result_ids)]
-    return _convert_user_message(msg, call_ids)
+        return [_convert_assistant_message(msg, result_ids, id_map)]
+    return _convert_user_message(msg, call_ids, id_map)
+
+
+# Anthropic-only keys that may sit inside an input_schema; OpenAI clients
+# never emit them, so a ref forwarder would render the prompt without them.
+_TOOL_PARAM_ANTHROPIC_KEYS = frozenset({"cache_control", "strict"})
 
 
 def _convert_tool_definitions(tools: list[Tool]) -> list[dict[str, Any]]:
@@ -1042,7 +1055,7 @@ def _convert_tool_definitions(tools: list[Tool]) -> list[dict[str, Any]]:
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
-                "parameters": tool.input_schema,
+                "parameters": {k: v for k, v in tool.input_schema.items() if k not in _TOOL_PARAM_ANTHROPIC_KEYS},
             },
         }
         for tool in tools
@@ -1068,7 +1081,8 @@ def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
     Mutates in place. Keeps ``role``, ``content``, ``name``, ``tool_call_id``,
     and ``tool_calls``; everything else is dropped. Empty/None ``content`` is
     replaced with ``"..."`` when no tool_calls are present — OpenAI rejects
-    empty content outright.
+    empty content outright. Tool result bodies are left as-is even when empty:
+    the placeholder would change the prompt's tokens.
     """
     allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls"}
     for msg in messages:
@@ -1076,6 +1090,8 @@ def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
             if key not in allowed_keys:
                 logger.debug("Removing unsupported message field: %s", key)
                 del msg[key]
+        if msg.get("role") == "tool":
+            continue
         if msg.get("content") in {None, ""} and not msg.get("tool_calls"):
             msg["content"] = "..."
 
@@ -1118,6 +1134,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     """
     call_ids, result_ids = _collect_tool_ids(anthropic_request.messages)
 
+    # Rewrite Anthropic's ``toolu_*`` ids to OpenAI's ``call_*`` so the
+    # chat template renders the same prefix any OpenAI client would.
+    id_map = {old: f"call_{uuid.uuid4().hex[:24]}" for old in call_ids}
+
     messages = []
     if system := _build_system_message(anthropic_request.system, anthropic_request.messages):
         messages.append(system)
@@ -1126,7 +1146,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     # models to emit tool calls as literal text and broke tool use.
     for msg in anthropic_request.messages:
         if msg.role != "system":
-            messages.extend(_convert_message(msg, result_ids, call_ids))
+            messages.extend(_convert_message(msg, result_ids, call_ids, id_map))
 
     litellm_request: dict[str, Any] = {
         "model": anthropic_request.model,
@@ -1893,17 +1913,16 @@ def _prepare_litellm_request(request: MessagesRequest) -> dict[str, Any]:
 
 
 def _log_upstream_params_debug(litellm_request: dict[str, Any]) -> None:
-    # Skip the bulky fields (messages, tools) — they dominate the dump and
-    # are visible in litellm.set_verbose anyway.
+    # Skip bulky fields (dumped by litellm.set_verbose) and the api_key secret.
     if not logger.isEnabledFor(logging.DEBUG):
         return
-    debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools"}}
+    debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools", "api_key"}}
     logger.debug("upstream params: %s", debug)
     if _litellm_debug_http_enabled():
-        # Verbose: dump the entire kwargs dict going into litellm
-        # (messages, tools, tool_choice, …) so we can confirm the
-        # exact payload upstream sees, not just the sampling subset.
-        _debug_json_dump("litellm.completion kwargs (full)", litellm_request)
+        # Dump the full kwargs (messages, tools, tool_choice, …) to confirm the
+        # exact payload upstream sees — api_key is masked first.
+        redacted = {**litellm_request, "api_key": "***"}
+        _debug_json_dump("litellm.completion kwargs (full)", redacted)
 
 
 def _log_response_debug(litellm_response: object, model: str, start_time: float) -> None:

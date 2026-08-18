@@ -582,11 +582,22 @@ def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None
         })
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][1]["role"] == "assistant"
-        assert out["messages"][1]["tool_calls"] == [{
-            "id": "t1", "type": "function",
-            "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
-        }]
-        assert out["messages"][2] == {"role": "tool", "tool_call_id": "t1", "content": "4"}
+        # Compact JSON, sort_keys, ensure_ascii=False; id rewritten to call_* prefix.
+        tc = out["messages"][1]["tool_calls"][0]
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "calc"
+        assert tc["function"]["arguments"] == '{"q":"2+2"}', (
+            f"Compact JSON expected; got {tc['function']['arguments']!r}"
+        )
+        assert tc["id"].startswith("call_"), (
+            f"Tool call id must be rewritten to call_* prefix; got {tc['id']!r}"
+        )
+        tool_msg = out["messages"][2]
+        assert tool_msg["role"] == "tool"
+        assert tool_msg["content"] == "4"
+        assert tool_msg["tool_call_id"] == tc["id"], (
+            "tool_call_id must match tool_calls[].id after rewrite"
+        )
 
 
 def test_user_content_list_with_single_text_block() -> None:
@@ -601,6 +612,521 @@ def test_user_content_list_with_single_text_block() -> None:
         })
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"] == [{"role": "user", "content": "Hello there"}]
+
+
+def test_tool_call_arguments_use_compact_json_for_cache_stability() -> None:
+    """Regression test for llama-server prefix-cache misses.
+
+    ``tool_call.function.arguments`` is rendered verbatim by llama-server's
+    chat template. Default ``json.dumps`` inserts ``', '`` and ``': '``
+    separators; reference OpenAI clients (and Anthropic's own tool output)
+    use compact JSON. The whitespace difference produces different tokens
+    after BPE, busting the prefix cache when the same conversation is
+    routed via the proxy vs. a reference client.
+
+    This test pins the proxy to compact JSON — fixing the bug means
+    tightening ``json.dumps`` in ``_convert_assistant_message`` to
+    ``separators=(",", ":")``.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "lookup"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "lookup",
+                     "input": {"key": "value", "count": 42, "tag": "a b"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                ]},
+            ],
+            "tools": [{
+                "name": "lookup",
+                "description": "x",
+                "input_schema": {"type": "object"},
+            }],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        args_str = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        # Compact JSON: no whitespace after the comma or colon separators.
+        assert ", " not in args_str, (
+            f"Compact JSON required for cache stability; got {args_str!r}"
+        )
+        assert ": " not in args_str, (
+            f"Compact JSON required for cache stability; got {args_str!r}"
+        )
+        # And it must round-trip back to the original dict.
+        assert json.loads(args_str) == {"key": "value", "count": 42, "tag": "a b"}
+
+
+# ---------------------------------------------------------------------------
+# Prefix-equivalence tests for llama-server prompt-cache stability.
+#
+# llama-server's prefix cache is keyed by the rendered prompt's token sequence.
+# Two requests share cache if and only if the proxy's outgoing OpenAI payload
+# is byte-identical up to the length of the shorter one. The tests below pin
+# the canonical wire form so we can detect any drift — every failure is a
+# candidate cache-busting hotspot.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_wire(payload: dict[str, Any]) -> str:
+    """Canonical, byte-stable JSON serialisation of the outgoing payload.
+
+    Mirrors what a well-behaved OpenAI client would put on the wire:
+    sorted keys, no whitespace, UTF-8 passthrough. The proxy's job is to
+    emit messages that hash to this canonical form regardless of client
+    quirks.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_tool_call_id_normalised_to_call_prefix() -> None:
+    """Anthropic emits ``toolu_*`` ids; OpenAI clients use ``call_*``.
+
+    The chat template renders the id in the prompt for many models, so the
+    prefix differs from a reference client's request. The proxy must rewrite
+    both ``tool_calls[].id`` and the matching ``tool_call_id``.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "lookup"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc123",
+                     "name": "lookup", "input": {"q": "x"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc123",
+                     "content": "ok"},
+                ]},
+            ],
+            "tools": [{"name": "lookup", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        tc_id = out["messages"][1]["tool_calls"][0]["id"]
+        tool_msg_id = out["messages"][2]["tool_call_id"]
+        assert tc_id.startswith("call_"), f"Expected call_* prefix, got {tc_id!r}"
+        assert tool_msg_id.startswith("call_"), f"Expected call_* prefix, got {tool_msg_id!r}"
+        assert tc_id == tool_msg_id, (
+            f"tool_calls[].id ({tc_id!r}) must match tool_call_id ({tool_msg_id!r})"
+        )
+
+
+def test_tool_call_arguments_preserve_unicode() -> None:
+    """Non-ASCII characters in tool arguments must serialise as UTF-8.
+
+    Default ``json.dumps`` uses ``ensure_ascii=True`` and escapes unicode to
+    ``\\uXXXX``. The reference wire form is UTF-8 — the rendered prompt
+    diverges whenever tool inputs contain non-ASCII.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "поиск"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "lookup", "input": {"city": "Москва", "emoji": "🔍"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": "ok"},
+                ]},
+            ],
+            "tools": [{"name": "lookup", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        args_str = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        assert "\\u" not in args_str, (
+            f"Unicode must be passed through; got {args_str!r}"
+        )
+        assert "Москва" in args_str and "🔍" in args_str
+
+
+def test_tool_call_arguments_stable_key_order() -> None:
+    """The arguments JSON must have a deterministic key order.
+
+    Reference wire form sorts keys (``sort_keys=True``). Python dicts preserve
+    insertion order, so the proxy must canonicalise via ``json.dumps`` rather
+    than embedding the input dict directly to disk.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "lookup"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "lookup", "input": {"z": 1, "a": 2, "m": 3}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": "ok"},
+                ]},
+            ],
+            "tools": [{"name": "lookup", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        args_str = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        parsed = json.loads(args_str)
+        keys = list(parsed.keys())
+        assert keys == sorted(keys), (
+            f"Arguments keys must be sorted; got {keys!r}"
+        )
+
+
+def test_outgoing_payload_is_canonical_byte_stable() -> None:
+    """The outgoing payload must serialise to a single canonical form.
+
+    Two requests with the same content must produce the same bytes on the
+    wire, regardless of input dict ordering. We assert the canonical form
+    round-trips cleanly and that the proxy's output preserves key order.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "f", "description": "d",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        # Round-trip must be idempotent (no whitespace, sorted keys).
+        wire = _canonical_wire(out)
+        reparsed = json.loads(wire)
+        again = _canonical_wire(reparsed)
+        assert wire == again, "Canonical wire form must be idempotent"
+        # And no leading whitespace, no indentation.
+        assert "\n" not in wire, "Wire form must not contain newlines"
+        assert ": " not in wire, "Wire form must not contain ': ' separators"
+        assert ", " not in wire, "Wire form must not contain ', ' separators"
+
+
+def test_prefix_equivalence_across_turns() -> None:
+    """Turn N's outgoing messages must START with turn N-1's outgoing messages.
+
+    llama-server's prefix cache only reuses if the rendered prompt of turn
+    N equals the rendered prompt of turn N-1 plus the new turn appended.
+    Structural prefix equivalence on the message list is the proxy-side
+    precondition for that.
+    """
+    with _patched_empty_config():
+        # Turn 1: just a user message.
+        req1 = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        out1 = srv.convert_anthropic_to_litellm(req1)
+        # Turn 2: append an assistant reply.
+        req2 = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        })
+        out2 = srv.convert_anthropic_to_litellm(req2)
+        # The first len(out1.messages) messages of out2 must equal out1's
+        # messages byte-for-byte. Use canonical wire form for comparison.
+        n = len(out1["messages"])
+        prefix_new = [_canonical_wire(m) for m in out2["messages"][:n]]
+        prefix_old = [_canonical_wire(m) for m in out1["messages"]]
+        assert prefix_new == prefix_old, (
+            f"Turn N's prefix drifted:\n  new: {prefix_new}\n  old: {prefix_old}"
+        )
+
+
+def test_prefix_equivalence_with_tool_turns() -> None:
+    """Tool-call turn's prefix must match the previous turn's full messages.
+
+    Most common cache-busting scenario: a turn that adds an assistant
+    tool_call plus the user tool_result must have the prefix (everything
+    before the new tool turns) identical to the previous turn.
+    """
+    with _patched_empty_config():
+        # Turn 1: system + user.
+        req1 = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "What is the weather?"},
+            ],
+            "tools": [{"name": "weather", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out1 = srv.convert_anthropic_to_litellm(req1)
+        # Turn 2: same prefix + assistant tool_call + user tool_result.
+        req2 = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "What is the weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "weather", "input": {"city": "Paris"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": "sunny"},
+                ]},
+            ],
+            "tools": [{"name": "weather", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out2 = srv.convert_anthropic_to_litellm(req2)
+        n = len(out1["messages"])
+        prefix_new = [_canonical_wire(m) for m in out2["messages"][:n]]
+        prefix_old = [_canonical_wire(m) for m in out1["messages"]]
+        assert prefix_new == prefix_old, (
+            "Turn N's prefix (system + user) must match turn N-1 exactly."
+        )
+
+
+def test_system_message_idempotent_across_turns() -> None:
+    """Same system field ⇒ byte-identical system message in outgoing payload."""
+    with _patched_empty_config():
+        req1 = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        req2 = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are a helpful assistant.",
+            "messages": [{"role": "user", "content": "bye"}],
+        })
+        out1 = srv.convert_anthropic_to_litellm(req1)
+        out2 = srv.convert_anthropic_to_litellm(req2)
+        assert _canonical_wire(out1["messages"][0]) == _canonical_wire(out2["messages"][0]), (
+            "System message must be byte-stable when the input system field is unchanged."
+        )
+
+
+def test_tool_definitions_order_preserved() -> None:
+    """Tool list ordering must equal input ordering — clients append-only."""
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [
+                {"name": "z_last", "description": "", "input_schema": {"type": "object"}},
+                {"name": "a_first", "description": "", "input_schema": {"type": "object"}},
+                {"name": "m_mid", "description": "", "input_schema": {"type": "object"}},
+            ],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        names = [t["function"]["name"] for t in out["tools"]]
+        assert names == ["z_last", "a_first", "m_mid"], (
+            f"Tool order must match input; got {names!r}"
+        )
+
+
+def test_determinism_same_input_same_output() -> None:
+    """Converting the same request twice must produce the same wire form.
+
+    Tool call ids are randomised (``call_<uuid>``) so the byte-level hash
+    differs across runs. Assert determinism on the canonicalised message
+    payload after stripping the random-generated ids — that's what
+    llama-server's prefix cache is keyed on.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "system": "help",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "f", "input": {"a": 1, "b": 2, "c": "x y"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": "ok"},
+                ]},
+            ],
+            "tools": [{"name": "f", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out1 = srv.convert_anthropic_to_litellm(req)
+        out2 = srv.convert_anthropic_to_litellm(req)
+        # Strip random ids so the deterministic content can be compared.
+        def _strip_ids(payload: dict[str, Any]) -> dict[str, Any]:
+            payload = json.loads(_canonical_wire(payload))
+            for msg in payload.get("messages", []):
+                for tc in msg.get("tool_calls", []):
+                    tc["id"] = "<id>"
+                if "tool_call_id" in msg:
+                    msg["tool_call_id"] = "<id>"
+            return payload
+        assert _strip_ids(out1) == _strip_ids(out2), (
+            "Same input must produce deterministic output (modulo random ids)"
+        )
+
+
+def test_no_anthropic_specific_fields_in_outgoing_messages() -> None:
+    """Only OpenAI fields must appear in outgoing message dicts.
+
+    Anthropic uses ``tool_use_id``, ``cache_control``, ``signature``;
+    OpenAI uses ``tool_call_id``, ``tool_calls``. Any leakage busts the
+    prefix cache because the chat template renders the extra fields.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "f", "input": {"a": 1}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": "ok"},
+                ]},
+            ],
+            "tools": [{"name": "f", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        allowed = {"role", "content", "name", "tool_call_id", "tool_calls"}
+        for msg in out["messages"]:
+            extras = set(msg.keys()) - allowed
+            assert not extras, f"Anthropic-specific fields leaked: {extras!r} in {msg!r}"
+
+
+def test_tool_definitions_parameters_not_none() -> None:
+    """Tool ``parameters`` must always be a dict — never ``null``.
+
+    OpenAI-compatible upstreams reject ``parameters: null``; reference
+    clients emit ``{}`` for empty schemas. The proxy must normalise.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"name": "f", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        for tool in out["tools"]:
+            params = tool["function"]["parameters"]
+            assert isinstance(params, dict), (
+                f"Tool parameters must be dict; got {type(params).__name__}"
+            )
+            assert "type" in params, (
+                f"Tool parameters must declare 'type' so upstream validates schema"
+            )
+
+
+def test_tool_definition_cache_control_stripped_from_parameters() -> None:
+    """Anthropic allows ``cache_control`` inside ``input_schema``; OpenAI doesn't.
+
+    Reference wire form has no cache_control. Any leftover field renders
+    in the prompt and busts the prefix.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{
+                "name": "f", "description": "x",
+                "input_schema": {
+                    "type": "object",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            }],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        params = out["tools"][0]["function"]["parameters"]
+        assert "cache_control" not in params, (
+            f"cache_control must be stripped from parameters; got {params!r}"
+        )
+
+
+def test_tool_result_string_content_passes_through_unchanged() -> None:
+    """String ``tool_result.content`` must hit the wire as the same string.
+
+    The proxy currently appends trailing newlines / strips — both change
+    the prompt's tokens. Reference form is verbatim.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "f", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": "exact result"},
+                ]},
+            ],
+            "tools": [{"name": "f", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == "exact result", (
+            f"Tool result content must be verbatim; got {tool_msg['content']!r}"
+        )
+
+
+def test_empty_string_tool_result_content_not_replaced() -> None:
+    """Empty string ``tool_result.content`` must stay empty — not ``"..."``.
+
+    The current code normalises empty content to the placeholder ``"..."``
+    at the message level. That substitution is for empty ``user`` content,
+    not for tool result bodies. Exercise the full pipeline so the test
+    catches the post-sanitisation substitution.
+    """
+    with _patched_empty_config():
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_01abc",
+                     "name": "f", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01abc",
+                     "content": ""},
+                ]},
+            ],
+            "tools": [{"name": "f", "description": "x",
+                       "input_schema": {"type": "object"}}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        srv.sanitize_messages_for_openai(out["messages"])
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == "", (
+            f"Empty tool result must stay empty; got {tool_msg['content']!r}"
+        )
 
 
 def test_user_content_list_with_text_and_image() -> None:
