@@ -11,3 +11,143 @@ dependencies = [
     "litellm>=1.81.0",
     "python-dotenv>=1.0.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
+    "ty>=0.0.70",
+    "vulture>=2.16",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 140
+exclude = ["vulture_whitelist.py"]
+
+[tool.ruff.lint]
+preview = true
+select = [
+    "A",     # builtin shadowing
+    "ASYNC", # flake8-async
+    "B",     # bugbear
+    "BLE",   # blind-except
+    "C4",    # comprehensions
+    "COM",   # commas
+    "DTZ",   # flake8-datetimez
+    "E",     # pycodestyle errors
+    "EM",    # exception messages
+    "ERA",   # commented-out-code
+    "EXE",   # executable
+    "F",     # pyflakes
+    "FA",    # flake8-future-annotations
+    "FIX",   # flake8-fixme
+    "FLY",   # flynt
+    "FURB",  # refurb
+    "G",     # logging
+    "I",     # isort
+    "ICN",   # flake8-import-conventions
+    "INP",   # flake8-no-pep420
+    "INT",   # flake8-gettext
+    "ISC",   # implicit string concat
+    "LOG",   # flake8-logging
+    "PERF",  # perflint
+    "PGH",   # pygrep-hooks
+    "PIE",   # flake8-pie
+    "PT",    # pytest-style
+    "PTH",   # pathlib
+    "Q",     # quotes
+    "RET",   # return-statement
+    "RSE",   # flake8-raise
+    "RUF",   # ruff-specific
+    "S",     # flake8-bandit
+    "SIM",   # simplify
+    "SLF",   # private-member-access
+    "SLOT",  # flake8-slots
+    "TCH",   # flake8-type-checking
+    "TD",    # flake8-todos
+    "TID",   # flake8-tidy-imports
+    "TRY",   # tryceratops
+    "UP",    # pyupgrade
+    "ANN",   # flake8-annotations
+    "ARG",   # flake8-unused-arguments
+    "C",     # legacy flake8-comprehensions (C4 is the modern subset; both is safer)
+    "D",     # pydocstyle
+    "FAST",  # FastAPI-specific (route signatures, unused path params)
+    "FBT",   # boolean positional args / defaults — catch call-site arg swaps
+    "N",     # pep8-naming
+    "PL",    # Pylint
+    "T",     # T10 (debugger) + T20 (print in prod)
+    "W",     # pycodestyle warnings
+    # --- below: intentionally disabled. Uncomment to enable. ---
+]
+# False positives / intentional suppressions.
+ignore = [
+    "blind-except",           # top-level error wrappers intentionally catch everything; per-call catches narrow where the exception type is known
+    "any-type",               # `get_field` is duck-typed (dict | object) and propagates `Any`; typing it as `object` cascades into cast() at every call site.
+    "EM",                     # user prefers `raise X("msg")` inline — EM (raw/f-string/dot-format in exception) flags exactly that
+    "raise-vanilla-args",     # user prefers `raise X("msg")` inline over `msg = "..."; raise X(msg)`
+    "undocumented-public-init",    # __init__ docstrings are noise — the class docstring covers the constructor's contract
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-branches = 12
+max-returns = 6
+max-args = 5
+max-positional-args = 5
+max-statements = 50
+
+[tool.ruff.lint.pep8-naming]
+# Pydantic validators/methods use `cls`, not `self`. Tell N805 the
+# decorator names so it skips them.
+classmethod-decorators = ["field_validator", "model_validator", "pydantic_validator"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint.isort]
+known-first-party = ["server", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests.py" = [
+    "assert",
+    "private-member-access",
+    "unused-async",
+    "float-equality-comparison",
+    "module-import-not-at-top-of-file",
+    "magic-value-comparison", # tests assert against literal sampling temps/byte sizes/HTTP codes — naming each one adds ceremony without clarity
+    "D",     # tests.py has its own module docstring already; per-test docstrings are noise
+    "T20",   # integration runner prints scenarios + pass/fail lines
+]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+include = ["server.py", "tests.py"]
+
+[tool.ty.rules]
+# Promote every ty default-ignore rule to warn (or error for missing-type-argument) so future regressions surface. Server-side ignores use `# ty: ignore[...]`.
+missing-type-argument = "error"
+blanket-ignore-comment = "warn"
+division-by-zero = "warn"
+missing-override-decorator = "warn"
+possibly-missing-attribute = "warn"
+possibly-missing-import = "warn"
+possibly-unresolved-reference = "warn"
+unsound-return-statement = "warn"
+unsound-yield = "warn"
+unsupported-dynamic-base = "warn"
+
+[tool.vulture]
+paths = ["server.py", "tests.py", "vulture_whitelist.py"]
+min_confidence = 60
+ignore_decorators = [
+    "@app.*",
+    "@field_validator",
+    "@model_validator",
+    "@override",
+]

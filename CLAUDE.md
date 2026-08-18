@@ -15,6 +15,7 @@ A FastAPI proxy that accepts Anthropic Messages API requests, translates them to
 - **All tests**: `python tests.py --all`
 - **Filter integration scenarios**: `--simple` (skip tool tests) or `--tools` (only tool tests)
 - **Add a unit test**: write a `test_*` function in `tests.py` — `discover_unit_tests()` collects them automatically, no decorators needed
+- **Dev tooling** (ruff, ty, vulture, pre-commit): see `README.md` → Development
 
 ## Architecture
 
@@ -96,9 +97,11 @@ The discriminator between "client sent the field" and "Pydantic default applied"
 
 Logs go to stderr with a single timestamped format. `log_request` prints one line per request with colour-coded model names (ANSI when stderr is a TTY). `uvicorn.access` is silenced because we already log via `log_request`. The lifespan hook `_configure_logging` re-applies the format after uvicorn installs its own handlers, and reads `LOG_LEVEL` (default `INFO`). At `DEBUG` level, the request handler dumps the effective upstream sampling params + `extra_body` (whether sourced from request or `[tier]` config) so operators can verify backend knobs without attaching mitmproxy.
 
-### Comments
+### Style
 
-Comments are for non-obvious things only. Laconic, direct, concise — one line when possible. No prose explanations of what the code obviously does. No "what I changed and why" history in the diff itself (commit messages carry that).
+**Comments** are for non-obvious things only. Laconic, one line when possible, no prose explanations of what the code obviously does. No "what I changed and why" history in the diff itself — commit messages carry that. Comments describe current behaviour, not contrast with prior versions: drop rot-comments like "no longer X", "still Y", "instead of X", "was previously Z". If the code today does A, say it does A — don't anchor it against what it used to do.
+
+**Raises**: prefer `raise ValueError("msg")` inline. Avoid `msg = "..."` then `raise ValueError(msg)`. The `EM` and `raise-vanilla-args` ruff rules are suppressed for this preference.
 
 ## Tests
 

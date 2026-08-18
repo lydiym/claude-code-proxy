@@ -32,8 +32,9 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
 
 3. **Run the server:**
    ```bash
-   uv run uvicorn server:app --host 0.0.0.0 --port 8082 --reload
+   uv run uvicorn server:app --reload
    ```
+   Pass `--host 0.0.0.0` to expose on the LAN, `--host <ip>` for a specific interface, `--port <n>` for a non-default port.
 
 ### Using with Claude Code 🎮
 
@@ -157,6 +158,39 @@ Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_temp
 6. **Return** the formatted response (streaming or non-streaming) ✅
 
 Tool calls round-trip natively: `assistant.tool_calls` and `role="tool"` messages are preserved so tool use works with any OpenAI-compatible backend.
+
+## Development 🛠️
+
+```bash
+# Install dev deps (ruff, ty, vulture) — uv manages them via PEP 735 [dependency-groups].
+uv sync
+
+# Lint (autofix what's safe, suggest fixes for the rest).
+uv run ruff check --fix
+
+# Format.
+uv run ruff format
+
+# Type-check (ty config in pyproject.toml; checks server.py and tests.py).
+uv run ty check
+
+# Find dead code (vulture config in pyproject.toml; false positives in vulture_whitelist.py).
+uv run vulture
+
+# Run the test suite (unit tests, no network needed).
+uv run python tests.py
+```
+
+The pre-commit hook runs ruff (check + format), ty, and vulture on every commit:
+
+```bash
+uv tool install pre-commit
+pre-commit install
+```
+
+`tests.py` is linted by ruff, ty, and vulture with the same active rule set as `server.py` — per-file ignores in `pyproject.toml` (`assert`, `private-member-access`, `unused-async`, `float-equality-comparison`, `module-import-not-at-top-of-file`) suppress test-context noise (asserts are the test pattern, monkey-patching internals, async generators as fixtures, TOML-roundtrip exact floats, intentional late `import server`). `vulture_whitelist.py` is excluded from ruff: it's a tool config file, not production code.
+
+A handful of duck-typed call sites in `server.py` carry `# ty: ignore[unsound-return-statement]` — they're documented latent bugs in [`bugtracker.md`](bugtracker.md) (pre-existing in `main`, refactored but not fixed). The rule stays active so any new unsound-return at a different site still warns; the explicit ignores keep `ty check` clean and pre-commit green.
 
 ## Contributing 🤝
 
