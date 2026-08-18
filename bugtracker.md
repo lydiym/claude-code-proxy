@@ -1,10 +1,11 @@
 # Bug tracker
 
-Known issues and review findings deferred from the linter branch (`chore/linters`).
+Known latent issues in `server.py` / `tests.py`. Items are grouped by area;
+new findings belong at the top of the relevant section. Delete an entry
+when fixed — git history preserves it.
 
-Items in **Active** are still latent in `main`; items in **Resolved** were
-fixed in this branch (see commit `8eb227d`). New findings go to **Active**
-and migrate down as work lands.
+Line numbers in headers are approximate anchors; they drift as the
+surrounding code changes.
 
 ## Active
 
@@ -24,8 +25,7 @@ and migrate down as work lands.
   `end_turn` otherwise. Requires the in-flight tool_use block to remain
   open through the finish event (Anthropic SSE expects
   `content_block_stop` before `message_delta`).
-- **Source**: code review, `server.py:1635` — pre-existing in `main`,
-  preserved through our refactor; not introduced by the linter branch.
+- **Source**: pre-existing in `main`.
 
 #### `_log_request` emits STATUS_OK before upstream call — `server.py:1907`
 
@@ -43,9 +43,7 @@ and migrate down as work lands.
 - **Suggested fix**: wrap the `_handle_request` body in `try/except` that
   re-emits `_log_request` with the failure status code, or move the log
   line into a finally-style emission that captures the actual outcome.
-- **Source**: code review, `server.py:1916` — pre-existing in `main`. We
-  refactored the call shape to a `_LogContext` dataclass in `cd0baca` but
-  kept the same call position. No regression vs. `main`.
+- **Source**: pre-existing in `main`.
 
 ### Code quality / DRY
 
@@ -63,8 +61,7 @@ and migrate down as work lands.
 - **Suggested fix**: collapse to a single `_parse_section(body, section,
   accepts_model: bool)` and call it from both dispatch paths. Or keep
   separate functions but factor the body into `_validate_section_key`.
-- **Source**: code review, `server.py:207,229` — both functions created in
-  `1f179439` (2026-08-11), pre-dates the linter branch.
+- **Source**: pre-existing in `main`.
 
 ### Design / docs
 
@@ -81,7 +78,7 @@ and migrate down as work lands.
   `[big]` for non-haiku unmapped tiers (changes documented behaviour), or
   (b) keep current behaviour and add an explicit warning at startup when
   `[big].model` is set but the resolver never reads it for tier=None.
-- **Source**: code review, `server.py:1122` — pre-existing in `main`.
+- **Source**: pre-existing in `main`.
 
 #### HOST default `127.0.0.1` — `server.py:1958`
 
@@ -93,55 +90,51 @@ and migrate down as work lands.
   "127.0.0.1"`. Bare `python server.py` no longer LAN-bindable without
   `HOST=0.0.0.0`.
 - **Suggested fix**: documented in `README.md`, `.env.example`, and
-  `CLAUDE.md` (commits `1363364` + `2ce4cf7`). No code change needed;
-  re-evaluate if users report migration friction.
-- **Source**: code review, `server.py:1958` — intentional change in
-  `1363364`.
+  `CLAUDE.md`. No code change needed; re-evaluate if users report
+  migration friction.
+- **Source**: intentional behaviour change.
 
-### Pre-existing format drift
+### Format drift
 
-Side-finding from the linter branch. Not run through `ruff format`
-because the diff would be unrelated to the linter work and pollute the
-history.
+Not run through `ruff format` because the diff would have been unrelated
+to the work that surfaced these items. Re-run `uv run ruff format` and
+verify the test suite still passes after reformatting.
 
 - `server.py:659` — long type alias wraps awkwardly.
-- `tests.py` — 4 places of accumulated format drift (`uv run ruff format`
-  would normalise; verify the test suite still passes after).
+- `tests.py` — 4 places of accumulated format drift.
 
 ### Code robustness
 
 Latent bugs in `_first_choice`, `_extract_tool_calls`, `_parse_tool_arguments`,
-`_extract_usage`, `_join_tool_result_items`. Pre-existing in `main`; the linter
-branch refactored bodies but preserved the unsound patterns. Each site now
-carries an explicit `# ty: ignore[unsound-return-statement]` so `ty` exits
-clean, but the runtime hazards remain until fixed.
+`_extract_usage`, `_join_tool_result_items`. Each site carries an explicit
+`# ty: ignore[unsound-return-statement]` so `ty` exits clean; the runtime
+hazards below remain until the actual bug is fixed.
 
 #### `_join_tool_result_items` crashes on non-string `text` — `server.py:886`
 
 - **Severity**: medium — uncaught `TypeError` escapes to the request handler as a 500.
-- **Where**: `_join_tool_result_items` (extracted by `dd8516ea` from main's
-  `parse_tool_result_content` at `~server.py:717`) does `item.get("text", "") + "\n"`
-  without coercing. Pydantic accepts `content: [{"type": "text", "text": null}]`
-  because `ContentBlockToolResult.content` is typed loosely (`str | list[...] | ... | Any`).
+- **Where**: `_join_tool_result_items` (extracted from `parse_tool_result_content`)
+  does `item.get("text", "") + "\n"` without coercing. Pydantic accepts
+  `content: [{"type": "text", "text": null}]` because
+  `ContentBlockToolResult.content` is typed loosely (`str | list[...] | ... | Any`).
 - **Repro**: `tool_result.content = [{"type": "text", "text": null}]` →
   `result += None + "\n"` → `TypeError`. Same for `text: 42`, `text: [1,2]`,
-  `text: {...}`. Sibling `_parse_tool_result_dict` already does `str(content.get("text", ""))`
-  safely.
+  `text: {...}`. Sibling `_parse_tool_result_dict` already does
+  `str(content.get("text", ""))` safely.
 - **Suggested fix**: wrap with `str(...)` like the sibling does, or push the
   type narrowing up into the caller by tightening `ContentBlockToolResult.content`.
-- **Source**: code review pass 2 (post-`54c37ac`). Pre-existing in main's
-  `parse_tool_result_content`; refactored into a helper by `dd8516ea`.
+- **Source**: pre-existing in `main`.
 
 #### `_first_choice` indexes without `isinstance(choices, list)` — `server.py:1233`
 
 - **Severity**: low — malformed upstream returns 500 via broad exception handler.
-- **Where**: `_first_choice` does `if not choices: return None` then `return choices[0]`.
-  A dict-keyed or string-valued `choices` passes the falsy check but raises
-  on `[0]`.
+- **Where**: `_first_choice` does `if not choices: return None` then
+  `return choices[0]`. A dict-keyed or string-valued `choices` passes the
+  falsy check but raises on `[0]`.
 - **Repro**: cascade proxy returns `{"choices": {"0": {...}}}` or `{"choices": "error"}`.
 - **Suggested fix**: `if not isinstance(choices, list) or not choices: return None`.
   Same `isinstance` guard would also clear the `unsound-return` inference.
-- **Source**: code review pass 2. Pre-existing in main (same code at `~server.py:1056`).
+- **Source**: pre-existing in `main`.
 
 #### `_extract_tool_calls` wraps non-list into `[raw]` — `server.py:1248`
 
@@ -155,7 +148,7 @@ clean, but the runtime hazards remain until fixed.
 - **Repro**: `message = {"tool_calls": "call_1"}` → empty `name` + `input`.
 - **Suggested fix**: drop the `return [raw]` fallback, or guard with
   `isinstance(raw, dict)` to wrap a single dict-call (not a string/int/tuple).
-- **Source**: code review pass 2. Pre-existing in main (same code).
+- **Source**: pre-existing in `main`.
 
 #### `_parse_tool_arguments` returns non-dict from `json.loads` — `server.py:1257`
 
@@ -168,7 +161,7 @@ clean, but the runtime hazards remain until fixed.
 - **Repro**: upstream returns `tool_calls[0].function.arguments == "5"` (or
   `"null"`, `"[1,2]"`, `'"hi"'`) → `input: 5` → ValidationError.
 - **Suggested fix**: `result = json.loads(raw); return result if isinstance(result, dict) else {"raw": raw}`.
-- **Source**: code review pass 2. Pre-existing in main.
+- **Source**: pre-existing in `main`.
 
 #### `_extract_usage` doesn't coerce non-int token counts — `server.py:1295`
 
@@ -181,36 +174,4 @@ clean, but the runtime hazards remain until fixed.
   → ValidationError → broad handler → error placeholder.
 - **Suggested fix**: mirror streaming path `_record_chunk_usage` (~line 1672):
   `isinstance(incoming, (int, float)) and int(incoming)` else `0`.
-- **Source**: code review pass 2. Pre-existing in main (`~server.py:1108`).
-
-## Resolved
-
-Items fixed in `8eb227d` "fix: revert 5 regressions introduced by linter branch".
-
-| # | File | What | Why |
-|---|------|------|-----|
-| 3 | `server.py:1707` | Drop `isinstance(delta, dict)` coercion in `_process_chunk` | Downstream `_get_field` / `_coerce_delta_field` already handle non-dict via duck-typed getattr fallbacks. |
-| 4 | `server.py:1796` | Move `state.should_stop = True` BEFORE `yield from _emit_failure(...)` in `_handle_chunk_error` | Main used `return` immediately after the yield-from; we replaced with `should_stop` but kept post-yield ordering, leaving the guard unset if `_emit_failure` raises. |
-| 5 | `server.py:792` | Drop `isinstance(text, str)` guard in `_ThinkStreamParser.feed` | Restore main's truthiness-only guard; truthy non-strings now crash on `buffer += text` and surface via chunk tolerance. |
-| 6 | `server.py:1499` | Drop `isinstance(text, str)` guard in `_emit_thinking` | Same rationale as #5. |
-| 7 | `server.py:107` | Drop `tiktoken.Encoding` subclass, revert to plain duck-typed class for `_OfflineEncoding` | Subclass made `isinstance(enc, Encoding)` True and dispatched into non-overridden parent methods that dereference uninitialised `_mergeable_ranks` / `_special_tokens`. Duck-typed class only exercises methods we explicitly define. |
-
-## Source
-
-Code-review findings from the `chore/linters` review pass (10 findings).
-5 fixed in `8eb227d`; 5 listed in **Active** above.
-
-Code-review findings from pass 2 (post-`54c37ac`, 10 findings):
-
-| # | Finding | Origin | Resolution |
-|---|---------|--------|------------|
-| 1 | `unsound-return-statement = "warn"` regresses `ty check` exit 1 | NEW (this branch) | Mitigated: 6 sites now carry `# ty: ignore[unsound-return-statement]`, ty exits 0 |
-| 2 | `_join_tool_result_items` TypeError on non-string `text` | PRE-EXISTING | Logged in Active → Code robustness |
-| 3 | `_parse_tool_arguments` returns non-dict from `json.loads` | PRE-EXISTING | Logged in Active → Code robustness |
-| 4 | `_extract_usage` doesn't coerce float/negative | PRE-EXISTING | Logged in Active → Code robustness |
-| 5 | 6 trailing comments document unsoundness instead of suppressing | NEW (this branch) | Replaced with `# ty: ignore[unsound-return-statement]` at each site |
-| 6 | Comments violate CLAUDE.md (prose apologia, false claims) | NEW (this branch) | Same — replaced with structured ignore comments |
-| 7 | `_extract_tool_calls` wraps non-list as `[raw]` | PRE-EXISTING | Logged in Active → Code robustness |
-| 8 | `_first_choice` indexes without `isinstance(choices, list)` | PRE-EXISTING | Logged in Active → Code robustness |
-| 9 | pyproject.toml header comment miscategorises 4 rules | NEW (this branch) | Rewritten to "Promote every default-ignore rule to warn" |
-| 10 | README documents clean ty gate; baseline was 6 warnings | NEW (this branch) | ty now exits 0 after fix #5; README note added |
+- **Source**: pre-existing in `main`.
