@@ -206,7 +206,9 @@ _THINK_OPEN_TAG = "<think>"
 _THINK_CLOSE_TAG = "</think>"
 
 # ---------------------------------------------------------------------------
-# Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
+# Shared utilities — used across translation / response / streaming sections.
+# Moved up from their original scattered locations so every caller below can
+# rely on them being defined.
 # ---------------------------------------------------------------------------
 
 
@@ -225,327 +227,18 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
-def _strip_provider_prefix(name: str) -> str:
-    """Strip a known provider prefix (case-insensitive). Bare-name case preserved."""
-    for prefix in _PROVIDER_PREFIXES:
-        if name.lower().startswith(prefix):
-            return name[len(prefix) :]
-    return name
+def _get_field(obj: object, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
-def _match_tier(name: str) -> str | None:
-    """First TIER_KEYS substring that appears in the lower-cased name.
-
-    Returns None when no tier matches.
-    """
-    lower = name.lower()
-    for tier in TIER_KEYS:  # insertion order = routing priority (haiku first)
-        if tier in lower:
-            return tier
-    return None
+def _new_msg_id() -> str:
+    return f"msg_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
 
-def _parse_tier_section(body: dict[str, Any], section: str) -> dict[str, Any]:
-    """Parse [global]. Accepts `model` (str) + `extra_body` (dict).
-
-    Bad values are warned and skipped so one error doesn't drop the rest.
-    """
-    out: dict[str, Any] = {}
-    for k, v in body.items():
-        if k == "model":
-            if not isinstance(v, str) or not v:
-                logger.warning("[%s].model must be a non-empty string; ignoring", section)
-                continue
-            out[k] = v
-        elif k == "extra_body":
-            if not isinstance(v, dict):
-                logger.warning("[%s].extra_body must be a table; ignoring", section)
-                continue
-            out[k] = deepcopy(v)
-        else:
-            logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
-    return out
-
-
-def _parse_bucket_section(body: dict[str, Any], section: str) -> dict[str, Any]:
-    """Parse [big], [small], or a per-tier section. Accepts `model` (str) and `extra_body` (dict).
-
-    Bad values warned and skipped.
-    """
-    out: dict[str, Any] = {}
-    for k, v in body.items():
-        if k == "model":
-            if not isinstance(v, str) or not v:
-                logger.warning("[%s].model must be a non-empty string; ignoring", section)
-                continue
-            out[k] = v
-        elif k == "extra_body":
-            if not isinstance(v, dict):
-                logger.warning("[%s].extra_body must be a table; ignoring", section)
-                continue
-            out[k] = deepcopy(v)
-        else:
-            logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
-    return out
-
-
-def _coerce_proxy_value(key: str, value: object, section: str) -> str | bool | object:
-    """Coerce a [proxy] TOML value to the expected Python type.
-
-    Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped.
-    """
-    if isinstance(value, str):
-        return value  # strings are the canonical type for api_key, base_url, model names
-    if key in _BOOL_TLS_VERIFY and isinstance(value, bool):
-        return value
-    if key in _BOOL_TLS_VERIFY and isinstance(value, int) and not isinstance(value, bool):
-        return bool(value)
-    logger.warning(
-        "[%s].%s=%r has wrong type (%s); ignoring",
-        section,
-        key,
-        value,
-        type(value).__name__,
-    )
-    return _COERCE_DROP
-
-
-def _load_config(path: str) -> dict[str, Any]:
-    """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
-    out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
-    if not path:
-        return out
-    if not pathlib.Path(path).is_file():
-        logger.info("CONFIG_PATH=%r not found; using env vars only", path)
-        return out
-    try:
-        with pathlib.Path(path).open("rb") as f:
-            raw = tomllib.load(f)
-    except tomllib.TOMLDecodeError:
-        logger.exception("Malformed TOML in %s; falling back to env vars", path)
-        return out
-    for section, body in raw.items():
-        if section not in _VALID_SECTIONS:
-            logger.warning(
-                "Unknown section [%s] in %s; ignoring (valid: %s)",
-                section,
-                path,
-                sorted(_VALID_SECTIONS),
-            )
-            continue
-        if not isinstance(body, dict):
-            logger.warning("[%s] must be a table, got %s; ignoring", section, type(body).__name__)
-            continue
-        if section == "proxy":
-            out["proxy"] = _parse_proxy_section(body)
-        elif section in {"big", "small"}:
-            out[section] = _parse_bucket_section(body, section)
-        elif section == "global":
-            out["global"] = _parse_tier_section(body, section)
-        else:  # per-tier section
-            out["tiers"][section] = _parse_bucket_section(body, section)
-    return out
-
-
-def _parse_proxy_section(body: dict[str, object]) -> dict[str, object]:
-    """Pick out the keys we recognise from [proxy]; warn and skip the rest."""
-    out: dict[str, object] = {}
-    for k, v in body.items():
-        if k not in _PROXY_KEYS:
-            logger.warning("[proxy].%s is not a recognised key; ignoring", k)
-            continue
-        coerced = _coerce_proxy_value(k, v, "proxy")
-        if coerced is _COERCE_DROP:
-            continue
-        out[k] = coerced
-    return out
-
-
-CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config.toml")
-try:
-    CONFIG = _load_config(CONFIG_PATH)
-except Exception:
-    # Infrastructure error only — parse failures are handled inside _load_config.
-    logger.exception("Failed to load CONFIG_PATH=%r; using env vars only", CONFIG_PATH)
-    CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
-
-# WARNING so the boot summary shows up before uvicorn installs its own handlers.
-logger.warning(
-    "Loaded config from %r: proxy=%s, big=%s, small=%s, global=%s, tiers=%s",
-    CONFIG_PATH,
-    list(CONFIG["proxy"]),
-    CONFIG["big"],
-    CONFIG["small"],
-    "yes" if CONFIG["global"] else "no",
-    list(CONFIG["tiers"]),
-)
-
-
-def _proxy_value(key: str, env_name: str, default: object = None) -> object:
-    """Env var → CONFIG[proxy][key] → default. None / "" fall through."""
-    if key not in _PROXY_KEYS:
-        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy key")
-    env_val = os.environ.get(env_name)
-    if env_val not in {None, ""}:
-        return env_val
-    val = CONFIG["proxy"].get(key)
-    if val not in {None, ""}:
-        return val
-    return default
-
-
-def _proxy_bool(key: str, env_name: str, *, default: bool = True) -> bool:
-    """Resolve a boolean config value; unrecognised strings keep ``default``."""
-    val = _proxy_value(key, env_name, default)
-    if isinstance(val, bool):
-        return val
-    if val is None:
-        return default
-    return _str_to_bool(val, default=default)
-
-
-@cache
-def _default_model_for_tier(tier: str | None) -> str:
-    """Per-tier upstream model.
-
-    Lookup order:
-      1. {TIER}_MODEL env (e.g. HAIKU_MODEL; skipped when tier=None)
-      2. {BIG|SMALL}_MODEL env — bucket-level (haiku → SMALL_MODEL, others → BIG_MODEL)
-      3. [tier].model config (skipped when tier=None)
-      4. [bucket].model config (haiku → small, others → big; bucket skipped when tier=None)
-      5. [global].model config — fallback for any model
-      6. Built-in default (gpt-4.1-mini for haiku bucket, gpt-4.1 otherwise)
-
-    Cached at first call — env or CONFIG.toml edits require restart for
-    these lookups. ``[tier].extra_body`` edits apply live via the per-call
-    ``_resolve_tier_config``.
-    """
-    bucket = _bucket_for_tier(tier)
-    built_in = "gpt-4.1-mini" if bucket == "small" else "gpt-4.1"
-
-    if tier:
-        env_val = _env_nonempty(f"{tier.upper()}_MODEL")
-        if env_val is not None:
-            return env_val
-    bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
-    env_val = _env_nonempty(bucket_env)
-    if env_val is not None:
-        return env_val
-
-    if tier:
-        cfg_model = _config_model((CONFIG.get("tiers") or {}).get(tier) or {})
-        if cfg_model is not None:
-            return cfg_model
-    if bucket:
-        cfg_model = _config_model(CONFIG.get(bucket) or {})
-        if cfg_model is not None:
-            return cfg_model
-    cfg_model = _config_model(CONFIG.get("global") or {})
-    if cfg_model is not None:
-        return cfg_model
-    return built_in
-
-
-def _bucket_for_tier(tier: str | None) -> str | None:
-    """Map tier to its bucket section.
-
-    Returns None for tier=None so an unmapped model skips the bucket config
-    lookup and falls through to [global].model (the catch-all).
-    """
-    if tier == "haiku":
-        return "small"
-    if tier is None:
-        return None
-    return "big"
-
-
-def _env_nonempty(name: str) -> str | None:
-    val = os.environ.get(name) if name else None
-    return val or None
-
-
-def _config_model(section: dict[str, object]) -> str | None:
-    val = section.get("model")
-    return val if isinstance(val, str) and val else None
-
-
-class _Colors:
-    """ANSI color codes used to highlight parts of operational log lines."""
-
-    CYAN = "\033[96m"
-    BLUE = "\033[94m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    MAGENTA = "\033[95m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
-
-
-def _color(code: str, text: str | int) -> str:
-    """Wrap text in ANSI code when stderr is a TTY, otherwise return plain."""
-    try:
-        if sys.stderr.isatty():
-            return f"{code}{text}{_Colors.RESET}"
-    except (ValueError, AttributeError):
-        pass
-    return str(text)
-
-
-def _reset_logger(name: str, *, propagate: bool) -> None:
-    log = logging.getLogger(name)
-    log.handlers.clear()
-    log.propagate = propagate
-
-
-@asynccontextmanager
-async def _configure_logging(_app: FastAPI) -> AsyncIterator[None]:
-    """Unify the log format and silence uvicorn.access.
-
-    Runs after uvicorn's own configure_logging() so it overrides whatever
-    uvicorn set up.
-    """
-    root = logging.getLogger()
-    root.handlers.clear()
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
-    root.addHandler(handler)
-
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    try:
-        logger.setLevel(log_level)
-    except ValueError:
-        logger.setLevel(logging.INFO)
-        logger.warning("Invalid LOG_LEVEL=%r; falling back to INFO", log_level)
-    for noisy in ("LiteLLM", "httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    if _litellm_debug_http_enabled():
-        # Verbose mode: see exactly what litellm sends/receives and what
-        # goes over the wire via httpx. Heavy — only for live debugging.
-        litellm.set_verbose = True  # type: ignore[ty:invalid-assignment]
-        for noisy in ("httpx", "httpcore", "LiteLLM"):
-            logging.getLogger(noisy).setLevel(logging.DEBUG)
-        logger.warning("LITELLM_DEBUG_HTTP=1 — verbose litellm + httpx/httpcore DEBUG logs enabled")
-
-    _reset_logger("uvicorn", propagate=True)
-    _reset_logger("uvicorn.error", propagate=True)
-    _reset_logger("uvicorn.access", propagate=False)
-
-    yield
-
-
-app = FastAPI(lifespan=_configure_logging)
-
-
-OPENAI_API_KEY = _proxy_value("openai_api_key", "OPENAI_API_KEY")
-OPENAI_BASE_URL = _proxy_value("openai_base_url", "OPENAI_BASE_URL")
-
-# Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
-OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", default=True)
-litellm.ssl_verify = OPENAI_TLS_VERIFY
-if not OPENAI_TLS_VERIFY:
-    logger.warning("OPENAI_TLS_VERIFY=false — TLS certificate validation is disabled. Do not use this in production.")
+def _new_tool_id() -> str:
+    return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
 
 def _to_anthropic_stop_reason(finish_reason: object) -> Literal["end_turn", "max_tokens", "tool_use"]:
@@ -569,18 +262,14 @@ def _sanitize_error_message(message: str) -> str:
     return message
 
 
-def _get_field(obj: object, key: str, default: Any = None) -> Any:
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-def _new_msg_id() -> str:
-    return f"msg_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
-
-
 def _short_model(name: str) -> str:
     return name.rsplit("/", maxsplit=1)[-1] if "/" in name else name
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models — request/response vocabulary. Everything below references
+# these types, so they sit above their consumers.
+# ---------------------------------------------------------------------------
 
 
 class ContentBlockText(BaseModel):
@@ -749,74 +438,375 @@ class MessagesResponse(BaseModel):
     usage: Usage
 
 
-class _ThinkStreamParser:
-    """Incremental parser that splits a stream into thinking vs. text chunks.
+# ---------------------------------------------------------------------------
+# Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
+# ---------------------------------------------------------------------------
 
-    The OpenAI-compatible model emits <think>...</think> markers inside its
-    content stream. Anthropic SSE needs these surfaced as their own content
-    blocks, so we buffer just enough to recognise a marker split across chunks
-    and yield tagged deltas for the caller to forward.
+
+def _strip_provider_prefix(name: str) -> str:
+    """Strip a known provider prefix (case-insensitive). Bare-name case preserved."""
+    for prefix in _PROVIDER_PREFIXES:
+        if name.lower().startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
+def _match_tier(name: str) -> str | None:
+    """First TIER_KEYS substring that appears in the lower-cased name.
+
+    Returns None when no tier matches.
+    """
+    lower = name.lower()
+    for tier in TIER_KEYS:  # insertion order = routing priority (haiku first)
+        if tier in lower:
+            return tier
+    return None
+
+
+def _parse_tier_section(body: dict[str, Any], section: str) -> dict[str, Any]:
+    """Parse [global]. Accepts `model` (str) + `extra_body` (dict).
+
+    Bad values are warned and skipped so one error doesn't drop the rest.
+    """
+    out: dict[str, Any] = {}
+    for k, v in body.items():
+        if k == "model":
+            if not isinstance(v, str) or not v:
+                logger.warning("[%s].model must be a non-empty string; ignoring", section)
+                continue
+            out[k] = v
+        elif k == "extra_body":
+            if not isinstance(v, dict):
+                logger.warning("[%s].extra_body must be a table; ignoring", section)
+                continue
+            out[k] = deepcopy(v)
+        else:
+            logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
+    return out
+
+
+def _parse_bucket_section(body: dict[str, Any], section: str) -> dict[str, Any]:
+    """Parse [big], [small], or a per-tier section. Accepts `model` (str) and `extra_body` (dict).
+
+    Bad values warned and skipped.
+    """
+    out: dict[str, Any] = {}
+    for k, v in body.items():
+        if k == "model":
+            if not isinstance(v, str) or not v:
+                logger.warning("[%s].model must be a non-empty string; ignoring", section)
+                continue
+            out[k] = v
+        elif k == "extra_body":
+            if not isinstance(v, dict):
+                logger.warning("[%s].extra_body must be a table; ignoring", section)
+                continue
+            out[k] = deepcopy(v)
+        else:
+            logger.warning("[%s].%s is not a recognised key; put it inside extra_body", section, k)
+    return out
+
+
+def _coerce_proxy_value(key: str, value: object, section: str) -> str | bool | object:
+    """Coerce a [proxy] TOML value to the expected Python type.
+
+    Returns the coerced value, or ``_COERCE_DROP`` when the key must be skipped.
+    """
+    if isinstance(value, str):
+        return value  # strings are the canonical type for api_key, base_url, model names
+    if key in _BOOL_TLS_VERIFY and isinstance(value, bool):
+        return value
+    if key in _BOOL_TLS_VERIFY and isinstance(value, int) and not isinstance(value, bool):
+        return bool(value)
+    logger.warning(
+        "[%s].%s=%r has wrong type (%s); ignoring",
+        section,
+        key,
+        value,
+        type(value).__name__,
+    )
+    return _COERCE_DROP
+
+
+def _parse_proxy_section(body: dict[str, object]) -> dict[str, object]:
+    """Pick out the keys we recognise from [proxy]; warn and skip the rest."""
+    out: dict[str, object] = {}
+    for k, v in body.items():
+        if k not in _PROXY_KEYS:
+            logger.warning("[proxy].%s is not a recognised key; ignoring", k)
+            continue
+        coerced = _coerce_proxy_value(k, v, "proxy")
+        if coerced is _COERCE_DROP:
+            continue
+        out[k] = coerced
+    return out
+
+
+def _load_config(path: str) -> dict[str, Any]:
+    """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
+    out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    if not path:
+        return out
+    if not pathlib.Path(path).is_file():
+        logger.info("CONFIG_PATH=%r not found; using env vars only", path)
+        return out
+    try:
+        with pathlib.Path(path).open("rb") as f:
+            raw = tomllib.load(f)
+    except tomllib.TOMLDecodeError:
+        logger.exception("Malformed TOML in %s; falling back to env vars", path)
+        return out
+    for section, body in raw.items():
+        if section not in _VALID_SECTIONS:
+            logger.warning(
+                "Unknown section [%s] in %s; ignoring (valid: %s)",
+                section,
+                path,
+                sorted(_VALID_SECTIONS),
+            )
+            continue
+        if not isinstance(body, dict):
+            logger.warning("[%s] must be a table, got %s; ignoring", section, type(body).__name__)
+            continue
+        if section == "proxy":
+            out["proxy"] = _parse_proxy_section(body)
+        elif section in {"big", "small"}:
+            out[section] = _parse_bucket_section(body, section)
+        elif section == "global":
+            out["global"] = _parse_tier_section(body, section)
+        else:  # per-tier section
+            out["tiers"][section] = _parse_bucket_section(body, section)
+    return out
+
+
+CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config.toml")
+try:
+    CONFIG = _load_config(CONFIG_PATH)
+except Exception:
+    # Infrastructure error only — parse failures are handled inside _load_config.
+    logger.exception("Failed to load CONFIG_PATH=%r; using env vars only", CONFIG_PATH)
+    CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+
+# WARNING so the boot summary shows up before uvicorn installs its own handlers.
+logger.warning(
+    "Loaded config from %r: proxy=%s, big=%s, small=%s, global=%s, tiers=%s",
+    CONFIG_PATH,
+    list(CONFIG["proxy"]),
+    CONFIG["big"],
+    CONFIG["small"],
+    "yes" if CONFIG["global"] else "no",
+    list(CONFIG["tiers"]),
+)
+
+
+def _proxy_value(key: str, env_name: str, default: object = None) -> object:
+    """Env var → CONFIG[proxy][key] → default. None / "" fall through."""
+    if key not in _PROXY_KEYS:
+        raise ValueError(f"_proxy_value: {key!r} is not a recognised proxy key")
+    env_val = os.environ.get(env_name)
+    if env_val not in {None, ""}:
+        return env_val
+    val = CONFIG["proxy"].get(key)
+    if val not in {None, ""}:
+        return val
+    return default
+
+
+def _proxy_bool(key: str, env_name: str, *, default: bool = True) -> bool:
+    """Resolve a boolean config value; unrecognised strings keep ``default``."""
+    val = _proxy_value(key, env_name, default)
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    return _str_to_bool(val, default=default)
+
+
+def _bucket_for_tier(tier: str | None) -> str | None:
+    """Map tier to its bucket section.
+
+    Returns None for tier=None so an unmapped model skips the bucket config
+    lookup and falls through to [global].model (the catch-all).
+    """
+    if tier == "haiku":
+        return "small"
+    if tier is None:
+        return None
+    return "big"
+
+
+def _env_nonempty(name: str) -> str | None:
+    val = os.environ.get(name) if name else None
+    return val or None
+
+
+def _config_model(section: dict[str, object]) -> str | None:
+    val = section.get("model")
+    return val if isinstance(val, str) and val else None
+
+
+@cache
+def _default_model_for_tier(tier: str | None) -> str:
+    """Per-tier upstream model.
+
+    Lookup order:
+      1. {TIER}_MODEL env (e.g. HAIKU_MODEL; skipped when tier=None)
+      2. {BIG|SMALL}_MODEL env — bucket-level (haiku → SMALL_MODEL, others → BIG_MODEL)
+      3. [tier].model config (skipped when tier=None)
+      4. [bucket].model config (haiku → small, others → big; bucket skipped when tier=None)
+      5. [global].model config — fallback for any model
+      6. Built-in default (gpt-4.1-mini for haiku bucket, gpt-4.1 otherwise)
+
+    Cached at first call — env or CONFIG.toml edits require restart for
+    these lookups. ``[tier].extra_body`` edits apply live via the per-call
+    ``_resolve_tier_config``.
+    """
+    bucket = _bucket_for_tier(tier)
+    built_in = "gpt-4.1-mini" if bucket == "small" else "gpt-4.1"
+
+    if tier:
+        env_val = _env_nonempty(f"{tier.upper()}_MODEL")
+        if env_val is not None:
+            return env_val
+    bucket_env = "SMALL_MODEL" if bucket == "small" else "BIG_MODEL"
+    env_val = _env_nonempty(bucket_env)
+    if env_val is not None:
+        return env_val
+
+    if tier:
+        cfg_model = _config_model((CONFIG.get("tiers") or {}).get(tier) or {})
+        if cfg_model is not None:
+            return cfg_model
+    if bucket:
+        cfg_model = _config_model(CONFIG.get(bucket) or {})
+        if cfg_model is not None:
+            return cfg_model
+    cfg_model = _config_model(CONFIG.get("global") or {})
+    if cfg_model is not None:
+        return cfg_model
+    return built_in
+
+
+class _Colors:
+    """ANSI color codes used to highlight parts of operational log lines."""
+
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def _color(code: str, text: str | int) -> str:
+    """Wrap text in ANSI code when stderr is a TTY, otherwise return plain."""
+    try:
+        if sys.stderr.isatty():
+            return f"{code}{text}{_Colors.RESET}"
+    except (ValueError, AttributeError):
+        pass
+    return str(text)
+
+
+def _reset_logger(name: str, *, propagate: bool) -> None:
+    log = logging.getLogger(name)
+    log.handlers.clear()
+    log.propagate = propagate
+
+
+@asynccontextmanager
+async def _configure_logging(_app: FastAPI) -> AsyncIterator[None]:
+    """Unify the log format and silence uvicorn.access.
+
+    Runs after uvicorn's own configure_logging() so it overrides whatever
+    uvicorn set up.
+    """
+    root = logging.getLogger()
+    root.handlers.clear()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
+    root.addHandler(handler)
+
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    try:
+        logger.setLevel(log_level)
+    except ValueError:
+        logger.setLevel(logging.INFO)
+        logger.warning("Invalid LOG_LEVEL=%r; falling back to INFO", log_level)
+    for noisy in ("LiteLLM", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    if _litellm_debug_http_enabled():
+        # Verbose mode: see exactly what litellm sends/receives and what
+        # goes over the wire via httpx. Heavy — only for live debugging.
+        litellm.set_verbose = True  # type: ignore[ty:invalid-assignment]
+        for noisy in ("httpx", "httpcore", "LiteLLM"):
+            logging.getLogger(noisy).setLevel(logging.DEBUG)
+        logger.warning("LITELLM_DEBUG_HTTP=1 — verbose litellm + httpx/httpcore DEBUG logs enabled")
+
+    _reset_logger("uvicorn", propagate=True)
+    _reset_logger("uvicorn.error", propagate=True)
+    _reset_logger("uvicorn.access", propagate=False)
+
+    yield
+
+
+@dataclass
+class _LogContext:
+    """Per-request fields needed to format the ``log_request`` line.
+
+    A dataclass beats 8 positional args when callers span many sites and the
+    field set is stable.
     """
 
-    def __init__(self) -> None:
-        self.in_thinking = False
-        self.buffer = ""
+    method: str
+    path: str
+    source_model: str
+    target_model: str
+    tier: str | None
+    num_messages: int
+    num_tools: int
+    status_code: int
 
-    def feed(self, text: object) -> list[tuple[str, str | None]]:
-        """Consume a chunk of model output; return a list of (kind, value).
 
-        kind is "text" or "thinking" for a delta, or "open" / "close" for a
-        block transition (value is None for those).
+def _log_request(ctx: _LogContext) -> None:
+    """Emit the per-request log line. Pure formatter — no side effects beyond ``logger.info``."""
+    endpoint = ctx.path.split("?", 1)[0] if "?" in ctx.path else ctx.path
+    status_color = _Colors.GREEN if ctx.status_code == STATUS_OK else _Colors.RED
+    tier_str = f" tier={_color(_Colors.YELLOW, ctx.tier)}" if ctx.tier else ""
+    line = (
+        f"{_color(_Colors.BOLD, ctx.method)} {_color(_Colors.BOLD, endpoint)} "
+        f"{_color(status_color, ctx.status_code)} "
+        f"{_color(_Colors.CYAN, _short_model(ctx.source_model))} "
+        f"{_color(_Colors.BOLD, '→')} "
+        f"{_color(_Colors.GREEN, _short_model(ctx.target_model))}"
+        f"{tier_str} "
+        f"({_color(_Colors.MAGENTA, f'{ctx.num_tools} tools')}, "
+        f"{_color(_Colors.BLUE, f'{ctx.num_messages} messages')})"
+    )
+    logger.info(line)
 
-        Truthy non-strings fall through to ``self.buffer += text`` and raise
-        ``TypeError``; the chunk-handler tolerance catches that and eventually
-        surfaces an ``event:error`` frame.
-        """
-        if not text:
-            return []
-        text = cast("str", text)  # narrow for += below; truthy non-strings raise TypeError caught by chunk tolerance
-        events = []
-        self.buffer += text
-        while self._drain(events):
-            pass
-        return events
 
-    def _drain(self, events: list[tuple[str, str | None]]) -> bool:
-        if not self.buffer:
-            return False
-        tag = _THINK_CLOSE_TAG if self.in_thinking else _THINK_OPEN_TAG
-        idx = self.buffer.find(tag)
-        if idx < 0:
-            if self.in_thinking:
-                # Hold until close tag: emitting early would commit bytes to
-                # "thinking" if the tag never arrives or splits mid-word later.
-                return False
-            # Text mode: only risk is a stray open tag, so flush up to the last '<'.
-            last_lt = self.buffer.rfind("<")
-            if last_lt < 0:
-                events.append(("text", self.buffer))
-                self.buffer = ""
-            elif last_lt > 0:
-                events.append(("text", self.buffer[:last_lt]))
-                self.buffer = self.buffer[last_lt:]
-            return False
-        if idx > 0:
-            kind = "thinking" if self.in_thinking else "text"
-            events.append((kind, self.buffer[:idx]))
-        events.append(("close" if self.in_thinking else "open", None))
-        self.in_thinking = not self.in_thinking
-        self.buffer = self.buffer[idx + len(tag) :]
-        return True
+app = FastAPI(lifespan=_configure_logging)
 
-    def flush(self) -> list[tuple[str, str | None]]:
-        if not self.buffer:
-            return []
-        events = [(("thinking" if self.in_thinking else "text"), self.buffer)]
-        self.buffer = ""
-        if self.in_thinking:
-            events.append(("close", None))
-            self.in_thinking = False
-        return events
+
+OPENAI_API_KEY = _proxy_value("openai_api_key", "OPENAI_API_KEY")
+OPENAI_BASE_URL = _proxy_value("openai_base_url", "OPENAI_BASE_URL")
+
+# Skip TLS validation when OPENAI_BASE_URL uses a self-signed cert (local LLM).
+OPENAI_TLS_VERIFY = _proxy_bool("openai_tls_verify", "OPENAI_TLS_VERIFY", default=True)
+litellm.ssl_verify = OPENAI_TLS_VERIFY
+if not OPENAI_TLS_VERIFY:
+    logger.warning("OPENAI_TLS_VERIFY=false — TLS certificate validation is disabled. Do not use this in production.")
+
+
+# ---------------------------------------------------------------------------
+# Request translation — Anthropic Messages → OpenAI Chat Completions.
+# Tool-result normalisers live here because they're request-side consumers of
+# ContentBlockToolResult; the per-message converters below call into them.
+# ---------------------------------------------------------------------------
 
 
 def _parse_tool_result_content(content: object) -> str:
@@ -1207,6 +1197,12 @@ def _apply_merged_extra_body(
         litellm_request["extra_body"] = {"allowed_openai_params": keys}
 
 
+# ---------------------------------------------------------------------------
+# Response translation — OpenAI Chat Completions → Anthropic Messages.
+# Non-streaming path only; streaming lives in its own section below.
+# ---------------------------------------------------------------------------
+
+
 def _first_choice(response: object) -> object:
     choices = _get_field(response, "choices", [])
     if not choices:
@@ -1329,6 +1325,13 @@ def _build_error_response(model: str, error: Exception) -> MessagesResponse:
         stop_reason="end_turn",
         usage=Usage(input_tokens=0, output_tokens=0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming — Anthropic SSE event framing + chunk-loop orchestration.
+# Order: dataclasses (state), formatter classes, parser, per-chunk helpers,
+# loop wrapper, public entry point.
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -1468,6 +1471,76 @@ class _SseFormatter:
         ]
 
 
+class _ThinkStreamParser:
+    """Incremental parser that splits a stream into thinking vs. text chunks.
+
+    The OpenAI-compatible model emits <think>...</think> markers inside its
+    content stream. Anthropic SSE needs these surfaced as their own content
+    blocks, so we buffer just enough to recognise a marker split across chunks
+    and yield tagged deltas for the caller to forward.
+    """
+
+    def __init__(self) -> None:
+        self.in_thinking = False
+        self.buffer = ""
+
+    def feed(self, text: object) -> list[tuple[str, str | None]]:
+        """Consume a chunk of model output; return a list of (kind, value).
+
+        kind is "text" or "thinking" for a delta, or "open" / "close" for a
+        block transition (value is None for those).
+
+        Truthy non-strings fall through to ``self.buffer += text`` and raise
+        ``TypeError``; the chunk-handler tolerance catches that and eventually
+        surfaces an ``event:error`` frame.
+        """
+        if not text:
+            return []
+        text = cast("str", text)  # narrow for += below; truthy non-strings raise TypeError caught by chunk tolerance
+        events = []
+        self.buffer += text
+        while self._drain(events):
+            pass
+        return events
+
+    def _drain(self, events: list[tuple[str, str | None]]) -> bool:
+        if not self.buffer:
+            return False
+        tag = _THINK_CLOSE_TAG if self.in_thinking else _THINK_OPEN_TAG
+        idx = self.buffer.find(tag)
+        if idx < 0:
+            if self.in_thinking:
+                # Hold until close tag: emitting early would commit bytes to
+                # "thinking" if the tag never arrives or splits mid-word later.
+                return False
+            # Text mode: only risk is a stray open tag, so flush up to the last '<'.
+            last_lt = self.buffer.rfind("<")
+            if last_lt < 0:
+                events.append(("text", self.buffer))
+                self.buffer = ""
+            elif last_lt > 0:
+                events.append(("text", self.buffer[:last_lt]))
+                self.buffer = self.buffer[last_lt:]
+            return False
+        if idx > 0:
+            kind = "thinking" if self.in_thinking else "text"
+            events.append((kind, self.buffer[:idx]))
+        events.append(("close" if self.in_thinking else "open", None))
+        self.in_thinking = not self.in_thinking
+        self.buffer = self.buffer[idx + len(tag) :]
+        return True
+
+    def flush(self) -> list[tuple[str, str | None]]:
+        if not self.buffer:
+            return []
+        events = [(("thinking" if self.in_thinking else "text"), self.buffer)]
+        self.buffer = ""
+        if self.in_thinking:
+            events.append(("close", None))
+            self.in_thinking = False
+        return events
+
+
 def _open_block(tracker: _BlockTracker, kind: str, block_dict: dict[str, Any]) -> Iterator[str]:
     yield from tracker.ensure(kind)
     if not tracker.is_open(kind):
@@ -1523,46 +1596,6 @@ def _emit_failure(
         _sanitize_error_message(f"{message_prefix}: {exc}"),
     )
     yield _SseFormatter.done()
-
-
-@dataclass
-class _LogContext:
-    """Per-request fields needed to format the ``log_request`` line.
-
-    A dataclass beats 8 positional args when callers span many sites and the
-    field set is stable.
-    """
-
-    method: str
-    path: str
-    source_model: str
-    target_model: str
-    tier: str | None
-    num_messages: int
-    num_tools: int
-    status_code: int
-
-
-def _log_request(ctx: _LogContext) -> None:
-    """Emit the per-request log line. Pure formatter — no side effects beyond ``logger.info``."""
-    endpoint = ctx.path.split("?", 1)[0] if "?" in ctx.path else ctx.path
-    status_color = _Colors.GREEN if ctx.status_code == STATUS_OK else _Colors.RED
-    tier_str = f" tier={_color(_Colors.YELLOW, ctx.tier)}" if ctx.tier else ""
-    line = (
-        f"{_color(_Colors.BOLD, ctx.method)} {_color(_Colors.BOLD, endpoint)} "
-        f"{_color(status_color, ctx.status_code)} "
-        f"{_color(_Colors.CYAN, _short_model(ctx.source_model))} "
-        f"{_color(_Colors.BOLD, '→')} "
-        f"{_color(_Colors.GREEN, _short_model(ctx.target_model))}"
-        f"{tier_str} "
-        f"({_color(_Colors.MAGENTA, f'{ctx.num_tools} tools')}, "
-        f"{_color(_Colors.BLUE, f'{ctx.num_messages} messages')})"
-    )
-    logger.info(line)
-
-
-def _new_tool_id() -> str:
-    return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
 
 @dataclass
@@ -1758,29 +1791,6 @@ def _process_single_tool_call(tool_call: object, tracker: _BlockTracker, state: 
             yield tracker.delta({"type": "input_json_delta", "partial_json": json.dumps(arguments)})
 
 
-def _handle_chunk_error(
-    exc: Exception,
-    tracker: _BlockTracker,
-    think_parser: _ThinkStreamParser,
-    state: _StreamState,
-) -> Iterator[str]:
-    logger.warning(
-        "Error processing chunk (%d/%d): %s",
-        state.consecutive_chunk_errors + 1,
-        MAX_CONSECUTIVE_CHUNK_ERRORS + 1,
-        exc,
-    )
-    state.consecutive_chunk_errors += 1
-    if state.consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
-        return
-    # Threshold tripped — escalate with traceback and surface error.
-    # should_stop is set before the yield-from so an exception mid-emission
-    # still leaves the loop guard set.
-    state.should_stop = True
-    logger.error("Chunk error threshold exceeded; surfacing error", exc_info=exc)
-    yield from _emit_failure(think_parser, tracker, state.output_tokens, exc, "chunk processing failed")
-
-
 async def _stream_chunks(
     response_generator: AsyncGenerator[Any, None],
     tracker: _BlockTracker,
@@ -1802,6 +1812,29 @@ async def _stream_chunks(
                 yield event
         if state.should_stop:
             return
+
+
+def _handle_chunk_error(
+    exc: Exception,
+    tracker: _BlockTracker,
+    think_parser: _ThinkStreamParser,
+    state: _StreamState,
+) -> Iterator[str]:
+    logger.warning(
+        "Error processing chunk (%d/%d): %s",
+        state.consecutive_chunk_errors + 1,
+        MAX_CONSECUTIVE_CHUNK_ERRORS + 1,
+        exc,
+    )
+    state.consecutive_chunk_errors += 1
+    if state.consecutive_chunk_errors <= MAX_CONSECUTIVE_CHUNK_ERRORS:
+        return
+    # Threshold tripped — escalate with traceback and surface error.
+    # should_stop is set before the yield-from so an exception mid-emission
+    # still leaves the loop guard set.
+    state.should_stop = True
+    logger.error("Chunk error threshold exceeded; surfacing error", exc_info=exc)
+    yield from _emit_failure(think_parser, tracker, state.output_tokens, exc, "chunk processing failed")
 
 
 async def handle_streaming(
@@ -1841,6 +1874,12 @@ async def handle_streaming(
         # Close so the internal httpx client releases deterministically —
         # otherwise mid-stream cancellation leaks it until GC.
         await response_generator.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Request handler — wires translation → upstream → response. The two routes
+# (``create_message`` and ``root``) live at the bottom of the file.
+# ---------------------------------------------------------------------------
 
 
 def _prepare_litellm_request(request: MessagesRequest) -> dict[str, Any]:
