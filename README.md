@@ -34,7 +34,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
    ```bash
    uv run uvicorn server:app --reload
    ```
-   Default bind is `127.0.0.1:8082` (loopback only — safe on shared hosts). Set `HOST=0.0.0.0` to expose on the LAN, or `HOST=<ip>` for a specific interface. `PORT=...` works the same way.
+   Pass `--host 0.0.0.0` to expose on the LAN, `--host <ip>` for a specific interface, `--port <n>` for a non-default port.
 
 ### Using with Claude Code 🎮
 

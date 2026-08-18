@@ -80,20 +80,6 @@ surrounding code changes.
   `[big].model` is set but the resolver never reads it for tier=None.
 - **Source**: pre-existing in `main`.
 
-#### HOST default `127.0.0.1` — `server.py:1958`
-
-- **Severity**: low — by design (security: don't bind LAN by default), but
-  a behaviour break for existing `python server.py` invocations without
-  the `HOST` env var.
-- **Where**: `__main__` previously hardcoded `0.0.0.0`; now reads
-  `os.environ.get("HOST", DEFAULT_HOST)` with `DEFAULT_HOST =
-  "127.0.0.1"`. Bare `python server.py` no longer LAN-bindable without
-  `HOST=0.0.0.0`.
-- **Suggested fix**: documented in `README.md`, `.env.example`, and
-  `CLAUDE.md`. No code change needed; re-evaluate if users report
-  migration friction.
-- **Source**: intentional behaviour change.
-
 ### Format drift
 
 Not run through `ruff format` because the diff would have been unrelated

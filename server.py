@@ -31,7 +31,7 @@ load_dotenv()
 # model cost map from GitHub on every call and spams warnings on isolated nets.
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
-# basicConfig formats import-time logs (litellm, uvicorn, _load_config).
+# basicConfig formats import-time logs (litellm, _load_config).
 # _configure_logging re-applies it after uvicorn installs its handlers.
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -140,7 +140,6 @@ if TIKTOKEN_OFFLINE:
 
 # These imports must come after the env-var + tiktoken patch above.
 import litellm  # ruff: ignore[module-import-not-at-top-of-file]
-import uvicorn  # ruff: ignore[module-import-not-at-top-of-file]
 
 # ---------------------------------------------------------------------------
 # Config loader (TOML primary source; per-key env-var fallback via _proxy_value)
@@ -510,9 +509,6 @@ if not OPENAI_TLS_VERIFY:
 # OpenAI Chat Completions caps max_completion_tokens at this value for most
 # current models; over it the API rejects the request.
 MAX_OUTPUT_TOKENS = 16384
-
-DEFAULT_PORT = 8082
-DEFAULT_HOST = "127.0.0.1"
 
 MSG_ID_HEX_LEN = 24
 
@@ -1953,7 +1949,3 @@ async def create_message(request: MessagesRequest) -> MessagesResponse | Streami
 async def root() -> dict[str, str]:
     """Health endpoint — confirms the proxy is up and reports its identity."""
     return {"message": "Anthropic Proxy for LiteLLM"}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host=os.environ.get("HOST", DEFAULT_HOST), port=DEFAULT_PORT)
