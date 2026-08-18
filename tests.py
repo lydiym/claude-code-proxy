@@ -730,10 +730,10 @@ def test_tool_call_arguments_preserve_unicode() -> None:
             "model": "claude-3-5-sonnet-20241022",
             "max_tokens": 200,
             "messages": [
-                {"role": "user", "content": "поиск"},
+                {"role": "user", "content": "搜索"},
                 {"role": "assistant", "content": [
                     {"type": "tool_use", "id": "toolu_01abc",
-                     "name": "lookup", "input": {"city": "Москва", "emoji": "🔍"}},
+                     "name": "lookup", "input": {"city": "北京", "emoji": "🔍"}},
                 ]},
                 {"role": "user", "content": [
                     {"type": "tool_result", "tool_use_id": "toolu_01abc",
@@ -748,7 +748,7 @@ def test_tool_call_arguments_preserve_unicode() -> None:
         assert "\\u" not in args_str, (
             f"Unicode must be passed through; got {args_str!r}"
         )
-        assert "Москва" in args_str and "🔍" in args_str
+        assert "北京" in args_str and "🔍" in args_str
 
 
 def test_tool_call_arguments_stable_key_order() -> None:
