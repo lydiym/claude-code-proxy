@@ -8,6 +8,8 @@
 #   [small]    model + extra_body for haiku
 #   [haiku] / [sonnet] / [opus] / [fable] / [mythos]   per-tier overrides
 #              (optional model + extra_body)
+#   [[prompt_remap]]   regex → replacement pairs applied to the system prompt
+#              at request time (auto-strip volatile content the client injects)
 #
 # Merge chain is [global] → [bucket] → [tier]; later wins per leaf.
 # Every section except [proxy] accepts the same shape: optional `model`
@@ -82,3 +84,25 @@
 # (llama.cpp) — they belong to different backends. `thinking` is an
 # Anthropic-native field; if your backend speaks Anthropic API directly
 # (not OpenAI Chat Completions), it will accept it as top-level.
+
+# --- Volatile system-prompt rewrites ---
+#
+# [[prompt_remap]] entries are applied to the system prompt before it
+# goes upstream. Use them to strip auto-injected content the client
+# adds on its own.
+#
+# Each entry has:
+#   match        regex (TOML: escape backslashes as \\, e.g. \\. for a literal dot)
+#   replacement  string (TOML: \n is a real newline; default is "")
+#
+# Patterns are compiled with DOTALL so .*? crosses newlines. Entries are
+# applied in the order they appear; later matches operate on the already-
+# rewritten text.
+
+[[prompt_remap]]
+# Claude Code periodically injects a TodoWrite reminder into the system
+# prompt; without stripping it, every flip state is a cache miss and the
+# whole prompt is re-processed.
+match = "The TodoWrite tool hasn't been used recently.*?ignore if not applicable\\.\\n+"
+replacement = ""
+

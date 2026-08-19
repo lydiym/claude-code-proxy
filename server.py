@@ -542,9 +542,31 @@ def _parse_proxy_section(body: dict[str, object]) -> dict[str, object]:
     return out
 
 
+def _parse_prompt_remap_section(body: object) -> list[dict[str, str]]:
+    """Parse [[prompt_remap]] entries: each is a {match, replacement} table."""
+    if not isinstance(body, list):
+        logger.warning("[[prompt_remap]] must be an array of tables; ignoring")
+        return []
+    out: list[dict[str, str]] = []
+    for entry in body:
+        if not isinstance(entry, dict):
+            logger.warning("[[prompt_remap]] entry must be a table; skipping %r", entry)
+            continue
+        match = entry.get("match")
+        replacement = entry.get("replacement", "")
+        if not isinstance(match, str) or not match:
+            logger.warning("[[prompt_remap]].match must be a non-empty string; skipping")
+            continue
+        if not isinstance(replacement, str):
+            logger.warning("[[prompt_remap]].replacement must be a string; skipping")
+            continue
+        out.append({"match": match, "replacement": replacement})
+    return out
+
+
 def _load_config(path: str) -> dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
-    out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
     if not path:
         return out
     if not pathlib.Path(path).is_file():
@@ -557,6 +579,9 @@ def _load_config(path: str) -> dict[str, Any]:
         logger.exception("Malformed TOML in %s; falling back to env vars", path)
         return out
     for section, body in raw.items():
+        if section == "prompt_remap":
+            out["prompt_remap"] = _parse_prompt_remap_section(body)
+            continue
         if section not in _VALID_SECTIONS:
             logger.warning(
                 "Unknown section [%s] in %s; ignoring (valid: %s)",
@@ -585,17 +610,47 @@ try:
 except Exception:
     # Infrastructure error only — parse failures are handled inside _load_config.
     logger.exception("Failed to load CONFIG_PATH=%r; using env vars only", CONFIG_PATH)
-    CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    CONFIG = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
+
+
+def _compile_prompt_remaps(entries: list[dict[str, str]]) -> list[tuple[re.Pattern[str], str]]:
+    """Compile [[prompt_remap]] entries into (pattern, replacement) tuples.
+
+    Bad regexes and bad types are warned and skipped — config doesn't fail
+    the boot.
+    """
+    out: list[tuple[re.Pattern[str], str]] = []
+    for entry in entries:
+        match = entry.get("match")
+        replacement = entry.get("replacement", "")
+        if not isinstance(match, str) or not match:
+            logger.warning("[[prompt_remap]] entry has non-string or empty match; skipping")
+            continue
+        if not isinstance(replacement, str):
+            logger.warning("[[prompt_remap]] entry has non-string replacement; skipping")
+            continue
+        try:
+            # DOTALL so .*? crosses newlines in the matched content.
+            pattern = re.compile(match, re.DOTALL)
+        except re.error as e:
+            logger.warning("[[prompt_remap]] regex %r failed to compile: %s; skipping", match, e)
+            continue
+        out.append((pattern, replacement))
+    return out
+
+
+_PROMPT_REMAPS = _compile_prompt_remaps(CONFIG.get("prompt_remap", []))
 
 # WARNING so the boot summary shows up before uvicorn installs its own handlers.
 logger.warning(
-    "Loaded config from %r: proxy=%s, big=%s, small=%s, global=%s, tiers=%s",
+    "Loaded config from %r: proxy=%s, big=%s, small=%s, global=%s, tiers=%s, prompt_remap=%d",
     CONFIG_PATH,
     list(CONFIG["proxy"]),
     CONFIG["big"],
     CONFIG["small"],
     "yes" if CONFIG["global"] else "no",
     list(CONFIG["tiers"]),
+    len(_PROMPT_REMAPS),
 )
 
 
@@ -920,6 +975,8 @@ def _build_system_message(
     preserved: in-band messages come first, then the top-level field — which
     is the order Claude Code most likely intended when it injected the
     reminders inline.
+
+    Configured ``[[prompt_remap]]`` regexes are applied last.
     """
     parts = [text for text in (_extract_text(m.content) for m in messages if m.role == "system") if text]
     top = _extract_text(system_field)
@@ -927,7 +984,17 @@ def _build_system_message(
         parts.append(top)
     if not parts:
         return None
-    return {"role": "system", "content": "\n\n".join(parts)}
+    text = _apply_prompt_remaps("\n\n".join(parts)).strip()
+    if not text:
+        return None
+    return {"role": "system", "content": text}
+
+
+def _apply_prompt_remaps(text: str) -> str:
+    """Apply configured prompt remappings in order."""
+    for pattern, replacement in _PROMPT_REMAPS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def _collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
