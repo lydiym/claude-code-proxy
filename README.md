@@ -1,18 +1,28 @@
-# Anthropic API Proxy for OpenAI 🔄
+# Anthropic API Proxy for OpenAI
 
-**Use Anthropic clients (like Claude Code) with any OpenAI-compatible backend.** 🤝
+**Use Anthropic clients (like Claude Code) with any OpenAI-compatible backend.**
 
 A small proxy that accepts requests in the Anthropic Messages API format, translates them to OpenAI Chat Completions via LiteLLM, and converts the response back. Single backend, single code path.
 
-## Quick Start ⚡
+## Features
+
+- 🔄 **Translation** — Anthropic → OpenAI Chat Completions with tier-based model remapping
+- 🗂️ **Per-tier config** — `[big]` / `[small]` / `[haiku]` / `[sonnet]` / `[opus]` / `[fable]` / `[mythos]` with deep-merge `extra_body`
+- 🛠️ **Tool calls** — round-trip with any OpenAI-compatible backend (llama-server, ollama, vLLM, llama.cpp, OpenAI, OpenWebUI)
+- 📡 **Streaming** — SSE and non-streaming responses
+- ✏️ **System-prompt rewrites** — `[[prompt_remap]]` regex → replacement pairs to modify the system prompt on the fly
+- ✅ **Default cache-miss fix** — strips Claude Code's periodic TodoWrite reminder that the client can't disable
+- 📴 **Offline-friendly** — no network for tiktoken / litellm cost map; self-signed-TLS aware
+
+## Quick Start
 
 ### Prerequisites
 
-- An OpenAI API key, or a key for any OpenAI-compatible endpoint 🔑
-- Python ≥ 3.12 🐍
+- An OpenAI API key, or a key for any OpenAI-compatible endpoint
+- Python ≥ 3.12
 - [uv](https://github.com/astral-sh/uv) installed
 
-### Setup 🛠️
+### Setup
 
 #### From source
 
@@ -36,7 +46,7 @@ A small proxy that accepts requests in the Anthropic Messages API format, transl
    ```
    Pass `--host 0.0.0.0` to expose on the LAN, `--host <ip>` for a specific interface, `--port <n>` for a non-default port.
 
-### Using with Claude Code 🎮
+### Using with Claude Code
 
 ```bash
 npm install -g @anthropic-ai/claude-code
@@ -45,7 +55,7 @@ ANTHROPIC_BASE_URL=http://localhost:8082 claude
 
 That's it — Claude Code sends Anthropic-format requests; the proxy translates them to OpenAI format and returns the response in Anthropic format.
 
-## Model Mapping 🗺️
+## Model Mapping
 
 Claude Code sends requests naming Claude models (`claude-3-5-sonnet-...`, `claude-3-5-haiku-...`). The proxy remaps them to the OpenAI backend like this:
 
@@ -70,7 +80,7 @@ model = "your-model-name"
 model = "your-model-name"
 ```
 
-## Configuration ⚙️
+## Configuration
 
 The proxy has a single TOML config file (`config.toml`, defaulting to `./config.toml` next to `server.py`) as the primary source for every setting. Env vars and `.env` work as fallback for each key — useful for Docker overrides. **You don't need `.env` if `config.toml` exists**, but you can mix both.
 
@@ -148,18 +158,38 @@ extra_body = { temperature = 0.3, cache_prompt = true, n_predict = 4096, chat_te
 
 Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, etc. land in the body. For offline checks, set `LOG_LEVEL=DEBUG` — the proxy logs the effective `extra_body` per request (sourced from request or `[tier]` config).
 
-## How It Works 🧩
+### System-prompt rewrites (`[[prompt_remap]]`)
 
-1. **Receive** the request in Anthropic's Messages API format 📥
-2. **Remap** the model (`haiku`/`sonnet`/`opus`/... → `[small].model` / `[big].model` / `[tier].model`) 🗺️
-3. **Translate** to OpenAI Chat Completions format via LiteLLM 🔄
-4. **Send** to OpenAI (or any `OPENAI_BASE_URL`) 📤
-5. **Convert** the response back to Anthropic format 🔄
-6. **Return** the formatted response (streaming or non-streaming) ✅
+Two things at once:
+
+1. **Rewrite the system prompt on the fly** — `[[prompt_remap]]` regex → replacement pairs are applied to the assembled system prompt before it goes upstream. Use it to strip auto-injected content the client adds on its own, inject custom instructions, or canonicalise chatty wording.
+2. **Off by default, one line to enable** — no entries, no behaviour change. The shipped `config.toml.example` includes a default entry that strips Claude Code's periodic TodoWrite reminder; without it, every flip state is a cache miss and the whole prompt is re-processed. Comment out the entry if you don't want it.
+
+```toml
+[[prompt_remap]]
+match = "The TodoWrite tool hasn't been used recently.*?ignore if not applicable\\.\\n+"
+replacement = ""
+```
+
+Each entry has:
+
+- `match` — regex (TOML: escape backslashes as `\\`, e.g. `\\.` for a literal dot)
+- `replacement` — string (TOML: `\n` is a real newline; default is `""`)
+
+Patterns are compiled with DOTALL so `.` and `.*?` cross newlines. Entries are applied in the order they appear; later matches operate on the already-rewritten text. Bad regexes are warned and skipped — the proxy never fails to boot over a broken `[[prompt_remap]]`.
+
+## How It Works
+
+1. **Receive** the request in Anthropic's Messages API format
+2. **Remap** the model (`haiku`/`sonnet`/`opus`/... → `[small].model` / `[big].model` / `[tier].model`)
+3. **Translate** to OpenAI Chat Completions format via LiteLLM
+4. **Send** to OpenAI (or any `OPENAI_BASE_URL`)
+5. **Convert** the response back to Anthropic format
+6. **Return** the formatted response (streaming or non-streaming)
 
 Tool calls round-trip natively: `assistant.tool_calls` and `role="tool"` messages are preserved so tool use works with any OpenAI-compatible backend.
 
-## Development 🛠️
+## Development
 
 ```bash
 # Install dev deps (ruff, ty, vulture) — uv manages them via PEP 735 [dependency-groups].
@@ -192,6 +222,6 @@ pre-commit install
 
 A handful of duck-typed call sites in `server.py` carry `# ty: ignore[unsound-return-statement]` — they're documented latent bugs in [`bugtracker.md`](bugtracker.md) (pre-existing in `main`, refactored but not fixed). The rule stays active so any new unsound-return at a different site still warns; the explicit ignores keep `ty check` clean and pre-commit green.
 
-## Contributing 🤝
+## Contributing
 
-Pull requests welcome. 🎁
+Pull requests welcome.

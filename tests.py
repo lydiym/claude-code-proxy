@@ -1512,6 +1512,239 @@ def test_system_role_message_with_string_content_is_hoisted() -> None:
         assert out["messages"][1]["role"] == "user"
 
 
+# --- Prompt remap (stable system prompt) ---
+
+
+@contextlib.contextmanager
+def _patched_prompt_remaps(entries: list[dict[str, str]]) -> Iterator[None]:
+    """Replace srv._PROMPT_REMAPS with compiled entries from the given list."""
+    original = srv._PROMPT_REMAPS
+    srv._PROMPT_REMAPS = srv._compile_prompt_remaps(entries)
+    try:
+        yield
+    finally:
+        srv._PROMPT_REMAPS = original
+
+
+def test_prompt_remap_strip_todo_reminder() -> None:
+    """Reminder text is stripped from the outgoing system prompt."""
+    reminder = (
+        "The TodoWrite tool hasn't been used recently. If you're working on "
+        "tasks that would benefit from tracking progress, consider using the "
+        "TodoWrite tool to track progress. Also consider cleaning up the todo "
+        "list if has become stale and no longer matches what you are working "
+        "on. Use it if it's relevant to the current work. This is just a "
+        "gentle reminder - ignore if not applicable.\n\n"
+    )
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise." + "\n\n" + reminder,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        sys = out["messages"][0]["content"]
+        assert "TodoWrite" not in sys, f"Reminder must be stripped; got {sys!r}"
+        assert "You are concise." in sys
+
+
+def test_prompt_remap_canonical_across_reminder_states() -> None:
+    """Reminder on vs off → byte-identical outgoing system prompt."""
+    request_body = {
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    reminder = (
+        "\n\nThe TodoWrite tool hasn't been used recently. If you're working "
+        "on tasks that would benefit from tracking progress, consider using "
+        "the TodoWrite tool to track progress. Also consider cleaning up the "
+        "todo list if has become stale and no longer matches what you are "
+        "working on. Use it if it's relevant to the current work. This is "
+        "just a gentle reminder - ignore if not applicable.\n\n"
+    )
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req_on = _make_request({**request_body, "system": "You are concise." + reminder})
+        req_off = _make_request({**request_body, "system": "You are concise."})
+        out_on = srv.convert_anthropic_to_litellm(req_on)
+        out_off = srv.convert_anthropic_to_litellm(req_off)
+        sys_on = out_on["messages"][0]["content"]
+        sys_off = out_off["messages"][0]["content"]
+        assert sys_on == sys_off, (
+            f"Outgoing system prompt must match across reminder states;\n"
+            f"on:  {sys_on!r}\noff: {sys_off!r}"
+        )
+
+
+def test_prompt_remap_strips_trailing_newlines() -> None:
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise.\n\nThe TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        # No stray newlines, no leading/trailing whitespace.
+        assert out["messages"][0]["content"] == "You are concise.", (
+            f"Expected canonical 'You are concise.'; got {out['messages'][0]['content']!r}"
+        )
+
+
+def test_prompt_remap_no_match_passes_through() -> None:
+    """Patterns with no match leave the system prompt untouched."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"never-present-pattern-\d+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][0]["content"] == "You are concise."
+
+
+def test_prompt_remap_multiple_entries_applied_in_order() -> None:
+    """Entries are applied sequentially; later matches see the already-rewritten text."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"REMINDER_INNER", "replacement": ""},
+        {"match": r"REMINDER_OUTER", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "Keep REMINDER_OUTER marker [REMINDER_INNER content] visible.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][0]["content"] == "Keep  marker [ content] visible."
+
+
+def test_prompt_remap_handles_list_system_field() -> None:
+    """Anthropic's `system` can be a list of content blocks, not just a string."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "You are concise."},
+                {"type": "text", "text": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n"},
+            ],
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        sys = out["messages"][0]["content"]
+        assert "TodoWrite" not in sys
+        assert "You are concise." in sys
+
+
+def test_prompt_remap_handles_inband_system_messages() -> None:
+    """In-band role='system' messages (Claude Code 2.1.154+) are also remapped."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "system", "content": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n"},
+                {"role": "user", "content": "Hi"},
+            ],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        # The system message was the entire reminder — stripped to "" → dropped.
+        assert out["messages"][0]["role"] == "user"
+        assert len(out["messages"]) == 1
+
+
+def test_prompt_remap_empty_after_strip_returns_no_system_message() -> None:
+    """If the entire system prompt is the reminder, the system message is dropped."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][0]["role"] == "user"
+        assert len(out["messages"]) == 1
+
+
+def test_prompt_remap_no_remaps_no_change() -> None:
+    """Empty config leaves the system prompt verbatim — default behaviour unchanged."""
+    with _patched_empty_config(), _patched_prompt_remaps([]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "The TodoWrite tool hasn't been used recently.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "TodoWrite" in out["messages"][0]["content"]
+
+
+def test_prompt_remap_compile_failure_skipped() -> None:
+    """Bad regexes are warned and skipped — boot must not fail."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"[unclosed", "replacement": ""},  # re.error on compile
+        {"match": r"valid-pattern", "replacement": "X"},
+    ]):
+        # The valid one still applies; the broken one is dropped.
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "Then valid-pattern here.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][0]["content"] == "Then X here."
+
+
+def test_prompt_remap_bad_match_string_skipped() -> None:
+    """Non-string `match` entries are warned and skipped."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": 123, "replacement": ""},  # ty: ignore[list-item]
+        {"match": r"real-match", "replacement": "Y"},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "real-match applies",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][0]["content"] == "Y applies"
+
+
+def test_prompt_remap_replacement_supports_newlines() -> None:
+    """`\\n` in the replacement string becomes a real newline."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"BLOCK", "replacement": "\n"},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "before BLOCK after",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][0]["content"] == "before \n after"
+
+
 # --- Content block assembly ---
 
 def test_build_content_blocks_text_only() -> None:
@@ -2209,12 +2442,12 @@ def test_load_config_happy_path() -> None:
 
 def test_load_config_empty_path_is_noop() -> None:
     cfg = srv._load_config("")
-    assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
 
 
 def test_load_config_missing_file_returns_empty() -> None:
     cfg = srv._load_config("/nonexistent/config.toml")
-    assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
 
 
 def test_load_config_malformed_toml_returns_empty() -> None:
@@ -2226,7 +2459,7 @@ def test_load_config_malformed_toml_returns_empty() -> None:
         cfg = srv._load_config(path)
     finally:
         pathlib.Path(path).unlink()
-    assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}}
+    assert cfg == {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
 
 
 def test_load_config_unknown_section_warns_and_skips() -> None:
