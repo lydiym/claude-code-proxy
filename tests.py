@@ -2043,6 +2043,34 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
     assert stop["delta"]["stop_reason"] == "end_turn"
 
 
+async def test_streaming_no_finish_reason_with_tool_call_uses_tool_use_stop() -> None:
+    """Upstream closes the stream mid-tool-call without finish_reason.
+
+    Previously the epilogue hardcoded end_turn, which made the Anthropic
+    SDK treat the response as "no pending work" and skip the tool result
+    request. Pick tool_use instead.
+    """
+    req = _base_request(stream=True, tools=[{
+        "name": "calc",
+        "description": "x",
+        "input_schema": {"type": "object"},
+    }])
+    chunks = [
+        _tool_delta_chunk(index=0, tool_id="call_1", name="calc", arguments='{"q":'),
+        _tool_delta_chunk(index=0, arguments='"2"}'),
+        # No finish_reason chunk — upstream just terminated.
+    ]
+    events = await _run_stream(chunks, req)
+    types = [e["type"] for e in events]
+    assert "message_stop" in types
+    assert "content_block_stop" in types, "in-flight tool_use block must close"
+    stop = next(e for e in events if e["type"] == "message_delta")
+    assert stop["delta"]["stop_reason"] == "tool_use", (
+        f"expected tool_use when upstream omits finish_reason mid-tool-call; "
+        f"got {stop['delta']['stop_reason']!r}"
+    )
+
+
 async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
     """A chunk that crashes the inner pipeline must yield `event: error` so the
     SDK raises APIStatusError instead of silently terminating the stream.

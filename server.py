@@ -1691,10 +1691,13 @@ class _StreamState:
 
     Lives only as long as ``handle_streaming``'s iteration. ``should_stop``
     is set by chunk processors when they emit a finish_reason so the outer
-    loop can break cleanly.
+    loop can break cleanly. ``tool_use_emitted`` lets the epilogue pick
+    ``tool_use`` over ``end_turn`` when the upstream closes without a
+    finish_reason mid-tool-call.
     """
 
     tool_index: int | None = None
+    tool_use_emitted: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     has_sent_stop_reason: bool = False
@@ -1731,10 +1734,11 @@ def _stream_prologue(original_request: MessagesRequest, tracker: _BlockTracker) 
     yield _SseFormatter.ping()
 
 
-def _stream_epilogue(tracker: _BlockTracker, think_parser: _ThinkStreamParser, output_tokens: int) -> Iterator[str]:
+def _stream_epilogue(state: _StreamState, tracker: _BlockTracker, think_parser: _ThinkStreamParser) -> Iterator[str]:
     yield from _translate_parser_events(think_parser.flush(), tracker)
     yield from tracker.close()
-    yield from _SseFormatter.finish("end_turn", output_tokens)
+    stop_reason = "tool_use" if state.tool_use_emitted else "end_turn"
+    yield from _SseFormatter.finish(stop_reason, state.output_tokens)
 
 
 def _log_stream_finished(state: _StreamState) -> None:
@@ -1855,6 +1859,7 @@ def _process_single_tool_call(tool_call: object, tracker: _BlockTracker, state: 
         if state.tool_index is not None:
             yield from tracker.close()
         state.tool_index = current_index
+        state.tool_use_emitted = True
         function = _get_field(tool_call, "function", {}) or {}
         name = _get_field(function, "name", "")
         tool_id = _get_field(tool_call, "id") or _new_tool_id()
@@ -1950,7 +1955,7 @@ async def handle_streaming(
         # Skip epilogue if chunk loop already terminated the stream via _emit_failure
         # — calling _translate_parser_events again here would re-emit the error frame.
         if not state.has_sent_stop_reason and not state.should_stop:
-            for event in _stream_epilogue(tracker, think_parser, state.output_tokens):
+            for event in _stream_epilogue(state, tracker, think_parser):
                 yield event
         _log_stream_finished(state)
     except Exception as e:
