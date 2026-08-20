@@ -5,6 +5,7 @@ LiteLLM and converts the response back. Single FastAPI app, single code path.
 """
 
 import difflib
+import itertools
 import json
 import logging
 import os
@@ -2042,8 +2043,9 @@ class _CacheMatcher:
     def observe(self, payload: dict[str, Any]) -> None:
         new_messages, new_tools = self._strip_ids(payload)
         new_canonical = json.dumps(new_messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        # Structural check: new outgoing is a prefix extension of some prior one.
-        for old_messages, old_tools, old_payload in self._recent:
+        # Newest-first so the matched prior is the immediately-prior request:
+        # logs show incremental growth (msgs N-1 vs N), not always the oldest entry.
+        for old_messages, old_tools, old_payload in reversed(self._recent):
             prefix_match = (
                 new_tools == old_tools
                 and old_messages
@@ -2116,8 +2118,13 @@ def _write_diff(path: pathlib.Path, new_payload: dict[str, Any], old_payload: di
             logger.debug("cache debug diff save failed: %s", e)
 
 
+_cache_debug_seq = itertools.count(1)
+
+
 def _cache_debug_stamp(score: float, kind: str) -> str:
-    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}-{score:.2f}"
+    # Trailing seq disambiguates same-second same-pid same-score writes (every prefix_hit has score=1.00).
+    seq = next(_cache_debug_seq)
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}-{score:.2f}-{seq:04d}"
 
 
 def _safe_write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:

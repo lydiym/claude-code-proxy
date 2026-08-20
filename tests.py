@@ -1920,6 +1920,32 @@ def test_debug_cache_dump_enabled_prefix_hit_creates_artifacts() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_debug_cache_dump_matches_immediately_prior_request() -> None:
+    """Monotonic growth → each new request matches the immediately-prior one, not the oldest."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        prompts_dir = pathlib.Path(tmp) / ".claude-code-proxy" / "prompts"
+
+        def make(n: int) -> dict[str, object]:
+            return {"messages": [{"role": "user", "content": f"msg-{i}"} for i in range(n)]}
+
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            for n in (3, 5, 8):
+                srv._debug_dump_outgoing_payload(make(n))
+            diffs = sorted(prompts_dir.glob("*-prefix_hit-*-diff.diff"))
+            assert len(diffs) == 2, f"Expected 2 prefix_hit artifacts; got {diffs}"
+            texts = [d.read_text(encoding="utf-8") for d in diffs]
+            assert any('"content": "msg-4"' in t for t in texts), (
+                f"3→5 diff should show msg-3 + msg-4 added; got:\n{texts}"
+            )
+            assert any('"content": "msg-7"' in t for t in texts), (
+                f"5→8 diff should show msg-5..msg-7 added; got:\n{texts}"
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_debug_cache_dump_enabled_fuzzy_match_writes_artifacts() -> None:
     """Two payloads that share ≥ 0.6 SequenceMatcher ratio but aren't a structural prefix
     trigger ``fuzzy_match`` artifacts (cache-busting suspect)."""
