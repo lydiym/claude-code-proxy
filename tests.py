@@ -3154,6 +3154,62 @@ async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     assert first_tool_stop_idx < second_tool_start_idx
 
 
+async def test_streaming_preserves_partial_tool_arguments_when_index_changes() -> None:
+    """Repro for the malformed-Bash-before-Read pattern we saw against MiniMax.
+
+    When two parallel tool calls arrive and the first one's argument stream
+    ends mid-JSON (literally ``"{"``), the proxy must forward it faithfully —
+    no synthetic completion, no drop. Claude Code surfaces the malformed
+    input via ``__unparsedToolInput`` and the model retries with a clean
+    call.
+    """
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "Bash",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+            {
+                "name": "Read",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+            },
+        ],
+    )
+    chunks = [
+        _tool_delta_chunk(0, tool_id="call_bash", name="Bash", arguments="{"),
+        _tool_delta_chunk(1, tool_id="call_read", name="Read", arguments='{"file_path":"/tmp/x.png"}'),
+        _finish_chunk("tool_calls"),
+    ]
+    events = await _run_stream(chunks, req)
+
+    # Find each tool_use block by name, then assert what deltas fed it.
+    blocks: dict[str, dict[str, object]] = {}
+    current_name: str | None = None
+    for e in events:
+        if e["type"] == "content_block_start":
+            cb = e.get("content_block") or {}
+            if cb.get("type") == "tool_use":
+                current_name = cb.get("name")
+                blocks[current_name] = {"index": e["index"], "deltas": []}
+        elif e["type"] == "content_block_stop":
+            current_name = None
+        elif e["type"] == "content_block_delta" and current_name:
+            d = e.get("delta") or {}
+            if d.get("type") == "input_json_delta":
+                blocks[current_name]["deltas"].append(d.get("partial_json", ""))
+
+    assert set(blocks) == {"Bash", "Read"}, f"expected Bash and Read blocks; got {set(blocks)}"
+    assert blocks["Bash"]["deltas"] == ["{"], (
+        f"Bash must carry the literal partial_json from upstream — no synthetic closing; got {blocks['Bash']['deltas']!r}"
+    )
+    assert blocks["Read"]["deltas"] == ['{"file_path":"/tmp/x.png"}'], (
+        f"Read must carry its full arguments; got {blocks['Read']['deltas']!r}"
+    )
+
+
 async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
     """Tool argument fragments must be wrapped in input_json_delta deltas."""
     req = _base_request(
