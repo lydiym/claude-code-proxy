@@ -100,9 +100,10 @@
 # rewritten text.
 
 [[prompt_remap]]
-# Claude Code periodically injects a TodoWrite reminder into the system
-# prompt; without stripping it, every flip state is a cache miss and the
+# Claude Code periodically injects a reminder into the system prompt (one
+# variant mentions TodoWrite, another mentions task tools / TaskCreate /
+# TaskUpdate). Without stripping, every flip state is a cache miss and the
 # whole prompt is re-processed.
-match = "The TodoWrite tool hasn't been used recently.*?ignore if not applicable\\.\\n+"
+match = "The (?:TodoWrite tool hasn't|task tools haven't) been used recently.*?ignore if not applicable\\.\\n+"
 replacement = ""
 

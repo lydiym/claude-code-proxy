@@ -167,7 +167,7 @@ Two things at once:
 
 ```toml
 [[prompt_remap]]
-match = "The TodoWrite tool hasn't been used recently.*?ignore if not applicable\\.\\n+"
+match = "The (?:TodoWrite tool hasn't|task tools haven't) been used recently.*?ignore if not applicable\\.\\n+"
 replacement = ""
 ```
 

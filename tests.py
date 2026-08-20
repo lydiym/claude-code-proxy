@@ -1551,6 +1551,74 @@ def test_prompt_remap_strip_todo_reminder() -> None:
         assert "You are concise." in sys
 
 
+def test_prompt_remap_strip_task_tools_reminder() -> None:
+    """TaskCreate/TaskUpdate reminder (alt variant) is also stripped."""
+    reminder = (
+        "The task tools haven't been used recently. If you're working on "
+        "tasks that would benefit from tracking progress, consider using "
+        "TaskCreate to add new tasks and TaskUpdate to update task status "
+        "(set to in_progress when starting, completed when done). Also "
+        "consider cleaning up the task list if it has become stale. Only "
+        "use these if relevant to the current work. This is just a gentle "
+        "reminder - ignore if not applicable.\n\n\n"
+    )
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The task tools haven't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+    ]):
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise." + "\n\n" + reminder,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        out = srv.convert_anthropic_to_litellm(req)
+        sys = out["messages"][0]["content"]
+        assert "TaskCreate" not in sys, f"Reminder must be stripped; got {sys!r}"
+        assert "TaskUpdate" not in sys, f"Reminder must be stripped; got {sys!r}"
+        assert "You are concise." in sys
+
+
+def test_prompt_remap_canonical_across_reminder_variants() -> None:
+    """Both reminder variants yield the same outgoing system prompt as the no-reminder case."""
+    request_body = {
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    todo_reminder = (
+        "\n\nThe TodoWrite tool hasn't been used recently. If you're working "
+        "on tasks that would benefit from tracking progress, consider using "
+        "the TodoWrite tool to track progress. Also consider cleaning up the "
+        "todo list if has become stale and no longer matches what you are "
+        "working on. Use it if it's relevant to the current work. This is "
+        "just a gentle reminder - ignore if not applicable.\n\n"
+    )
+    task_tools_reminder = (
+        "\n\nThe task tools haven't been used recently. If you're working on "
+        "tasks that would benefit from tracking progress, consider using "
+        "TaskCreate to add new tasks and TaskUpdate to update task status "
+        "(set to in_progress when starting, completed when done). Also "
+        "consider cleaning up the task list if it has become stale. Only "
+        "use these if relevant to the current work. This is just a gentle "
+        "reminder - ignore if not applicable.\n\n\n"
+    )
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The (?:TodoWrite tool hasn't|task tools haven't) been used recently"
+                  r".*?ignore if not applicable\.?\n+",
+         "replacement": ""},
+    ]):
+        out_none = srv.convert_anthropic_to_litellm(_make_request({**request_body, "system": "You are concise."}))
+        out_todo = srv.convert_anthropic_to_litellm(_make_request({**request_body, "system": "You are concise." + todo_reminder}))
+        out_task = srv.convert_anthropic_to_litellm(_make_request({**request_body, "system": "You are concise." + task_tools_reminder}))
+        sys_none = out_none["messages"][0]["content"]
+        sys_todo = out_todo["messages"][0]["content"]
+        sys_task = out_task["messages"][0]["content"]
+        assert sys_none == sys_todo == sys_task, (
+            f"All three outgoing prompts must be byte-identical;\n"
+            f"none: {sys_none!r}\ntodo: {sys_todo!r}\ntask: {sys_task!r}"
+        )
+
+
 def test_prompt_remap_canonical_across_reminder_states() -> None:
     """Reminder on vs off → byte-identical outgoing system prompt."""
     request_body = {
