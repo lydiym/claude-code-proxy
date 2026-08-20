@@ -19,12 +19,14 @@ import inspect
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import time
 from collections.abc import AsyncGenerator, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
+from unittest.mock import patch
 
 import httpx
 from dotenv import load_dotenv
@@ -149,9 +151,9 @@ def _parse_sse_block(block: str) -> dict[str, Any] | None:
     data_lines: list[str] = []
     for line in block.splitlines():
         if line.startswith("event: "):
-            event_type = line[len("event: "):]
+            event_type = line[len("event: ") :]
         elif line.startswith("data: "):
-            data_lines.append(line[len("data: "):])
+            data_lines.append(line[len("data: ") :])
     if not data_lines:
         return None
     payload = "".join(data_lines)
@@ -174,10 +176,12 @@ async def _run_stream(chunks: list[Any], req: srv.MessagesRequest) -> list[dict[
 
 def _text_chunk(text: str, **extra: Any) -> dict[str, Any]:
     chunk = {
-        "choices": [{
-            "delta": {"content": text},
-            "finish_reason": None,
-        }],
+        "choices": [
+            {
+                "delta": {"content": text},
+                "finish_reason": None,
+            },
+        ],
     }
     chunk["choices"][0].update(extra.get("choice_extra", {}))
     chunk.update({k: v for k, v in extra.items() if k != "choice_extra"})
@@ -203,10 +207,12 @@ def _tool_delta_chunk(
     if function:
         tool_call["function"] = function
     return {
-        "choices": [{
-            "delta": {"tool_calls": [tool_call]},
-            "finish_reason": finish_reason,
-        }],
+        "choices": [
+            {
+                "delta": {"tool_calls": [tool_call]},
+                "finish_reason": finish_reason,
+            },
+        ],
     }
 
 
@@ -224,77 +230,94 @@ def _finish_chunk(reason: str, *, output_tokens: int = 5) -> dict[str, Any]:
 
 # --- Model mapping ---
 
+
 def test_capture_original_model_copies_model_field() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.original_model == "claude-3-5-sonnet-20241022"
     assert req.model == f"openai/{srv._default_model_for_tier('sonnet')}"
 
 
 def test_capture_original_model_preserves_explicit_override() -> None:
-    req = _make_request({
-        "model": "openai/gpt-4.1",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "openai/gpt-4.1",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.original_model == "openai/gpt-4.1"
     assert req.model == "openai/gpt-4.1"
 
 
 def test_validate_model_field_haiku_mapping() -> None:
-    req = _make_request({
-        "model": "claude-3-5-haiku-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-haiku-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('haiku')}"
 
 
 def test_validate_model_field_sonnet_mapping() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('sonnet')}"
 
 
 def test_validate_model_field_opus_maps_to_big_model() -> None:
-    req = _make_request({
-        "model": "claude-opus-5",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('opus')}"
 
 
 def test_validate_model_field_opus_with_dated_id() -> None:
-    req = _make_request({
-        "model": "claude-opus-5-20251215",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-opus-5-20251215",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('opus')}"
 
 
 def test_validate_model_field_fable_maps_to_big_model() -> None:
-    req = _make_request({
-        "model": "claude-fable-5",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-fable-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('fable')}"
 
 
 def test_validate_model_field_mythos_maps_to_big_model() -> None:
-    req = _make_request({
-        "model": "claude-mythos-5",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-mythos-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('mythos')}"
 
 
@@ -302,11 +325,13 @@ def test_validate_model_field_sonnet_override_takes_precedence() -> None:
     saved = _scrub_model_envs()
     try:
         with _patched_config('[sonnet]\nmodel = "custom-sonnet-model"'):
-            req = _make_request({
-                "model": "claude-3-5-sonnet-20241022",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "hi"}],
-            })
+            req = _make_request(
+                {
+                    "model": "claude-3-5-sonnet-20241022",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
             assert req.model == "openai/custom-sonnet-model"
     finally:
         for k, v in saved.items():
@@ -318,17 +343,21 @@ def test_validate_model_field_opus_override_is_independent() -> None:
     saved = _scrub_model_envs()
     try:
         with _patched_config('[opus]\nmodel = "custom-opus-model"'):
-            opus_req = _make_request({
-                "model": "claude-opus-5",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "hi"}],
-            })
+            opus_req = _make_request(
+                {
+                    "model": "claude-opus-5",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
             assert opus_req.model == "openai/custom-opus-model"
-            sonnet_req = _make_request({
-                "model": "claude-3-5-sonnet-20241022",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "hi"}],
-            })
+            sonnet_req = _make_request(
+                {
+                    "model": "claude-3-5-sonnet-20241022",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
             assert sonnet_req.model == f"openai/{srv._default_model_for_tier('sonnet')}"
     finally:
         for k, v in saved.items():
@@ -340,11 +369,13 @@ def test_validate_model_field_haiku_override() -> None:
     saved = _scrub_model_envs()
     try:
         with _patched_config('[haiku]\nmodel = "custom-haiku-model"'):
-            req = _make_request({
-                "model": "claude-3-5-haiku-20241022",
-                "max_tokens": 100,
-                "messages": [{"role": "user", "content": "hi"}],
-            })
+            req = _make_request(
+                {
+                    "model": "claude-3-5-haiku-20241022",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
             assert req.model == "openai/custom-haiku-model"
     finally:
         for k, v in saved.items():
@@ -353,48 +384,58 @@ def test_validate_model_field_haiku_override() -> None:
 
 
 def test_validate_model_field_known_openai_model_gets_prefix() -> None:
-    req = _make_request({
-        "model": "gpt-4.1",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "gpt-4.1",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == "openai/gpt-4.1"
 
 
 def test_validate_model_field_existing_openai_prefix_passthrough() -> None:
-    req = _make_request({
-        "model": "openai/custom-model",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "openai/custom-model",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == "openai/custom-model"
 
 
 def test_validate_model_field_unknown_name_gets_prefix() -> None:
-    req = _make_request({
-        "model": "my-local-llama",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "my-local-llama",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == "openai/my-local-llama"
 
 
 def test_validate_model_field_strips_anthropic_prefix() -> None:
-    req = _make_request({
-        "model": "anthropic/claude-3-5-haiku-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "anthropic/claude-3-5-haiku-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('haiku')}"
     assert req.original_model == "anthropic/claude-3-5-haiku-20241022"
 
 
 def test_validate_model_field_strips_gemini_prefix() -> None:
-    req = _make_request({
-        "model": "gemini/claude-3-5-haiku-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "gemini/claude-3-5-haiku-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == f"openai/{srv._default_model_for_tier('haiku')}"
     assert req.original_model == "gemini/claude-3-5-haiku-20241022"
 
@@ -405,6 +446,7 @@ def test_tls_verify_wiring_matches_module_setting() -> None:
 
 
 # --- Message sanitization ---
+
 
 def test_sanitize_messages_for_openai_removes_foreign_keys() -> None:
     messages = [
@@ -437,15 +479,56 @@ def test_sanitize_messages_for_openai_keeps_allowed_keys() -> None:
     assert messages[0]["content"] == "42"
 
 
+def test_sanitize_messages_for_openai_handles_list_content() -> None:
+    """Image messages arrive with content as a list of content blocks — not a set member.
+
+    Post-conversion (what sanitize actually sees) uses the OpenAI ``image_url``
+    shape; the Anthropic shape is also exercised so any regression in
+    conversion order would still fail this test.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                {"type": "text", "text": "what do you see?"},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "data": "..."}},
+                {"type": "text", "text": "raw anthropic shape"},
+            ],
+        },
+        {"role": "user", "content": []},
+        {"role": "assistant", "content": [], "tool_calls": [{"id": "x"}]},
+    ]
+    srv.sanitize_messages_for_openai(messages)
+    assert messages[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        {"type": "text", "text": "what do you see?"},
+    ]
+    assert messages[1]["content"] == [
+        {"type": "image", "source": {"type": "base64", "data": "..."}},
+        {"type": "text", "text": "raw anthropic shape"},
+    ]
+    assert messages[2]["content"] == "..."
+    assert messages[3]["content"] == []
+
+
 # --- Request conversion ---
+
 
 def test_convert_anthropic_to_litellm_minimal_request() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 200,
-            "messages": [{"role": "user", "content": "Hello"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["model"] == f"openai/{srv._default_model_for_tier('sonnet')}"
         assert out["max_completion_tokens"] == 200
@@ -464,38 +547,44 @@ def test_no_max_tokens_clamp() -> None:
     Users explicitly want 24000 when they ask for 24000.
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": srv.MAX_OUTPUT_TOKENS + 1000,
-            "messages": [{"role": "user", "content": "Hello"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": srv.MAX_OUTPUT_TOKENS + 1000,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["max_completion_tokens"] == srv.MAX_OUTPUT_TOKENS + 1000
 
 
 def test_convert_anthropic_to_litellm_with_string_system() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "You are helpful.",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are helpful.",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0] == {"role": "system", "content": "You are helpful."}
 
 
 def test_convert_anthropic_to_litellm_with_list_system_joins_text_blocks() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": [
-                {"type": "text", "text": "Be concise."},
-                {"type": "text", "text": "Answer in English."},
-            ],
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": [
+                    {"type": "text", "text": "Be concise."},
+                    {"type": "text", "text": "Answer in English."},
+                ],
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["role"] == "system"
         assert "Be concise." in out["messages"][0]["content"]
@@ -504,39 +593,47 @@ def test_convert_anthropic_to_litellm_with_list_system_joins_text_blocks() -> No
 
 def test_convert_anthropic_to_litellm_with_tools_and_choice() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 200,
-            "messages": [{"role": "user", "content": "What is 2+2?"}],
-            "tools": [{
-                "name": "calc",
-                "description": "calculator",
-                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
-            }],
-            "tool_choice": {"type": "tool", "name": "calc"},
-        })
-        out = srv.convert_anthropic_to_litellm(req)
-        assert out["tools"] == [{
-            "type": "function",
-            "function": {
-                "name": "calc",
-                "description": "calculator",
-                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                "tools": [
+                    {
+                        "name": "calc",
+                        "description": "calculator",
+                        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+                    },
+                ],
+                "tool_choice": {"type": "tool", "name": "calc"},
             },
-        }]
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["tools"] == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "calculator",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
+                },
+            },
+        ]
         assert out["tool_choice"] == {"type": "function", "function": {"name": "calc"}}
 
 
 def test_convert_anthropic_to_litellm_passes_optional_sampling() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "stop_sequences": ["END"],
-            "top_p": 0.9,
-            "top_k": 40,
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stop_sequences": ["END"],
+                "top_p": 0.9,
+                "top_k": 40,
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["stop"] == ["END"]
         assert out["top_p"] == 0.9
@@ -549,14 +646,16 @@ def test_explicit_null_sampling_is_dropped() -> None:
     must not include the field.
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "temperature": None,
-            "top_p": None,
-            "stop_sequences": None,
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "temperature": None,
+                "top_p": None,
+                "stop_sequences": None,
+            },
+        )
         # Pydantic v2 includes explicit null in fields_set — confirm semantics.
         assert "temperature" in req.model_fields_set
         out = srv.convert_anthropic_to_litellm(req)
@@ -567,55 +666,893 @@ def test_explicit_null_sampling_is_dropped() -> None:
 
 def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 200,
-            "messages": [
-                {"role": "user", "content": "What is 2+2?"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "calc", "input": {"q": "2+2"}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "4"},
-                ]},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "What is 2+2?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "t1", "name": "calc", "input": {"q": "2+2"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "4"},
+                        ],
+                    },
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][1]["role"] == "assistant"
-        assert out["messages"][1]["tool_calls"] == [{
-            "id": "t1", "type": "function",
-            "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
-        }]
-        assert out["messages"][2] == {"role": "tool", "tool_call_id": "t1", "content": "4"}
+        # Compact JSON, sort_keys, ensure_ascii=False; id rewritten to call_* prefix.
+        tc = out["messages"][1]["tool_calls"][0]
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "calc"
+        assert tc["function"]["arguments"] == '{"q":"2+2"}', f"Compact JSON expected; got {tc['function']['arguments']!r}"
+        assert tc["id"].startswith("call_"), f"Tool call id must be rewritten to call_* prefix; got {tc['id']!r}"
+        tool_msg = out["messages"][2]
+        assert tool_msg["role"] == "tool"
+        assert tool_msg["content"] == "4"
+        assert tool_msg["tool_call_id"] == tc["id"], "tool_call_id must match tool_calls[].id after rewrite"
 
 
 def test_user_content_list_with_single_text_block() -> None:
     """A user message as a list of content blocks must be flattened to string content."""
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Hello there"},
-            ]}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Hello there"},
+                        ],
+                    },
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"] == [{"role": "user", "content": "Hello there"}]
+
+
+def test_tool_call_arguments_use_compact_json_for_cache_stability() -> None:
+    """Regression test for llama-server prefix-cache misses.
+
+    ``tool_call.function.arguments`` is rendered verbatim by llama-server's
+    chat template. Default ``json.dumps`` inserts ``', '`` and ``': '``
+    separators; reference OpenAI clients (and Anthropic's own tool output)
+    use compact JSON. The whitespace difference produces different tokens
+    after BPE, busting the prefix cache when the same conversation is
+    routed via the proxy vs. a reference client.
+
+    This test pins the proxy to compact JSON — fixing the bug means
+    tightening ``json.dumps`` in ``_convert_assistant_message`` to
+    ``separators=(",", ":")``.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "t1", "name": "lookup", "input": {"key": "value", "count": 42, "tag": "a b"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "description": "x",
+                        "input_schema": {"type": "object"},
+                    },
+                ],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        args_str = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        # Compact JSON: no whitespace after the comma or colon separators.
+        assert ", " not in args_str, f"Compact JSON required for cache stability; got {args_str!r}"
+        assert ": " not in args_str, f"Compact JSON required for cache stability; got {args_str!r}"
+        # And it must round-trip back to the original dict.
+        assert json.loads(args_str) == {"key": "value", "count": 42, "tag": "a b"}
+
+
+# ---------------------------------------------------------------------------
+# Prefix-equivalence tests for llama-server prompt-cache stability.
+#
+# llama-server's prefix cache is keyed by the rendered prompt's token sequence.
+# Two requests share cache if and only if the proxy's outgoing OpenAI payload
+# is byte-identical up to the length of the shorter one. The tests below pin
+# the canonical wire form so we can detect any drift — every failure is a
+# candidate cache-busting hotspot.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_wire(payload: dict[str, Any]) -> str:
+    """Canonical, byte-stable JSON serialisation of the outgoing payload.
+
+    Mirrors what a well-behaved OpenAI client would put on the wire:
+    sorted keys, no whitespace, UTF-8 passthrough. The proxy's job is to
+    emit messages that hash to this canonical form regardless of client
+    quirks.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def test_tool_call_id_normalised_to_call_prefix() -> None:
+    """Anthropic emits ``toolu_*`` ids; OpenAI clients use ``call_*``.
+
+    The chat template renders the id in the prompt for many models, so the
+    prefix differs from a reference client's request. The proxy must rewrite
+    both ``tool_calls[].id`` and the matching ``tool_call_id``.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc123", "name": "lookup", "input": {"q": "x"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc123", "content": "ok"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "lookup", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tc_id = out["messages"][1]["tool_calls"][0]["id"]
+        tool_msg_id = out["messages"][2]["tool_call_id"]
+        assert tc_id.startswith("call_"), f"Expected call_* prefix, got {tc_id!r}"
+        assert tool_msg_id.startswith("call_"), f"Expected call_* prefix, got {tool_msg_id!r}"
+        assert tc_id == tool_msg_id, f"tool_calls[].id ({tc_id!r}) must match tool_call_id ({tool_msg_id!r})"
+
+
+def test_tool_call_arguments_preserve_unicode() -> None:
+    """Non-ASCII characters in tool arguments must serialise as UTF-8.
+
+    Default ``json.dumps`` uses ``ensure_ascii=True`` and escapes unicode to
+    ``\\uXXXX``. The reference wire form is UTF-8 — the rendered prompt
+    diverges whenever tool inputs contain non-ASCII.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "搜索"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "lookup", "input": {"city": "北京", "emoji": "🔍"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "ok"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "lookup", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        args_str = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        assert "\\u" not in args_str, f"Unicode must be passed through; got {args_str!r}"
+        assert "北京" in args_str
+        assert "🔍" in args_str
+
+
+def test_tool_call_arguments_stable_key_order() -> None:
+    """The arguments JSON must have a deterministic key order.
+
+    Reference wire form sorts keys (``sort_keys=True``). Python dicts preserve
+    insertion order, so the proxy must canonicalise via ``json.dumps`` rather
+    than embedding the input dict directly to disk.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "lookup"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "lookup", "input": {"z": 1, "a": 2, "m": 3}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "ok"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "lookup", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        args_str = out["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        parsed = json.loads(args_str)
+        keys = list(parsed.keys())
+        assert keys == sorted(keys), f"Arguments keys must be sorted; got {keys!r}"
+
+
+def test_outgoing_payload_is_canonical_byte_stable() -> None:
+    """The outgoing payload must serialise to a single canonical form.
+
+    Two requests with the same content must produce the same bytes on the
+    wire, regardless of input dict ordering. We assert the canonical form
+    round-trips cleanly and that the proxy's output preserves key order.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        # Round-trip must be idempotent (no whitespace, sorted keys).
+        wire = _canonical_wire(out)
+        reparsed = json.loads(wire)
+        again = _canonical_wire(reparsed)
+        assert wire == again, "Canonical wire form must be idempotent"
+        # And no leading whitespace, no indentation.
+        assert "\n" not in wire, "Wire form must not contain newlines"
+        assert ": " not in wire, "Wire form must not contain ': ' separators"
+        assert ", " not in wire, "Wire form must not contain ', ' separators"
+
+
+def test_prefix_equivalence_across_turns() -> None:
+    """Turn N's outgoing messages must START with turn N-1's outgoing messages.
+
+    llama-server's prefix cache only reuses if the rendered prompt of turn
+    N equals the rendered prompt of turn N-1 plus the new turn appended.
+    Structural prefix equivalence on the message list is the proxy-side
+    precondition for that.
+    """
+    with _patched_empty_config():
+        # Turn 1: just a user message.
+        req1 = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        out1 = srv.convert_anthropic_to_litellm(req1)
+        # Turn 2: append an assistant reply.
+        req2 = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ],
+            },
+        )
+        out2 = srv.convert_anthropic_to_litellm(req2)
+        # The first len(out1.messages) messages of out2 must equal out1's
+        # messages byte-for-byte. Use canonical wire form for comparison.
+        n = len(out1["messages"])
+        prefix_new = [_canonical_wire(m) for m in out2["messages"][:n]]
+        prefix_old = [_canonical_wire(m) for m in out1["messages"]]
+        assert prefix_new == prefix_old, f"Turn N's prefix drifted:\n  new: {prefix_new}\n  old: {prefix_old}"
+
+
+def test_prefix_equivalence_with_tool_turns() -> None:
+    """Tool-call turn's prefix must match the previous turn's full messages.
+
+    Most common cache-busting scenario: a turn that adds an assistant
+    tool_call plus the user tool_result must have the prefix (everything
+    before the new tool turns) identical to the previous turn.
+    """
+    with _patched_empty_config():
+        # Turn 1: system + user.
+        req1 = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "system": "You are helpful.",
+                "messages": [
+                    {"role": "user", "content": "What is the weather?"},
+                ],
+                "tools": [{"name": "weather", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out1 = srv.convert_anthropic_to_litellm(req1)
+        # Turn 2: same prefix + assistant tool_call + user tool_result.
+        req2 = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "system": "You are helpful.",
+                "messages": [
+                    {"role": "user", "content": "What is the weather?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "weather", "input": {"city": "Paris"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "sunny"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "weather", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out2 = srv.convert_anthropic_to_litellm(req2)
+        n = len(out1["messages"])
+        prefix_new = [_canonical_wire(m) for m in out2["messages"][:n]]
+        prefix_old = [_canonical_wire(m) for m in out1["messages"]]
+        assert prefix_new == prefix_old, "Turn N's prefix (system + user) must match turn N-1 exactly."
+
+
+def test_system_message_idempotent_across_turns() -> None:
+    """Same system field ⇒ byte-identical system message in outgoing payload."""
+    with _patched_empty_config():
+        req1 = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are a helpful assistant.",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        req2 = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are a helpful assistant.",
+                "messages": [{"role": "user", "content": "bye"}],
+            },
+        )
+        out1 = srv.convert_anthropic_to_litellm(req1)
+        out2 = srv.convert_anthropic_to_litellm(req2)
+        assert _canonical_wire(out1["messages"][0]) == _canonical_wire(out2["messages"][0]), (
+            "System message must be byte-stable when the input system field is unchanged."
+        )
+
+
+def test_tool_definitions_order_preserved() -> None:
+    """Tool list ordering must equal input ordering — clients append-only."""
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [
+                    {"name": "z_last", "description": "", "input_schema": {"type": "object"}},
+                    {"name": "a_first", "description": "", "input_schema": {"type": "object"}},
+                    {"name": "m_mid", "description": "", "input_schema": {"type": "object"}},
+                ],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        names = [t["function"]["name"] for t in out["tools"]]
+        assert names == ["z_last", "a_first", "m_mid"], f"Tool order must match input; got {names!r}"
+
+
+def test_determinism_same_input_same_output() -> None:
+    """Converting the same request twice must produce the same wire form.
+
+    Tool call ids are randomised (``call_<uuid>``) so the byte-level hash
+    differs across runs. Assert determinism on the canonicalised message
+    payload after stripping the random-generated ids — that's what
+    llama-server's prefix cache is keyed on.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "system": "help",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "f", "input": {"a": 1, "b": 2, "c": "x y"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "ok"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "f", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out1 = srv.convert_anthropic_to_litellm(req)
+        out2 = srv.convert_anthropic_to_litellm(req)
+
+        # Strip random ids so the deterministic content can be compared.
+        def _strip_ids(payload: dict[str, Any]) -> dict[str, Any]:
+            payload = json.loads(_canonical_wire(payload))
+            for msg in payload.get("messages", []):
+                for tc in msg.get("tool_calls", []):
+                    tc["id"] = "<id>"
+                if "tool_call_id" in msg:
+                    msg["tool_call_id"] = "<id>"
+            return payload
+
+        assert _strip_ids(out1) == _strip_ids(out2), "Same input must produce deterministic output (modulo random ids)"
+
+
+def test_no_anthropic_specific_fields_in_outgoing_messages() -> None:
+    """Only OpenAI fields must appear in outgoing message dicts.
+
+    Anthropic uses ``tool_use_id``, ``cache_control``, ``signature``;
+    OpenAI uses ``tool_call_id``, ``tool_calls``. Any leakage busts the
+    prefix cache because the chat template renders the extra fields.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "f", "input": {"a": 1}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "ok"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "f", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        allowed = {"role", "content", "name", "tool_call_id", "tool_calls"}
+        for msg in out["messages"]:
+            extras = set(msg.keys()) - allowed
+            assert not extras, f"Anthropic-specific fields leaked: {extras!r} in {msg!r}"
+
+
+def test_tool_definitions_parameters_not_none() -> None:
+    """Tool ``parameters`` must always be a dict — never ``null``.
+
+    OpenAI-compatible upstreams reject ``parameters: null``; reference
+    clients emit ``{}`` for empty schemas. The proxy must normalise.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"name": "f", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        for tool in out["tools"]:
+            params = tool["function"]["parameters"]
+            assert isinstance(params, dict), f"Tool parameters must be dict; got {type(params).__name__}"
+            assert "type" in params, "Tool parameters must declare 'type' so upstream validates schema"
+
+
+def test_tool_definition_cache_control_stripped_from_parameters() -> None:
+    """Anthropic allows ``cache_control`` inside ``input_schema``; OpenAI doesn't.
+
+    Reference wire form has no cache_control. Any leftover field renders
+    in the prompt and busts the prefix.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [
+                    {
+                        "name": "f",
+                        "description": "x",
+                        "input_schema": {
+                            "type": "object",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    },
+                ],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        params = out["tools"][0]["function"]["parameters"]
+        assert "cache_control" not in params, f"cache_control must be stripped from parameters; got {params!r}"
+
+
+def test_tool_result_string_content_passes_through_unchanged() -> None:
+    """String ``tool_result.content`` must hit the wire as the same string.
+
+    The proxy currently appends trailing newlines / strips — both change
+    the prompt's tokens. Reference form is verbatim.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "f", "input": {}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": "exact result"},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "f", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == "exact result", f"Tool result content must be verbatim; got {tool_msg['content']!r}"
+
+
+def test_empty_string_tool_result_content_not_replaced() -> None:
+    """Empty string ``tool_result.content`` must stay empty — not ``"..."``.
+
+    The current code normalises empty content to the placeholder ``"..."``
+    at the message level. That substitution is for empty ``user`` content,
+    not for tool result bodies. Exercise the full pipeline so the test
+    catches the post-sanitisation substitution.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_01abc", "name": "f", "input": {}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": ""},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "f", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        srv.sanitize_messages_for_openai(out["messages"])
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert not tool_msg["content"], f"Empty tool result must stay empty; got {tool_msg['content']!r}"
+
+
+# --- Image-bearing tool_result ---
+
+
+def _make_tool_result_request(tool_result_content: object) -> srv.MessagesRequest:
+    """Build an Anthropic Messages request whose last user turn is a single
+    tool_result block with the given content. Wraps the boilerplate so each
+    image-tool-result test stays focused on the content shape it exercises.
+    """
+    return _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 200,
+            "messages": [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_01abc", "name": "Read", "input": {"path": "/tmp/s.png"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_01abc", "content": tool_result_content},
+                    ],
+                },
+            ],
+            "tools": [{"name": "Read", "description": "x", "input_schema": {"type": "object"}}],
+        },
+    )
+
+
+def test_tool_result_with_image_block_emits_image_url() -> None:
+    """Image-only tool_result content list must emit an image_url part —
+    not a 100+KB stringified-JSON blob that the model can't see.
+    """
+    img_source = {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}
+    with _patched_empty_config():
+        req = _make_tool_result_request([{"type": "image", "source": img_source}])
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert isinstance(tool_msg["content"], list), f"Image-bearing tool result must be a list, got {type(tool_msg['content']).__name__}"
+        assert tool_msg["content"] == [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+            },
+        ]
+
+
+def test_tool_result_with_text_and_image_mixed() -> None:
+    """Mixed text + image list preserves source order: text part, then image_url part."""
+    img_source = {"type": "base64", "media_type": "image/png", "data": "abc"}
+    with _patched_empty_config():
+        req = _make_tool_result_request(
+            [
+                {"type": "text", "text": "here is the file"},
+                {"type": "image", "source": img_source},
+            ],
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == [
+            {"type": "text", "text": "here is the file"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+
+
+def test_tool_result_image_only_dict_single() -> None:
+    """Single image dict (not wrapped in a list) still produces an image_url list."""
+    img_source = {"type": "base64", "media_type": "image/jpeg", "data": "xyz"}
+    with _patched_empty_config():
+        req = _make_tool_result_request({"type": "image", "source": img_source})
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,xyz"},
+            },
+        ]
+
+
+def test_tool_result_text_only_unchanged_string() -> None:
+    """Regression: a list of text-only blocks still flattens to a string.
+
+    Three pre-existing tests assert string tool content; this is the
+    list-of-text-blocks equivalent of test_tool_result_string_content_passes_through_unchanged.
+    """
+    with _patched_empty_config():
+        req = _make_tool_result_request(
+            [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"},
+            ],
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == "first\nsecond", f"Text-only list must flatten to newline-joined string; got {tool_msg['content']!r}"
+
+
+def test_tool_result_with_multiple_images() -> None:
+    """Multiple images in one tool_result emit multiple image_url parts."""
+    src1 = {"type": "base64", "media_type": "image/png", "data": "aaa"}
+    src2 = {"type": "base64", "media_type": "image/png", "data": "bbb"}
+    with _patched_empty_config():
+        req = _make_tool_result_request(
+            [
+                {"type": "image", "source": src1},
+                {"type": "image", "source": src2},
+            ],
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aaa"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,bbb"}},
+        ]
+
+
+def test_tool_result_image_with_url_source() -> None:
+    """``source.type=url`` exercises the bare-URL branch of convert_image_block."""
+    with _patched_empty_config():
+        req = _make_tool_result_request(
+            [
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/cat.jpg"}},
+            ],
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == [
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/cat.jpg"},
+            },
+        ]
+
+
+def test_tool_result_empty_list_content_stays_empty() -> None:
+    """``content=[]`` must round-trip as empty string (parity with empty-string test)."""
+    with _patched_empty_config():
+        req = _make_tool_result_request([])
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert not tool_msg["content"], f"Empty list tool result must stay empty; got {tool_msg['content']!r}"
+
+
+def test_orphaned_tool_result_with_image_folded_as_prose() -> None:
+    """Orphan tool_result (no matching tool_use) folds into user text — image lost to prose.
+
+    The ghost id is meaningless, so we never emit a ``role=tool`` for it; the
+    image content gets stringified via the existing prose path.
+    """
+    img_source = {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    # tool_result references an id that no assistant turn emitted
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_ghost", "content": [{"type": "image", "source": img_source}]},
+                        ],
+                    },
+                ],
+                "tools": [{"name": "Read", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msgs = [m for m in out["messages"] if m.get("role") == "tool"]
+        assert not tool_msgs, f"Orphan tool_result must not produce role=tool; got {tool_msgs}"
+        folded = [
+            m
+            for m in out["messages"]
+            if m.get("role") == "user" and isinstance(m.get("content"), str) and "Result from an earlier tool call" in m["content"]
+        ]
+        assert len(folded) == 1, f"Expected one folded user message; got {len(folded)}"
+        assert "image" in folded[0]["content"]
+        assert "iVBORw0KGgo" in folded[0]["content"]
+
+
+def test_tool_result_with_image_after_sanitize_passes_list_through() -> None:
+    """Regression guard: sanitize_messages_for_openai must preserve list
+    content for ``role=tool`` (it has an early-continue for tool role).
+    """
+    img_source = {"type": "base64", "media_type": "image/png", "data": "abc"}
+    with _patched_empty_config():
+        req = _make_tool_result_request([{"type": "image", "source": img_source}])
+        out = srv.convert_anthropic_to_litellm(req)
+        srv.sanitize_messages_for_openai(out["messages"])
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert isinstance(tool_msg["content"], list)
+        assert tool_msg["content"] == [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            },
+        ]
+
+
+def test_tool_result_image_survives_full_pipeline() -> None:
+    """End-to-end: tool_use → tool_result with image → next assistant turn.
+
+    Confirms the image_url block survives the full convert → sanitize pipeline
+    and lives next to a fresh assistant message.
+    """
+    img_source = {"type": "base64", "media_type": "image/png", "data": "img"}
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "describe this"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"path": "/tmp/x.png"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_read", "content": [{"type": "image", "source": img_source}]},
+                        ],
+                    },
+                    {"role": "assistant", "content": "looks like a chart"},
+                ],
+                "tools": [{"name": "Read", "description": "x", "input_schema": {"type": "object"}}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        srv.sanitize_messages_for_openai(out["messages"])
+
+        roles = [m["role"] for m in out["messages"]]
+        assert roles == ["user", "assistant", "tool", "assistant"], f"Expected [user, assistant, tool, assistant]; got {roles}"
+        tool_msg = out["messages"][2]
+        assert tool_msg["content"] == [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,img"},
+            },
+        ]
 
 
 def test_user_content_list_with_text_and_image() -> None:
     """Text + image must produce a structured OpenAI content array (not flattened)."""
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "What is this?"},
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=",
-                }},
-            ]}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What is this?"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBORw0KGgo=",
+                                },
+                            },
+                        ],
+                    },
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         msg = out["messages"][0]
         assert msg["role"] == "user"
@@ -640,21 +1577,27 @@ def test_convert_image_block_unknown_source_falls_back_gracefully() -> None:
 
 # --- Tool edge cases ---
 
+
 def test_dangling_tool_use_folded_into_text() -> None:
     """A tool_use with no matching tool_result (truncated history) must be turned into prose,
     not emitted as a tool_call — otherwise the model would have to answer for an unanswerable call.
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 200,
-            "messages": [
-                {"role": "user", "content": "What's the weather?"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "SF"}},
-                ]},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "What's the weather?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "t1", "name": "get_weather", "input": {"city": "SF"}},
+                        ],
+                    },
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assistant = out["messages"][1]
         assert assistant["role"] == "assistant"
@@ -668,15 +1611,20 @@ def test_orphaned_tool_result_folded_into_user_text() -> None:
     than emitted as a role='tool' message (which would dangle).
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 200,
-            "messages": [
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "ghost", "content": "old data"},
-                ]},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "ghost", "content": "old data"},
+                        ],
+                    },
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         user_msgs = [m for m in out["messages"] if m["role"] == "user"]
         tool_msgs = [m for m in out["messages"] if m["role"] == "tool"]
@@ -691,20 +1639,28 @@ def test_tool_use_and_tool_result_ordering() -> None:
     the assistant tool_call turn.
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 200,
-            "messages": [
-                {"role": "user", "content": "Q"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "t1", "name": "calc", "input": {"x": 1}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "42"},
-                    {"type": "text", "text": "Thanks. Now also do Y."},
-                ]},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [
+                    {"role": "user", "content": "Q"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "t1", "name": "calc", "input": {"x": 1}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t1", "content": "42"},
+                            {"type": "text", "text": "Thanks. Now also do Y."},
+                        ],
+                    },
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         roles = [m["role"] for m in out["messages"]]
         assert roles == ["user", "assistant", "tool", "user"], f"got {roles}"
@@ -712,57 +1668,68 @@ def test_tool_use_and_tool_result_ordering() -> None:
 
 def test_tool_choice_any_passes_through() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "x"}],
-            "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
-            "tool_choice": {"type": "any"},
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "any"},
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["tool_choice"] == "any"
 
 
 def test_tool_choice_unknown_type_falls_back_to_auto() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "x"}],
-            "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
-            "tool_choice": {"type": "bogus_type"},
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "bogus_type"},
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["tool_choice"] == "auto"
 
 
 def test_tool_choice_tool_with_missing_name_falls_back_to_auto() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "x"}],
-            "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
-            "tool_choice": {"type": "tool"},
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"name": "t", "description": "t", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "tool"},
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["tool_choice"] == "auto"
 
 
 # --- Response conversion ---
 
+
 def test_convert_litellm_to_anthropic_text_response() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "Hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     response = {
         "id": "resp-1",
-        "choices": [{
-            "message": {"role": "assistant", "content": "Hello there"},
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "Hello there"},
+                "finish_reason": "stop",
+            },
+        ],
         "usage": {"prompt_tokens": 11, "completion_tokens": 5},
     }
     out = srv.convert_litellm_to_anthropic(response, req)
@@ -776,24 +1743,30 @@ def test_convert_litellm_to_anthropic_text_response() -> None:
 
 
 def test_convert_litellm_to_anthropic_tool_use_response() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "Hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     response = {
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
-                }],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "calc", "arguments": '{"q": "2+2"}'},
+                        },
+                    ],
+                },
+                "finish_reason": "tool_calls",
             },
-            "finish_reason": "tool_calls",
-        }],
+        ],
         "usage": {"prompt_tokens": 7, "completion_tokens": 3},
     }
     out = srv.convert_litellm_to_anthropic(response, req)
@@ -801,16 +1774,21 @@ def test_convert_litellm_to_anthropic_tool_use_response() -> None:
     assert len(out.content) == 1
     block = out.content[0]
     assert block.model_dump() == {
-        "type": "tool_use", "id": "call_1", "name": "calc", "input": {"q": "2+2"},
+        "type": "tool_use",
+        "id": "call_1",
+        "name": "calc",
+        "input": {"q": "2+2"},
     }
 
 
 def test_convert_litellm_to_anthropic_generates_id_when_missing() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "Hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     response = {
         "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
     }
@@ -821,11 +1799,13 @@ def test_convert_litellm_to_anthropic_generates_id_when_missing() -> None:
 
 
 def test_convert_litellm_to_anthropic_maps_length_stop_reason() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 5,
-        "messages": [{"role": "user", "content": "Tell me a long story"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 5,
+            "messages": [{"role": "user", "content": "Tell me a long story"}],
+        },
+    )
     response = {
         "choices": [{"message": {"role": "assistant", "content": "Once upon..."}, "finish_reason": "length"}],
     }
@@ -834,11 +1814,13 @@ def test_convert_litellm_to_anthropic_maps_length_stop_reason() -> None:
 
 
 def test_convert_litellm_to_anthropic_handles_empty_choices() -> None:
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "Hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     response = {"choices": []}
     out = srv.convert_litellm_to_anthropic(response, req)
     assert [b.model_dump() for b in out.content] == [{"type": "text", "text": ""}]
@@ -847,11 +1829,13 @@ def test_convert_litellm_to_anthropic_handles_empty_choices() -> None:
 
 def test_convert_litellm_to_anthropic_uses_keyword_usage_args() -> None:
     """Regression: Usage(...) must be built with keyword args, not positional."""
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "Hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     response = {
         "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 4, "completion_tokens": 2},
@@ -863,11 +1847,13 @@ def test_convert_litellm_to_anthropic_uses_keyword_usage_args() -> None:
 
 def test_convert_litellm_to_anthropic_recovers_from_broken_usage() -> None:
     """Regression: even if usage is malformed, we still return a usable response."""
-    req = _make_request({
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "Hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     response = {
         "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
         "usage": "not-a-dict",
@@ -882,16 +1868,20 @@ def test_convert_litellm_to_anthropic_handles_string_arguments_gracefully() -> N
     """Tool arguments are typically strings (JSON-encoded); a non-string must not crash."""
     req = _base_request()
     response = {
-        "choices": [{
-            "message": {
-                "content": None,
-                "tool_calls": [{
-                    "id": "c1",
-                    "function": {"name": "calc", "arguments": {"already": "a dict"}},
-                }],
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {"name": "calc", "arguments": {"already": "a dict"}},
+                        },
+                    ],
+                },
+                "finish_reason": "tool_calls",
             },
-            "finish_reason": "tool_calls",
-        }],
+        ],
     }
     out = srv.convert_litellm_to_anthropic(response, req)
     block = out.content[0]
@@ -904,16 +1894,20 @@ def test_convert_litellm_to_anthropic_recovers_from_invalid_json_arguments() -> 
     """If tool arguments are not valid JSON, we must not crash — fall back to a raw wrapper."""
     req = _base_request()
     response = {
-        "choices": [{
-            "message": {
-                "content": None,
-                "tool_calls": [{
-                    "id": "c1",
-                    "function": {"name": "calc", "arguments": "{this is not json"},
-                }],
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {"name": "calc", "arguments": "{this is not json"},
+                        },
+                    ],
+                },
+                "finish_reason": "tool_calls",
             },
-            "finish_reason": "tool_calls",
-        }],
+        ],
     }
     out = srv.convert_litellm_to_anthropic(response, req)
     block = out.content[0]
@@ -923,17 +1917,20 @@ def test_convert_litellm_to_anthropic_recovers_from_invalid_json_arguments() -> 
 
 # --- System messages ---
 
+
 def test_system_message_list_with_only_text_blocks() -> None:
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": [
-                {"type": "text", "text": "You are concise."},
-                {"type": "text", "text": "Answer in English."},
-            ],
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": [
+                    {"type": "text", "text": "You are concise."},
+                    {"type": "text", "text": "Answer in English."},
+                ],
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         sys_msg = out["messages"][0]
         assert sys_msg["role"] == "system"
@@ -948,18 +1945,20 @@ def test_system_role_message_in_messages_array_is_hoisted() -> None:
     request — never inline as a 'system' message in the middle.
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "You are concise.",
-            "messages": [
-                {"role": "system", "content": "[skill: foo] description"},
-                {"role": "user", "content": "Hi"},
-                {"role": "assistant", "content": "Hello!"},
-                {"role": "system", "content": [{"type": "text", "text": "[skill: baz] more"}]},
-                {"role": "user", "content": "and now?"},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise.",
+                "messages": [
+                    {"role": "system", "content": "[skill: foo] description"},
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "Hello!"},
+                    {"role": "system", "content": [{"type": "text", "text": "[skill: baz] more"}]},
+                    {"role": "user", "content": "and now?"},
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         roles = [m["role"] for m in out["messages"]]
         assert roles == ["system", "user", "assistant", "user"], f"got {roles}"
@@ -973,14 +1972,16 @@ def test_system_role_message_in_messages_array_is_hoisted() -> None:
 def test_system_role_message_with_string_content_is_hoisted() -> None:
     """A system message with string content is treated identically to a list."""
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [
-                {"role": "system", "content": "top-of-stream reminder"},
-                {"role": "user", "content": "Hi"},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "system", "content": "top-of-stream reminder"},
+                    {"role": "user", "content": "Hi"},
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0] == {"role": "system", "content": "top-of-stream reminder"}
         assert out["messages"][1]["role"] == "user"
@@ -1010,19 +2011,107 @@ def test_prompt_remap_strip_todo_reminder() -> None:
         "on. Use it if it's relevant to the current work. This is just a "
         "gentle reminder - ignore if not applicable.\n\n"
     )
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "You are concise." + "\n\n" + reminder,
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise." + "\n\n" + reminder,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         sys = out["messages"][0]["content"]
         assert "TodoWrite" not in sys, f"Reminder must be stripped; got {sys!r}"
         assert "You are concise." in sys
+
+
+def test_prompt_remap_strip_task_tools_reminder() -> None:
+    """TaskCreate/TaskUpdate reminder (alt variant) is also stripped."""
+    reminder = (
+        "The task tools haven't been used recently. If you're working on "
+        "tasks that would benefit from tracking progress, consider using "
+        "TaskCreate to add new tasks and TaskUpdate to update task status "
+        "(set to in_progress when starting, completed when done). Also "
+        "consider cleaning up the task list if it has become stale. Only "
+        "use these if relevant to the current work. This is just a gentle "
+        "reminder - ignore if not applicable.\n\n\n"
+    )
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The task tools haven't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise." + "\n\n" + reminder,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        sys = out["messages"][0]["content"]
+        assert "TaskCreate" not in sys, f"Reminder must be stripped; got {sys!r}"
+        assert "TaskUpdate" not in sys, f"Reminder must be stripped; got {sys!r}"
+        assert "You are concise." in sys
+
+
+def test_prompt_remap_canonical_across_reminder_variants() -> None:
+    """Both reminder variants yield the same outgoing system prompt as the no-reminder case."""
+    request_body = {
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    todo_reminder = (
+        "\n\nThe TodoWrite tool hasn't been used recently. If you're working "
+        "on tasks that would benefit from tracking progress, consider using "
+        "the TodoWrite tool to track progress. Also consider cleaning up the "
+        "todo list if has become stale and no longer matches what you are "
+        "working on. Use it if it's relevant to the current work. This is "
+        "just a gentle reminder - ignore if not applicable.\n\n"
+    )
+    task_tools_reminder = (
+        "\n\nThe task tools haven't been used recently. If you're working on "
+        "tasks that would benefit from tracking progress, consider using "
+        "TaskCreate to add new tasks and TaskUpdate to update task status "
+        "(set to in_progress when starting, completed when done). Also "
+        "consider cleaning up the task list if it has become stale. Only "
+        "use these if relevant to the current work. This is just a gentle "
+        "reminder - ignore if not applicable.\n\n\n"
+    )
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {
+                    "match": r"The (?:TodoWrite tool hasn't|task tools haven't) been used recently"
+                    r".*?ignore if not applicable\.?\n+",
+                    "replacement": "",
+                },
+            ],
+        ),
+    ):
+        out_none = srv.convert_anthropic_to_litellm(_make_request({**request_body, "system": "You are concise."}))
+        out_todo = srv.convert_anthropic_to_litellm(_make_request({**request_body, "system": "You are concise." + todo_reminder}))
+        out_task = srv.convert_anthropic_to_litellm(_make_request({**request_body, "system": "You are concise." + task_tools_reminder}))
+        sys_none = out_none["messages"][0]["content"]
+        sys_todo = out_todo["messages"][0]["content"]
+        sys_task = out_task["messages"][0]["content"]
+        assert sys_none == sys_todo == sys_task, (
+            f"All three outgoing prompts must be byte-identical;\nnone: {sys_none!r}\ntodo: {sys_todo!r}\ntask: {sys_task!r}"
+        )
 
 
 def test_prompt_remap_canonical_across_reminder_states() -> None:
@@ -1040,31 +2129,40 @@ def test_prompt_remap_canonical_across_reminder_states() -> None:
         "working on. Use it if it's relevant to the current work. This is "
         "just a gentle reminder - ignore if not applicable.\n\n"
     )
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
-    ]):
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+            ],
+        ),
+    ):
         req_on = _make_request({**request_body, "system": "You are concise." + reminder})
         req_off = _make_request({**request_body, "system": "You are concise."})
         out_on = srv.convert_anthropic_to_litellm(req_on)
         out_off = srv.convert_anthropic_to_litellm(req_off)
         sys_on = out_on["messages"][0]["content"]
         sys_off = out_off["messages"][0]["content"]
-        assert sys_on == sys_off, (
-            f"Outgoing system prompt must match across reminder states;\n"
-            f"on:  {sys_on!r}\noff: {sys_off!r}"
-        )
+        assert sys_on == sys_off, f"Outgoing system prompt must match across reminder states;\non:  {sys_on!r}\noff: {sys_off!r}"
 
 
 def test_prompt_remap_strips_trailing_newlines() -> None:
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "You are concise.\n\nThe TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise.\n\nThe TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         # No stray newlines, no leading/trailing whitespace.
         assert out["messages"][0]["content"] == "You are concise.", (
@@ -1074,49 +2172,149 @@ def test_prompt_remap_strips_trailing_newlines() -> None:
 
 def test_prompt_remap_no_match_passes_through() -> None:
     """Patterns with no match leave the system prompt untouched."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"never-present-pattern-\d+", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "You are concise.",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"never-present-pattern-\d+", "replacement": ""},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise.",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "You are concise."
 
 
+def test_prompt_remap_logs_when_stripping() -> None:
+    """WARNING log fires when any entry actually replaces text."""
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The task tools haven't been used recently.*?ignore if not applicable\.\n+", "replacement": ""},
+            ],
+        ),
+        patch.object(srv.logger, "warning") as warning,
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise.\n\nThe task tools haven't been used recently. ignore if not applicable.\n",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        srv.convert_anthropic_to_litellm(req)
+        strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
+        assert len(strip_logs) == 1, f"expected one strip log, got {len(strip_logs)}: {strip_logs}"
+        _msg, stripped, matches, _es, fired, _word = strip_logs[0].args
+        assert stripped > 0
+        assert matches == 1
+        assert fired == 1
+
+
+def test_prompt_remap_silent_when_no_strip() -> None:
+    """No WARNING log fires when no entry replaces anything."""
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"never-present-pattern-\d+", "replacement": ""},
+            ],
+        ),
+        patch.object(srv.logger, "warning") as warning,
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise.",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        srv.convert_anthropic_to_litellm(req)
+        strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
+        assert strip_logs == [], f"expected no strip log, got {strip_logs}"
+
+
+def test_prompt_remap_logs_match_count_when_pattern_fires_multiple_times() -> None:
+    """When the same reminder appears N times, log says 'N matches' so accumulation is visible."""
+    reminder = "The task tools haven't been used recently. ignore if not applicable.\n"
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The task tools haven't been used recently.*?ignore if not applicable\.\n+", "replacement": ""},
+            ],
+        ),
+        patch.object(srv.logger, "warning") as warning,
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "You are concise.\n\n" + reminder + reminder + reminder,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        srv.convert_anthropic_to_litellm(req)
+        strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
+        assert len(strip_logs) == 1
+        _msg, _stripped, matches, _es, _fired, _word = strip_logs[0].args
+        assert matches == 3, f"expected 3 matches for 3 reminder copies; got {matches}"
+
+
 def test_prompt_remap_multiple_entries_applied_in_order() -> None:
     """Entries are applied sequentially; later matches see the already-rewritten text."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"REMINDER_INNER", "replacement": ""},
-        {"match": r"REMINDER_OUTER", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "Keep REMINDER_OUTER marker [REMINDER_INNER content] visible.",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"REMINDER_INNER", "replacement": ""},
+                {"match": r"REMINDER_OUTER", "replacement": ""},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "Keep REMINDER_OUTER marker [REMINDER_INNER content] visible.",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "Keep  marker [ content] visible."
 
 
 def test_prompt_remap_handles_list_system_field() -> None:
     """Anthropic's `system` can be a list of content blocks, not just a string."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": [
-                {"type": "text", "text": "You are concise."},
-                {"type": "text", "text": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n"},
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
             ],
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": [
+                    {"type": "text", "text": "You are concise."},
+                    {"type": "text", "text": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n"},
+                ],
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         sys = out["messages"][0]["content"]
         assert "TodoWrite" not in sys
@@ -1125,17 +2323,24 @@ def test_prompt_remap_handles_list_system_field() -> None:
 
 def test_prompt_remap_handles_inband_system_messages() -> None:
     """In-band role='system' messages (Claude Code 2.1.154+) are also remapped."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [
-                {"role": "system", "content": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n"},
-                {"role": "user", "content": "Hi"},
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
             ],
-        })
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "system", "content": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n"},
+                    {"role": "user", "content": "Hi"},
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         # The system message was the entire reminder — stripped to "" → dropped.
         assert out["messages"][0]["role"] == "user"
@@ -1144,15 +2349,22 @@ def test_prompt_remap_handles_inband_system_messages() -> None:
 
 def test_prompt_remap_empty_after_strip_returns_no_system_message() -> None:
     """If the entire system prompt is the reminder, the system message is dropped."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"The TodoWrite tool hasn't been used recently.*?ignore if not applicable\.?\n+", "replacement": ""},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "The TodoWrite tool hasn't been used recently. ignore if not applicable.\n\n",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["role"] == "user"
         assert len(out["messages"]) == 1
@@ -1161,65 +2373,221 @@ def test_prompt_remap_empty_after_strip_returns_no_system_message() -> None:
 def test_prompt_remap_no_remaps_no_change() -> None:
     """Empty config leaves the system prompt verbatim — default behaviour unchanged."""
     with _patched_empty_config(), _patched_prompt_remaps([]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "The TodoWrite tool hasn't been used recently.",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "The TodoWrite tool hasn't been used recently.",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert "TodoWrite" in out["messages"][0]["content"]
 
 
 def test_prompt_remap_compile_failure_skipped() -> None:
     """Bad regexes are warned and skipped — boot must not fail."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"[unclosed", "replacement": ""},  # re.error on compile
-        {"match": r"valid-pattern", "replacement": "X"},
-    ]):
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"[unclosed", "replacement": ""},  # re.error on compile
+                {"match": r"valid-pattern", "replacement": "X"},
+            ],
+        ),
+    ):
         # The valid one still applies; the broken one is dropped.
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "Then valid-pattern here.",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "Then valid-pattern here.",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "Then X here."
 
 
 def test_prompt_remap_bad_match_string_skipped() -> None:
     """Non-string `match` entries are warned and skipped."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": 123, "replacement": ""},  # ty: ignore[list-item]
-        {"match": r"real-match", "replacement": "Y"},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "real-match applies",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": 123, "replacement": ""},  # ty: ignore[list-item]
+                {"match": r"real-match", "replacement": "Y"},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "real-match applies",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "Y applies"
 
 
 def test_prompt_remap_replacement_supports_newlines() -> None:
     """`\\n` in the replacement string becomes a real newline."""
-    with _patched_empty_config(), _patched_prompt_remaps([
-        {"match": r"BLOCK", "replacement": "\n"},
-    ]):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "system": "before BLOCK after",
-            "messages": [{"role": "user", "content": "Hi"}],
-        })
+    with (
+        _patched_empty_config(),
+        _patched_prompt_remaps(
+            [
+                {"match": r"BLOCK", "replacement": "\n"},
+            ],
+        ),
+    ):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "before BLOCK after",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "before \n after"
 
 
+@contextlib.contextmanager
+def _patched_env(name: str, value: str) -> Iterator[None]:
+    """Temporarily set an env var; restore on exit."""
+    original = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original
+
+
+@contextlib.contextmanager
+def _patched_cwd(path: pathlib.Path) -> Iterator[None]:
+    """Temporarily chdir; restore on exit."""
+    original = pathlib.Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(original)
+
+
+def _reset_cache_matcher() -> None:
+    """Drop the @cache singleton so each test gets a fresh matcher."""
+    srv._get_cache_matcher.cache_clear()
+
+
+def test_debug_cache_dump_disabled_by_default() -> None:
+    """Without PROXY_DEBUG_CACHE_DUMP, no debug directory is created and no files written."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", ""):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload({"messages": [{"role": "user", "content": "hi"}]})
+            srv._debug_dump_outgoing_payload({"messages": [{"role": "user", "content": "hi again"}]})
+            assert not (pathlib.Path(tmp) / ".claude-code-proxy").exists(), "Disabled flag must not create the debug directory"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_debug_cache_dump_does_not_mutate_payload() -> None:
+    """The matcher scrubs ids in copies; the caller's payload keeps its original tool_call ids."""
+    payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "f"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_abc123", "content": "result"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+    }
+    snapshot = json.loads(json.dumps(payload))  # deep copy for comparison
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload(payload)
+            srv._debug_dump_outgoing_payload(payload)  # second call hits history
+            assert payload == snapshot, f"observe() must not mutate the caller's payload; got diff:\nbefore: {snapshot}\nafter:  {payload}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_debug_cache_dump_enabled_prefix_hit_creates_artifacts() -> None:
+    """PROXY_DEBUG_CACHE_DUMP=true creates $cwd/.claude-code-proxy/prompts/ when an outgoing
+    is a prefix extension of a prior one (cache-hit evidence)."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        prompts_dir = pathlib.Path(tmp) / ".claude-code-proxy" / "prompts"
+        payload_v1 = {"messages": [{"role": "user", "content": "hi"}]}
+        payload_v2 = {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        }
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload(payload_v1)
+            # First call: no history → no directory, no files.
+            assert not prompts_dir.exists(), "No history → no debug directory should be created"
+            srv._debug_dump_outgoing_payload(payload_v2)
+            assert prompts_dir.is_dir(), f"Expected {prompts_dir} to exist after a prefix hit"
+            json_files = list(prompts_dir.glob("*-prefix_hit-*.json"))
+            assert len(json_files) == 2, f"Expected -new.json + -old.json; got {json_files}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_debug_cache_dump_matches_immediately_prior_request() -> None:
+    """Monotonic growth → each new request matches the immediately-prior one, not the oldest."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        prompts_dir = pathlib.Path(tmp) / ".claude-code-proxy" / "prompts"
+
+        def make(n: int) -> dict[str, object]:
+            return {"messages": [{"role": "user", "content": f"msg-{i}"} for i in range(n)]}
+
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            for n in (3, 5, 8):
+                srv._debug_dump_outgoing_payload(make(n))
+            hits = sorted(prompts_dir.glob("*-prefix_hit-*.json"))
+            assert len(hits) == 4, f"Expected 2 prefix_hits x 2 files; got {hits}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_debug_cache_dump_enabled_fuzzy_match_writes_artifacts() -> None:
+    """Two payloads that share ≥ 0.6 SequenceMatcher ratio but aren't a structural prefix
+    trigger ``fuzzy_match`` artifacts (cache-busting suspect)."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        prompts_dir = pathlib.Path(tmp) / ".claude-code-proxy" / "prompts"
+        # Same messages except one trailing punctuation flip — high SequenceMatcher ratio,
+        # not a structural prefix (different final char).
+        payload_v1 = {"messages": [{"role": "user", "content": "Hello"}]}
+        payload_v2 = {"messages": [{"role": "user", "content": "Hello!"}]}
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload(payload_v1)
+            srv._debug_dump_outgoing_payload(payload_v2)
+            fuzzy_files = list(prompts_dir.glob("*-fuzzy_match-*.json"))
+            assert fuzzy_files, f"Expected fuzzy_match artifacts; got {list(prompts_dir.glob('*'))}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --- Content block assembly ---
+
 
 def test_build_content_blocks_text_only() -> None:
     """No reasoning -> just a text block."""
@@ -1253,13 +2621,15 @@ def test_convert_litellm_to_anthropic_uses_reasoning_content() -> None:
     """
     req = _base_request()
     response = {
-        "choices": [{
-            "message": {
-                "content": "final answer",
-                "reasoning_content": "step by step",
+        "choices": [
+            {
+                "message": {
+                    "content": "final answer",
+                    "reasoning_content": "step by step",
+                },
+                "finish_reason": "stop",
             },
-            "finish_reason": "stop",
-        }],
+        ],
     }
     out = srv.convert_litellm_to_anthropic(response, req)
     dumped = [b.model_dump(exclude_none=True) for b in out.content]
@@ -1276,18 +2646,23 @@ def test_request_accepts_thinking_block_in_history() -> None:
     OpenAI call (OpenAI has no equivalent concept).
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "hello"},
-                    {"type": "thinking", "thinking": "I should say hi back.", "signature": ""},
-                ]},
-                {"role": "user", "content": "and now?"},
-            ],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {"type": "thinking", "thinking": "I should say hi back.", "signature": ""},
+                        ],
+                    },
+                    {"role": "user", "content": "and now?"},
+                ],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assistant = out["messages"][1]
         assert assistant["role"] == "assistant"
@@ -1296,6 +2671,7 @@ def test_request_accepts_thinking_block_in_history() -> None:
 
 
 # --- Think stream parser ---
+
 
 def test_think_stream_parser_text_only() -> None:
     """Plain text with no tags passes through verbatim."""
@@ -1405,6 +2781,7 @@ def test_think_stream_parser_unclosed_at_flush() -> None:
 
 # --- Streaming ---
 
+
 async def test_streaming_text_only_emits_required_events() -> None:
     """A pure-text stream must emit message_start, ping, deltas, message_delta, message_stop, [DONE]."""
     req = _base_request(stream=True)
@@ -1416,8 +2793,7 @@ async def test_streaming_text_only_emits_required_events() -> None:
     events = await _run_stream(chunks, req)
     types = [e["type"] for e in events]
 
-    for required in ("message_start", "content_block_start", "content_block_delta",
-                     "content_block_stop", "message_delta", "message_stop"):
+    for required in ("message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"):
         assert required in types, f"missing {required}; got {types}"
 
     assert events[-1] == {"type": "[DONE]"}, "stream must end with [DONE]"
@@ -1428,10 +2804,7 @@ async def test_streaming_text_only_accumulates_text() -> None:
     chunks = [_text_chunk("foo"), _text_chunk("bar"), _finish_chunk("stop")]
     events = await _run_stream(chunks, req)
     text = "".join(
-        e["delta"]["text"]
-        for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "text_delta"
+        e["delta"]["text"] for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta"
     )
     assert text == "foobar"
 
@@ -1440,9 +2813,16 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
     """When the model emits text and then a tool call, the text block must be closed
     before the tool_use block starts — Anthropic's SSE protocol requires this ordering.
     """
-    req = _base_request(stream=True, tools=[{
-        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
-    }])
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "calc",
+                "description": "calc",
+                "input_schema": {"type": "object"},
+            },
+        ],
+    )
     chunks = [
         _text_chunk("Let me calculate"),
         _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":1}'),
@@ -1455,30 +2835,30 @@ async def test_streaming_text_then_tool_call_closes_text_block_first() -> None:
 
     text_close_idx = find(lambda e: e["type"] == "content_block_stop" and e.get("index") == 0)
     tool_start_idx = find(
-        lambda e: e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "tool_use",
+        lambda e: e["type"] == "content_block_start" and (e.get("content_block") or {}).get("type") == "tool_use",
     )
-    assert text_close_idx < tool_start_idx, (
-        f"text block (idx {text_close_idx}) must close before tool block opens (idx {tool_start_idx})"
-    )
+    assert text_close_idx < tool_start_idx, f"text block (idx {text_close_idx}) must close before tool block opens (idx {tool_start_idx})"
 
 
 async def test_streaming_tool_call_then_text_opens_new_block() -> None:
     """Text emitted after a tool_use must open a fresh text block (close-before-open)."""
-    req = _base_request(stream=True, tools=[{
-        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
-    }])
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "calc",
+                "description": "calc",
+                "input_schema": {"type": "object"},
+            },
+        ],
+    )
     chunks = [
         _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":1}'),
         _text_chunk("after tool"),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
-    text_starts = [
-        e for e in events
-        if e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "text"
-    ]
+    text_starts = [e for e in events if e["type"] == "content_block_start" and (e.get("content_block") or {}).get("type") == "text"]
     assert len(text_starts) == 2, f"expected two text blocks (initial + post-tool), got {len(text_starts)}"
     # Canonical sequence: tool_use stop(0) → text start(1) → text stop(1).
     types = [e["type"] for e in events]
@@ -1487,19 +2867,22 @@ async def test_streaming_tool_call_then_text_opens_new_block() -> None:
 
 async def test_streaming_tool_only_no_text() -> None:
     """Tool-only response: no text deltas, just tool_use block and finish."""
-    req = _base_request(stream=True, tools=[{
-        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
-    }])
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "calc",
+                "description": "calc",
+                "input_schema": {"type": "object"},
+            },
+        ],
+    )
     chunks = [
         _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":1}'),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
-    text_deltas = [
-        e for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "text_delta"
-    ]
+    text_deltas = [e for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta"]
     assert text_deltas == []
     stop = next(e for e in events if e["type"] == "message_delta")
     assert stop["delta"]["stop_reason"] == "tool_use"
@@ -1515,6 +2898,38 @@ async def test_streaming_no_finish_reason_falls_back_to_end_turn() -> None:
     assert events[-1] == {"type": "[DONE]"}
     stop = next(e for e in events if e["type"] == "message_delta")
     assert stop["delta"]["stop_reason"] == "end_turn"
+
+
+async def test_streaming_no_finish_reason_with_tool_call_uses_tool_use_stop() -> None:
+    """Upstream closes the stream mid-tool-call without finish_reason.
+
+    Previously the epilogue hardcoded end_turn, which made the Anthropic
+    SDK treat the response as "no pending work" and skip the tool result
+    request. Pick tool_use instead.
+    """
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "calc",
+                "description": "x",
+                "input_schema": {"type": "object"},
+            },
+        ],
+    )
+    chunks = [
+        _tool_delta_chunk(index=0, tool_id="call_1", name="calc", arguments='{"q":'),
+        _tool_delta_chunk(index=0, arguments='"2"}'),
+        # No finish_reason chunk — upstream just terminated.
+    ]
+    events = await _run_stream(chunks, req)
+    types = [e["type"] for e in events]
+    assert "message_stop" in types
+    assert "content_block_stop" in types, "in-flight tool_use block must close"
+    stop = next(e for e in events if e["type"] == "message_delta")
+    assert stop["delta"]["stop_reason"] == "tool_use", (
+        f"expected tool_use when upstream omits finish_reason mid-tool-call; got {stop['delta']['stop_reason']!r}"
+    )
 
 
 async def test_streaming_emits_error_frame_on_chunk_failure() -> None:
@@ -1596,11 +3011,7 @@ async def test_streaming_tolerates_isolated_bad_chunks() -> None:
     # Stream terminated cleanly via message_stop (not error).
     assert "message_stop" in types
     # good2/good3 must have flowed through — counter reset on next success.
-    text_deltas = [
-        e for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "text_delta"
-    ]
+    text_deltas = [e for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta"]
     text_blob = "".join(d["delta"]["text"] for d in text_deltas)
     assert "good1" in text_blob
     assert "good2" in text_blob
@@ -1636,9 +3047,7 @@ async def test_streaming_counter_resets_on_successful_chunks() -> None:
     events = _parse_sse(raw)
     types = [e["type"] for e in events]
     # No error frame — interleaved bad chunks reset on the good one.
-    assert "error" not in types, (
-        f"counter did not reset on success; got error frame. types={types}"
-    )
+    assert "error" not in types, f"counter did not reset on success; got error frame. types={types}"
     assert "message_stop" in types
 
 
@@ -1682,11 +3091,7 @@ def test_emit_failure_flushes_buffered_think_content() -> None:
     raw = list(srv._emit_failure(parser, tracker, 0, exc, "test failed"))
     events = _parse_sse(raw)
 
-    thinking_deltas = [
-        e for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "thinking_delta"
-    ]
+    thinking_deltas = [e for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "thinking_delta"]
     assert thinking_deltas, "buffered think content must be flushed before error frame"
     assert any("partial reasoning" in d["delta"]["thinking"] for d in thinking_deltas)
 
@@ -1715,20 +3120,23 @@ async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     """Parallel tool calls must each get their own SSE block index, with
     content_block_stop(N) emitted before content_block_start(N+1).
     """
-    req = _base_request(stream=True, tools=[{
-        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
-    }])
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "calc",
+                "description": "calc",
+                "input_schema": {"type": "object"},
+            },
+        ],
+    )
     chunks = [
         _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"a":1}'),
         _tool_delta_chunk(1, tool_id="call_2", name="calc", arguments='{"b":2}'),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
-    tool_starts = [
-        e for e in events
-        if e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "tool_use"
-    ]
+    tool_starts = [e for e in events if e["type"] == "content_block_start" and (e.get("content_block") or {}).get("type") == "tool_use"]
     assert len(tool_starts) == 2
     indices = {t["index"] for t in tool_starts}
     assert len(indices) == 2, f"tool blocks must have distinct indices, got {indices}"
@@ -1738,23 +3146,82 @@ async def test_streaming_multiple_tool_calls_use_distinct_indices() -> None:
     assert len(stops) >= len(starts), "each tool_use must be closed before the next opens"
     # In event order, the first tool stop precedes the second tool start.
     second_tool_start_idx = next(
-        i for i, e in enumerate(events)
-        if e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "tool_use"
-        and e["index"] == 1
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "content_block_start" and (e.get("content_block") or {}).get("type") == "tool_use" and e["index"] == 1
     )
-    first_tool_stop_idx = next(
-        i for i, e in enumerate(events)
-        if e["type"] == "content_block_stop" and e["index"] == 0
-    )
+    first_tool_stop_idx = next(i for i, e in enumerate(events) if e["type"] == "content_block_stop" and e["index"] == 0)
     assert first_tool_stop_idx < second_tool_start_idx
+
+
+async def test_streaming_preserves_partial_tool_arguments_when_index_changes() -> None:
+    """Repro for the malformed-Bash-before-Read pattern we saw against MiniMax.
+
+    When two parallel tool calls arrive and the first one's argument stream
+    ends mid-JSON (literally ``"{"``), the proxy must forward it faithfully —
+    no synthetic completion, no drop. Claude Code surfaces the malformed
+    input via ``__unparsedToolInput`` and the model retries with a clean
+    call.
+    """
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "Bash",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+            {
+                "name": "Read",
+                "description": "x",
+                "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+            },
+        ],
+    )
+    chunks = [
+        _tool_delta_chunk(0, tool_id="call_bash", name="Bash", arguments="{"),
+        _tool_delta_chunk(1, tool_id="call_read", name="Read", arguments='{"file_path":"/tmp/x.png"}'),
+        _finish_chunk("tool_calls"),
+    ]
+    events = await _run_stream(chunks, req)
+
+    # Find each tool_use block by name, then assert what deltas fed it.
+    blocks: dict[str, dict[str, object]] = {}
+    current_name: str | None = None
+    for e in events:
+        if e["type"] == "content_block_start":
+            cb = e.get("content_block") or {}
+            if cb.get("type") == "tool_use":
+                current_name = cb.get("name")
+                blocks[current_name] = {"index": e["index"], "deltas": []}
+        elif e["type"] == "content_block_stop":
+            current_name = None
+        elif e["type"] == "content_block_delta" and current_name:
+            d = e.get("delta") or {}
+            if d.get("type") == "input_json_delta":
+                blocks[current_name]["deltas"].append(d.get("partial_json", ""))
+
+    assert set(blocks) == {"Bash", "Read"}, f"expected Bash and Read blocks; got {set(blocks)}"
+    assert blocks["Bash"]["deltas"] == ["{"], (
+        f"Bash must carry the literal partial_json from upstream — no synthetic closing; got {blocks['Bash']['deltas']!r}"
+    )
+    assert blocks["Read"]["deltas"] == ['{"file_path":"/tmp/x.png"}'], (
+        f"Read must carry its full arguments; got {blocks['Read']['deltas']!r}"
+    )
 
 
 async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
     """Tool argument fragments must be wrapped in input_json_delta deltas."""
-    req = _base_request(stream=True, tools=[{
-        "name": "calc", "description": "calc", "input_schema": {"type": "object"},
-    }])
+    req = _base_request(
+        stream=True,
+        tools=[
+            {
+                "name": "calc",
+                "description": "calc",
+                "input_schema": {"type": "object"},
+            },
+        ],
+    )
     chunks = [
         _tool_delta_chunk(0, tool_id="call_1", name="calc", arguments='{"x":'),
         _tool_delta_chunk(0, arguments="1}"),
@@ -1764,8 +3231,7 @@ async def test_streaming_tool_arguments_streamed_as_partial_json() -> None:
     arg_deltas = [
         e["delta"]["partial_json"]
         for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "input_json_delta"
+        if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "input_json_delta"
     ]
     assert "".join(arg_deltas) == '{"x":1}'
 
@@ -1788,7 +3254,7 @@ async def test_streaming_message_id_format() -> None:
     msg_id = start["message"]["id"]
     assert msg_id.startswith("msg_")
     assert len(msg_id) == len("msg_") + 24
-    assert all(c in "0123456789abcdef" for c in msg_id[len("msg_"):])
+    assert all(c in "0123456789abcdef" for c in msg_id[len("msg_") :])
 
 
 async def test_streaming_emits_thinking_block_for_think_tags() -> None:
@@ -1802,24 +3268,14 @@ async def test_streaming_emits_thinking_block_for_think_tags() -> None:
         _finish_chunk("stop"),
     ]
     events = await _run_stream(chunks, req)
-    thinking_starts = [
-        e for e in events
-        if e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "thinking"
-    ]
+    thinking_starts = [e for e in events if e["type"] == "content_block_start" and (e.get("content_block") or {}).get("type") == "thinking"]
     assert len(thinking_starts) == 1, "exactly one thinking block expected"
     thinking_deltas = [
-        e["delta"]["thinking"]
-        for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "thinking_delta"
+        e["delta"]["thinking"] for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "thinking_delta"
     ]
     assert "".join(thinking_deltas) == "step 1; step 2;"
     text_deltas = [
-        e["delta"]["text"]
-        for e in events
-        if e["type"] == "content_block_delta"
-        and e.get("delta", {}).get("type") == "text_delta"
+        e["delta"]["text"] for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta"
     ]
     assert "".join(text_deltas) == "final answer"
 
@@ -1830,17 +3286,15 @@ async def test_streaming_emits_thinking_for_native_reasoning_content() -> None:
     """
     req = _base_request(stream=True)
     chunk = {
-        "choices": [{
-            "delta": {"content": "answer", "reasoning_content": "thinking"},
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "delta": {"content": "answer", "reasoning_content": "thinking"},
+                "finish_reason": "stop",
+            },
+        ],
     }
     events = await _run_stream([chunk], req)
-    thinking_starts = [
-        e for e in events
-        if e["type"] == "content_block_start"
-        and (e.get("content_block") or {}).get("type") == "thinking"
-    ]
+    thinking_starts = [e for e in events if e["type"] == "content_block_start" and (e.get("content_block") or {}).get("type") == "thinking"]
     assert len(thinking_starts) == 1
 
 
@@ -1893,6 +3347,7 @@ def _patched_empty_config() -> Iterator[None]:
 
 
 # --- Loader ---
+
 
 def test_load_config_happy_path() -> None:
     with _patched_config("""
@@ -2041,15 +3496,16 @@ def test_convert_request_explicit_none_top_p_is_dropped() -> None:
     to upstream — OpenAI-compatible backends reject null with 400.
     """
     with _patched_empty_config():
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-            "top_p": None,
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "top_p": None,
+            },
+        )
         assert "top_p" in req.model_fields_set, (
-            "test setup: top_p=None must land in model_fields_set so the "
-            "request-time drop branch actually executes"
+            "test setup: top_p=None must land in model_fields_set so the request-time drop branch actually executes"
         )
         out = srv.convert_anthropic_to_litellm(req)
         assert "top_p" not in out
@@ -2064,11 +3520,13 @@ def test_convert_config_empty_stop_in_extra_body_passes_through() -> None:
         [sonnet]
         extra_body = { stop = [] }
     """):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["stop"] == []
 
@@ -2079,19 +3537,18 @@ def test_resolve_tier_config_does_not_share_nested_dicts() -> None:
         [global]
         extra_body = { chat_template_kwargs = { enable_thinking = false } }
     """):
-        req = _make_request({
-            "model": "claude-3-5-haiku-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-haiku-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
         resolved = srv._resolve_tier_config(req)
         resolved["extra_body"]["chat_template_kwargs"]["enable_thinking"] = True
         resolved["extra_body"]["new_key"] = 1
         # CONFIG is unchanged
-        assert (
-            srv.CONFIG["global"]["extra_body"]["chat_template_kwargs"]["enable_thinking"]
-            is False
-        )
+        assert srv.CONFIG["global"]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
         assert "new_key" not in srv.CONFIG["global"]["extra_body"]
 
 
@@ -2101,11 +3558,13 @@ def test_convert_config_zero_sampling_in_extra_body_is_preserved() -> None:
         [sonnet]
         extra_body = { temperature = 0, top_p = 0, top_k = 0 }
     """):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["temperature"] == 0
         assert out["top_p"] == 0
@@ -2124,6 +3583,7 @@ def test_proxy_value_empty_string_in_config_falls_through_to_env() -> None:
 
 
 # --- Deep merge ---
+
 
 def test_deep_merge_config_wins_per_leaf() -> None:
     merged = srv._deep_merge({"a": 1, "b": 2}, {"b": 99, "c": 3})
@@ -2176,6 +3636,7 @@ def test_proxy_bool_garbage_string_falls_back_to_caller_default() -> None:
 
 # --- Tier capture ---
 
+
 def test_derive_tier_sets_tier_for_each_known_substring() -> None:
     expected = {
         "claude-3-5-haiku-20241022": "haiku",
@@ -2185,32 +3646,29 @@ def test_derive_tier_sets_tier_for_each_known_substring() -> None:
         "claude-mythos-5": "mythos",
     }
     for model, tier in expected.items():
-        req = _make_request({"model": model, "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": model, "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         assert req.tier == tier, f"model={model!r} expected tier={tier!r}, got {req.tier!r}"
 
 
 def test_derive_tier_is_none_for_unknown_model() -> None:
-    req = _make_request({"model": "my-local-llama", "max_tokens": 100,
-                          "messages": [{"role": "user", "content": "hi"}]})
+    req = _make_request({"model": "my-local-llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
     assert req.tier is None
 
 
 def test_derive_tier_strips_anthropic_prefix() -> None:
-    req = _make_request({"model": "anthropic/claude-3-5-haiku-20241022",
-                          "max_tokens": 100,
-                          "messages": [{"role": "user", "content": "hi"}]})
+    req = _make_request(
+        {"model": "anthropic/claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]},
+    )
     assert req.tier == "haiku"
 
 
 def test_derive_tier_strips_gemini_prefix() -> None:
-    req = _make_request({"model": "gemini/claude-3-5-sonnet-20241022",
-                          "max_tokens": 100,
-                          "messages": [{"role": "user", "content": "hi"}]})
+    req = _make_request({"model": "gemini/claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
     assert req.tier == "sonnet"
 
 
 # --- Per-tier lookup ---
+
 
 def test_resolve_tier_config_prefers_tier_over_global() -> None:
     with _patched_config("""
@@ -2220,9 +3678,7 @@ def test_resolve_tier_config_prefers_tier_over_global() -> None:
         [sonnet]
         extra_body = { temperature = 0.9 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"]["temperature"] == 0.9
 
@@ -2232,9 +3688,7 @@ def test_resolve_tier_config_falls_back_to_global_when_tier_missing() -> None:
         [global]
         extra_body = { temperature = 0.5 }
     """):
-        req = _make_request({"model": "claude-3-5-haiku-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"]["temperature"] == 0.5
 
@@ -2244,9 +3698,7 @@ def test_resolve_tier_config_falls_back_to_global_when_tier_none() -> None:
         [global]
         extra_body = { temperature = 0.4 }
     """):
-        req = _make_request({"model": "my-local-llama",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "my-local-llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"]["temperature"] == 0.4
 
@@ -2259,9 +3711,7 @@ def test_resolve_tier_config_deep_merges_extra_body_over_global() -> None:
         [sonnet]
         extra_body = { chat_template_kwargs = { enable_thinking = false }, foo = 2 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"]["cache_prompt"] is True  # from global
         assert cfg["extra_body"]["foo"] == 2  # tier overrides global
@@ -2270,9 +3720,7 @@ def test_resolve_tier_config_deep_merges_extra_body_over_global() -> None:
 
 def test_resolve_tier_config_empty_when_nothing_loaded() -> None:
     with _patched_empty_config():
-        req = _make_request({"model": "claude-3-5-haiku-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {}
 
@@ -2283,9 +3731,7 @@ def test_resolve_tier_config_handles_none_global() -> None:
     """
     with _patched_empty_config():
         srv.CONFIG["global"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
-        req = _make_request({"model": "claude-3-5-haiku-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {}
 
@@ -2296,9 +3742,7 @@ def test_resolve_tier_config_handles_none_tier_value() -> None:
     """
     with _patched_empty_config():
         srv.CONFIG["tiers"] = {"haiku": None}
-        req = _make_request({"model": "claude-3-5-haiku-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {}
 
@@ -2309,9 +3753,7 @@ def test_convert_extra_body_non_dict_is_skipped() -> None:
     """
     with _patched_empty_config():
         srv.CONFIG["tiers"] = {"haiku": {"extra_body": "not-a-dict"}}
-        req = _make_request({"model": "claude-3-5-haiku-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert "extra_body" not in out
 
@@ -2320,21 +3762,25 @@ def test_validate_model_field_preserves_bare_name_case() -> None:
     """Custom (non-OpenAI) model names must keep their original case in the
     rewritten upstream model.
     """
-    req = _make_request({
-        "model": "MyModel-V1",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "MyModel-V1",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == "openai/MyModel-V1"
 
 
 def test_validate_model_field_openai_prefix_is_case_insensitive() -> None:
     """``OpenAI/MyModel-V1`` should pass through unchanged (any-case prefix)."""
-    req = _make_request({
-        "model": "OpenAI/MyModel-V1",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "OpenAI/MyModel-V1",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.model == "OpenAI/MyModel-V1"
 
 
@@ -2343,11 +3789,13 @@ def test_validate_model_field_anthropic_prefix_preserves_case() -> None:
     rewritten upstream model must use the resolved sonnet default (lowercased
     because it's a known OpenAI model).
     """
-    req = _make_request({
-        "model": "anthropic/Claude-3-5-Sonnet",
-        "max_tokens": 100,
-        "messages": [{"role": "user", "content": "hi"}],
-    })
+    req = _make_request(
+        {
+            "model": "anthropic/Claude-3-5-Sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
     assert req.tier == "sonnet"
     assert req.model == f"openai/{srv._default_model_for_tier('sonnet')}"
 
@@ -2383,16 +3831,16 @@ def test_extra_body_is_deep_copied_from_raw_toml() -> None:
 
 # --- Injection: sampling ---
 
+
 def test_convert_extra_body_overrides_request_sampling_via_config() -> None:
     """[tier].extra_body {temperature=0.2} wins over client temperature=0.9."""
     with _patched_config("""
         [sonnet]
         extra_body = { temperature = 0.2 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}],
-                              "temperature": 0.9})
+        req = _make_request(
+            {"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.9},
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["temperature"] == 0.2
 
@@ -2400,10 +3848,14 @@ def test_convert_extra_body_overrides_request_sampling_via_config() -> None:
 def test_convert_request_sampling_preserved_when_config_omits_key() -> None:
     """Request value flows through unchanged when config doesn't touch the key."""
     with _patched_config(""):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}],
-                              "temperature": 0.42})
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.42,
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["temperature"] == 0.42
 
@@ -2413,9 +3865,7 @@ def test_convert_sampling_field_omitted_when_neither_set() -> None:
     the upstream call doesn't include it (was previously always set to 1.0).
     """
     with _patched_empty_config():
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert "temperature" not in out
         assert "top_p" not in out
@@ -2428,9 +3878,7 @@ def test_convert_max_completion_tokens_via_extra_body_overrides_request() -> Non
         [sonnet]
         extra_body = { max_completion_tokens = 500 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 1000,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 1000, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["max_completion_tokens"] == 500
 
@@ -2441,9 +3889,7 @@ def test_convert_config_only_seed_field() -> None:
         [sonnet]
         extra_body = { seed = 42 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["seed"] == 42
 
@@ -2454,23 +3900,20 @@ def test_convert_global_extra_body_applies_to_unmapped_tier() -> None:
         [global]
         extra_body = { cache_prompt = true }
     """):
-        req = _make_request({"model": "my-local-llama",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "my-local-llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["cache_prompt"] is True
 
 
 # --- Injection: extra_body ---
 
+
 def test_convert_merges_extra_body_from_config() -> None:
     with _patched_config("""
         [sonnet]
         extra_body = { cache_prompt = true, n_predict = 1024 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         # extra_body keys are lifted to top-level kwargs in the new pipeline.
         assert out["cache_prompt"] is True
@@ -2482,9 +3925,7 @@ def test_convert_extra_body_deep_merges_nested_dicts() -> None:
         [sonnet]
         extra_body = { chat_template_kwargs = { enable_thinking = false }, n_predict = 256 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["chat_template_kwargs"] == {"enable_thinking": False}
         assert out["n_predict"] == 256
@@ -2498,9 +3939,7 @@ def test_convert_global_extra_body_preserved_when_tier_section_has_no_extra_body
         [sonnet]
         extra_body = { temperature = 0.7 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         # Global extra_body survives; tier extra_body sits alongside.
         assert out["cache_prompt"] is True
@@ -2516,14 +3955,13 @@ def test_convert_tier_extra_body_overrides_global() -> None:
         [sonnet]
         extra_body = { cache_prompt = false }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["cache_prompt"] is False
 
 
 # --- End-to-end: realistic llama-server config ---
+
 
 def test_convert_with_full_llama_server_config() -> None:
     with _patched_config("""
@@ -2537,9 +3975,7 @@ def test_convert_with_full_llama_server_config() -> None:
         [sonnet]
         extra_body = { chat_template_kwargs = { enable_thinking = false } }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 256,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         # No temperature in request → not set (no defaults applied).
         assert "temperature" not in out
@@ -2553,15 +3989,14 @@ def test_convert_with_full_llama_server_config() -> None:
 
 # --- extra_body pipeline (post-simplification) ---
 
+
 def test_extra_body_simple() -> None:
     """Vendor key from config extra_body reaches the upstream call as a top-level kwarg."""
     with _patched_config("""
         [sonnet]
         extra_body = { reasoning_effort = "low" }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["reasoning_effort"] == "low"
         assert out["allowed_openai_params"] == ["reasoning_effort"]
@@ -2574,10 +4009,9 @@ def test_extra_body_overrides_pydantic_sampling() -> None:
         [sonnet]
         extra_body = { temperature = 0.3 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}],
-                              "temperature": 0.5})
+        req = _make_request(
+            {"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.5},
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["temperature"] == 0.3
 
@@ -2585,11 +4019,15 @@ def test_extra_body_overrides_pydantic_sampling() -> None:
 def test_extra_body_pydantic_sampling_passes_through() -> None:
     """When config doesn't touch a sampling key, the client's Pydantic value reaches upstream."""
     with _patched_empty_config():
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}],
-                              "temperature": 0.5,
-                              "top_p": 0.95})
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 0.5,
+                "top_p": 0.95,
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         assert out["temperature"] == 0.5
         assert out["top_p"] == 0.95
@@ -2601,12 +4039,14 @@ def test_extra_body_deep_merge_with_client() -> None:
         [sonnet]
         extra_body = { thinking = { type = "disabled" }, temperature = 0.3 }
     """):
-        req = _make_request({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": "hi"}],
-            "extra_body": {"thinking": {"effort": "high"}, "top_p": 0.9},
-        })
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+                "extra_body": {"thinking": {"effort": "high"}, "top_p": 0.9},
+            },
+        )
         out = srv.convert_anthropic_to_litellm(req)
         # thinking: both leaves present; client effort + config type (config wins per leaf)
         assert out["thinking"]["type"] == "disabled"  # from config
@@ -2623,9 +4063,7 @@ def test_extra_body_protected_keys_blocked() -> None:
         [sonnet]
         extra_body = { model = "evil-model", messages = "stolen", stream = true }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         # The proxy's own values are untouched.
         assert out["model"] != "evil-model"
@@ -2639,9 +4077,7 @@ def test_extra_body_allowed_openai_params_set() -> None:
         [sonnet]
         extra_body = { reasoning_effort = "low", top_k = 5 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert set(out["allowed_openai_params"]) == {"reasoning_effort", "top_k"}
         assert set(out["extra_body"]["allowed_openai_params"]) == {"reasoning_effort", "top_k"}
@@ -2650,9 +4086,7 @@ def test_extra_body_allowed_openai_params_set() -> None:
 def test_no_max_tokens_clamp_arbitrary_large_value() -> None:
     """Any large max_tokens value (including well above MAX_OUTPUT_TOKENS) flows through unchanged."""
     with _patched_empty_config():
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 99999,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 99999, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         assert out["max_completion_tokens"] == 99999
 
@@ -2666,9 +4100,7 @@ def test_global_extra_body_precedes_tier() -> None:
         [sonnet]
         extra_body = { x = 2, y = 3 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         out = srv.convert_anthropic_to_litellm(req)
         # 'x' is overridden by the tier (wins over global)
         assert out["x"] == 2
@@ -2760,10 +4192,18 @@ def _scrub_model_envs() -> dict[str, str | None]:
     """Pop all model-related env vars so a test starts from a clean slate.
     Returns a dict suitable for restoring in `finally`.
     """
-    return {k: os.environ.pop(k, None) for k in (
-        "BIG_MODEL", "SMALL_MODEL",
-        "HAIKU_MODEL", "SONNET_MODEL", "OPUS_MODEL", "FABLE_MODEL", "MYTHOS_MODEL",
-    )}
+    return {
+        k: os.environ.pop(k, None)
+        for k in (
+            "BIG_MODEL",
+            "SMALL_MODEL",
+            "HAIKU_MODEL",
+            "SONNET_MODEL",
+            "OPUS_MODEL",
+            "FABLE_MODEL",
+            "MYTHOS_MODEL",
+        )
+    }
 
 
 def test_default_model_for_tier_haiku_uses_small_default() -> None:
@@ -3038,9 +4478,7 @@ def test_resolve_tier_config_merges_global_bucket_tier_for_sonnet() -> None:
         [sonnet]
         extra_body = { from_tier = 3, shared = "t" }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         eb = cfg["extra_body"]
         assert eb["from_global"] == 1
@@ -3061,9 +4499,7 @@ def test_resolve_tier_config_merges_global_bucket_tier_for_haiku() -> None:
         [haiku]
         extra_body = { from_haiku = 3 }
     """):
-        req = _make_request({"model": "claude-3-5-haiku-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"]["from_global"] == 1
         assert cfg["extra_body"]["from_small"] == 2
@@ -3077,9 +4513,7 @@ def test_resolve_tier_config_strips_model_from_result() -> None:
         model = "bucket-big"
         extra_body = { x = 1 }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert "model" not in cfg
         assert cfg["extra_body"] == {"x": 1}
@@ -3094,9 +4528,7 @@ def test_resolve_tier_config_unknown_tier_only_global() -> None:
         [big]
         extra_body = { y = 2 }
     """):
-        req = _make_request({"model": "my-local-llama",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "my-local-llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"] == {"x": 1}
 
@@ -3107,9 +4539,7 @@ def test_resolve_tier_config_omitted_tier_section_still_inherits_bucket() -> Non
         [big]
         extra_body = { cache_prompt = true }
     """):
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg["extra_body"]["cache_prompt"] is True
 
@@ -3117,9 +4547,7 @@ def test_resolve_tier_config_omitted_tier_section_still_inherits_bucket() -> Non
 def test_resolve_tier_config_empty_and_unknown_tier() -> None:
     """No CONFIG, no tier — empty dict."""
     with _patched_empty_config():
-        req = _make_request({"model": "my-local-llama",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "my-local-llama", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {}
 
@@ -3129,9 +4557,7 @@ def test_resolve_tier_config_handles_none_global_cfg() -> None:
     with _patched_empty_config():
         srv.CONFIG["global"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
         srv.CONFIG["big"] = {"extra_body": {"from_big": 1}}
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {"extra_body": {"from_big": 1}}
 
@@ -3142,9 +4568,7 @@ def test_resolve_tier_config_handles_none_tier_cfg() -> None:
         srv.CONFIG["global"] = {"extra_body": {"from_global": 1}}
         srv.CONFIG["big"] = {"extra_body": {"from_big": 2}}
         srv.CONFIG["tiers"] = {"sonnet": None}
-        req = _make_request({"model": "claude-3-5-sonnet-20241022",
-                              "max_tokens": 100,
-                              "messages": [{"role": "user", "content": "hi"}]})
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         # global + big layers merge; the None [sonnet] layer is skipped.
         assert cfg["extra_body"] == {"from_global": 1, "from_big": 2}
@@ -3195,6 +4619,7 @@ class _StreamAgg:
     """Aggregated state from consuming an SSE stream: set of seen event
     types, accumulated text, whether a tool_use block opened, whether
     [DONE] arrived. Lives only as long as one integration scenario."""
+
     event_types: set[str] = field(default_factory=set)
     text_content: str = ""
     saw_tool_use: bool = False
@@ -3260,7 +4685,7 @@ def _record_stream_event(data: dict[str, Any], agg: _StreamAgg) -> None:
 def _extract_sse_data(event_block: str) -> str | None:
     """Concatenate ``data: <line>`` lines from a single SSE event block;
     return None for blocks with no data line."""
-    data_lines = [line[len("data: "):] for line in event_block.splitlines() if line.startswith("data: ")]
+    data_lines = [line[len("data: ") :] for line in event_block.splitlines() if line.startswith("data: ")]
     if not data_lines:
         return None
     return "".join(data_lines)
@@ -3309,8 +4734,7 @@ def filter_scenarios(scenarios: dict[str, dict[str, Any]], args: argparse.Namesp
 
 def discover_unit_tests() -> list[str]:
     """Collect every top-level test_* function defined in this module."""
-    return [name for name, _ in inspect.getmembers(sys.modules[__name__], inspect.isfunction)
-            if name.startswith("test_")]
+    return [name for name, _ in inspect.getmembers(sys.modules[__name__], inspect.isfunction) if name.startswith("test_")]
 
 
 def run_unit_tests(names: list[str]) -> list[bool]:

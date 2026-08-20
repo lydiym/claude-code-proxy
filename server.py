@@ -4,6 +4,8 @@ Translates Anthropic Messages API requests to OpenAI Chat Completions via
 LiteLLM and converts the response back. Single FastAPI app, single code path.
 """
 
+import difflib
+import itertools
 import json
 import logging
 import os
@@ -66,6 +68,15 @@ def _litellm_debug_http_enabled() -> bool:
     Surfaces the actual wire payload sent to the upstream OpenAI endpoint.
     """
     return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
+
+
+def _debug_cache_dump_enabled() -> bool:
+    """PROXY_DEBUG_CACHE_DUMP=true records outgoing payloads to $cwd/.claude-code-proxy/prompts/.
+
+    Matches prefix equivalence to surface cache-busting hot spots.
+    Off by default; each request writes 0-2 files when enabled.
+    """
+    return _str_to_bool(os.environ.get("PROXY_DEBUG_CACHE_DUMP"), default=False)
 
 
 def _debug_json_dump(label: str, obj: object) -> None:
@@ -323,12 +334,7 @@ class Message(BaseModel):
     """A single turn in the conversation — user, assistant, or system reminder."""
 
     role: Literal["user", "assistant", "system"]
-    content: (
-        str
-        | list[
-            ContentBlockText | ContentBlockThinking | ContentBlockImage | ContentBlockToolUse | ContentBlockToolResult
-        ]
-    )
+    content: str | list[ContentBlockText | ContentBlockThinking | ContentBlockImage | ContentBlockToolUse | ContentBlockToolResult]
 
 
 class Tool(BaseModel):
@@ -564,6 +570,18 @@ def _parse_prompt_remap_section(body: object) -> list[dict[str, str]]:
     return out
 
 
+def _apply_known_section(out: dict[str, Any], section: str, body: dict[str, Any]) -> None:
+    """Parse a recognised [proxy] / [bucket] / [global] / [tier] body into ``out``."""
+    if section in {"big", "small"}:
+        out[section] = _parse_bucket_section(body, section)
+    elif section == "proxy":
+        out["proxy"] = _parse_proxy_section(body)
+    elif section == "global":
+        out["global"] = _parse_tier_section(body, section)
+    else:  # per-tier section (haiku/sonnet/opus/fable/mythos)
+        out["tiers"][section] = _parse_bucket_section(body, section)
+
+
 def _load_config(path: str) -> dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
     out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
@@ -593,14 +611,7 @@ def _load_config(path: str) -> dict[str, Any]:
         if not isinstance(body, dict):
             logger.warning("[%s] must be a table, got %s; ignoring", section, type(body).__name__)
             continue
-        if section == "proxy":
-            out["proxy"] = _parse_proxy_section(body)
-        elif section in {"big", "small"}:
-            out[section] = _parse_bucket_section(body, section)
-        elif section == "global":
-            out["global"] = _parse_tier_section(body, section)
-        else:  # per-tier section
-            out["tiers"][section] = _parse_bucket_section(body, section)
+        _apply_known_section(out, section, body)
     return out
 
 
@@ -864,12 +875,56 @@ if not OPENAI_TLS_VERIFY:
 # ---------------------------------------------------------------------------
 
 
+def _convert_tool_result_to_parts(content: object) -> str | list[dict[str, Any]]:
+    """Convert Anthropic tool_result content to OpenAI Chat Completions shape.
+
+    Returns a string when content is text-only (preserves the existing wire
+    format for backwards compatibility). Returns a list of content parts
+    when content contains any image block — text parts stay as text, image
+    parts become image_url blocks via convert_image_block.
+    """
+    if content is None:
+        return "No content provided"
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        # Route single-dict shapes through the list branch for one source of truth
+        return _convert_tool_result_to_parts([content])
+    if isinstance(content, list):
+        return _tool_result_parts_from_list(content)
+    return _str_or_unparseable(content)
+
+
+def _tool_result_parts_from_list(items: list[object]) -> str | list[dict[str, Any]]:
+    parts = [_build_tool_result_part(item) for item in items]
+    # Text-only result: flatten back to a string for wire-format stability
+    if all(p.get("type") == "text" for p in parts):
+        return "\n".join(p.get("text", "") for p in parts).strip()
+    return parts
+
+
+def _build_tool_result_part(item: object) -> dict[str, Any]:
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        if item_type == "text":
+            return {"type": "text", "text": item.get("text", "")}
+        if item_type == "image":
+            return convert_image_block(item.get("source"))
+        # Unknown block type — render via existing prose path, wrapped as text part
+        return {"type": "text", "text": _parse_tool_result_content(item)}
+    if isinstance(item, str):
+        return {"type": "text", "text": item}
+    return {"type": "text", "text": _str_or_unparseable(item)}
+
+
 def _parse_tool_result_content(content: object) -> str:
     """Normalise a tool_result ``content`` field into a plain string.
 
     Anthropic allows None, str, list of blocks, or a single dict (sometimes
     ``{"type": "text", ...}``). We stringify whatever shape we get so the
-    model sees prose rather than a raw JSON blob.
+    model sees prose rather than a raw JSON blob. Image-bearing tool results
+    are routed through _convert_tool_result_to_parts at the call site instead
+    so the image can travel as an image_url block.
     """
     match content:
         case None:
@@ -992,8 +1047,24 @@ def _build_system_message(
 
 def _apply_prompt_remaps(text: str) -> str:
     """Apply configured prompt remappings in order."""
+    before_len = len(text)
+    fired = 0
+    total_matches = 0
     for pattern, replacement in _PROMPT_REMAPS:
-        text = pattern.sub(replacement, text)
+        new_text, n = pattern.subn(replacement, text)
+        if n:
+            fired += 1
+            total_matches += n
+            text = new_text
+    if fired:
+        logger.warning(
+            "prompt_remap: stripped %d chars in %d match%s via %d %s",
+            before_len - len(text),
+            total_matches,
+            "es" if total_matches != 1 else "",
+            fired,
+            "entry" if fired == 1 else "entries",
+        )
     return text
 
 
@@ -1014,7 +1085,7 @@ def _collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
     return call_ids, result_ids  # ty: ignore[unsound-return-statement] — elements come from cast / _get_field; ty can't trace set element types
 
 
-def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, Any]:
+def _convert_assistant_message(msg: Message, result_ids: set[str], id_map: dict[str, str]) -> dict[str, Any]:
     text_parts = []
     tool_calls = []
 
@@ -1027,11 +1098,18 @@ def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, 
             if tool_block.id in result_ids:
                 tool_calls.append(
                     {
-                        "id": tool_block.id,
+                        "id": id_map[tool_block.id],
                         "type": "function",
                         "function": {
                             "name": tool_block.name,
-                            "arguments": json.dumps(tool_block.input),
+                            # Compact JSON: cache-stable rendering when llama-server's
+                            # chat template interpolates the arguments string.
+                            "arguments": json.dumps(
+                                tool_block.input,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                                ensure_ascii=False,
+                            ),
                         },
                     },
                 )
@@ -1049,7 +1127,7 @@ def _convert_assistant_message(msg: Message, result_ids: set[str]) -> dict[str, 
     return out
 
 
-def _convert_user_message(msg: Message, call_ids: set[str]) -> list[dict[str, Any]]:
+def _convert_user_message(msg: Message, call_ids: set[str], id_map: dict[str, str]) -> list[dict[str, Any]]:
     tool_messages = []
     user_parts = []
 
@@ -1061,13 +1139,13 @@ def _convert_user_message(msg: Message, call_ids: set[str]) -> list[dict[str, An
             user_parts.append(convert_image_block(cast("ContentBlockImage", block).source))
         elif block_type == "tool_result":
             tool_use_id = _get_field(block, "tool_use_id", "") or ""
-            result_text = _parse_tool_result_content(_get_field(block, "content"))
+            raw_content = _get_field(block, "content")
             if tool_use_id in call_ids:
                 tool_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": result_text,
+                        "tool_call_id": id_map[tool_use_id],
+                        "content": _convert_tool_result_to_parts(raw_content),
                     },
                 )
             else:
@@ -1075,7 +1153,7 @@ def _convert_user_message(msg: Message, call_ids: set[str]) -> list[dict[str, An
                 user_parts.append(
                     {
                         "type": "text",
-                        "text": f"(Result from an earlier tool call:)\n{result_text}",
+                        "text": f"(Result from an earlier tool call:)\n{_parse_tool_result_content(raw_content)}",
                     },
                 )
 
@@ -1094,12 +1172,18 @@ def _convert_message(
     msg: Message,
     result_ids: set[str],
     call_ids: set[str],
+    id_map: dict[str, str],
 ) -> list[dict[str, Any]]:
     if isinstance(msg.content, str):
         return [{"role": msg.role, "content": msg.content}]
     if msg.role == "assistant":
-        return [_convert_assistant_message(msg, result_ids)]
-    return _convert_user_message(msg, call_ids)
+        return [_convert_assistant_message(msg, result_ids, id_map)]
+    return _convert_user_message(msg, call_ids, id_map)
+
+
+# Anthropic-only keys that may sit inside an input_schema; OpenAI clients
+# never emit them, so a ref forwarder would render the prompt without them.
+_TOOL_PARAM_ANTHROPIC_KEYS = frozenset({"cache_control", "strict"})
 
 
 def _convert_tool_definitions(tools: list[Tool]) -> list[dict[str, Any]]:
@@ -1109,7 +1193,7 @@ def _convert_tool_definitions(tools: list[Tool]) -> list[dict[str, Any]]:
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
-                "parameters": tool.input_schema,
+                "parameters": {k: v for k, v in tool.input_schema.items() if k not in _TOOL_PARAM_ANTHROPIC_KEYS},
             },
         }
         for tool in tools
@@ -1135,7 +1219,8 @@ def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
     Mutates in place. Keeps ``role``, ``content``, ``name``, ``tool_call_id``,
     and ``tool_calls``; everything else is dropped. Empty/None ``content`` is
     replaced with ``"..."`` when no tool_calls are present — OpenAI rejects
-    empty content outright.
+    empty content outright. Tool result bodies are left as-is even when empty:
+    the placeholder would change the prompt's tokens.
     """
     allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls"}
     for msg in messages:
@@ -1143,7 +1228,9 @@ def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
             if key not in allowed_keys:
                 logger.debug("Removing unsupported message field: %s", key)
                 del msg[key]
-        if msg.get("content") in {None, ""} and not msg.get("tool_calls"):
+        if msg.get("role") == "tool":
+            continue
+        if not msg.get("content") and not msg.get("tool_calls"):
             msg["content"] = "..."
 
 
@@ -1185,6 +1272,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     """
     call_ids, result_ids = _collect_tool_ids(anthropic_request.messages)
 
+    # Rewrite Anthropic's ``toolu_*`` ids to OpenAI's ``call_*`` so the
+    # chat template renders the same prefix any OpenAI client would.
+    id_map = {old: f"call_{uuid.uuid4().hex[:24]}" for old in call_ids}
+
     messages = []
     if system := _build_system_message(anthropic_request.system, anthropic_request.messages):
         messages.append(system)
@@ -1193,7 +1284,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
     # models to emit tool calls as literal text and broke tool use.
     for msg in anthropic_request.messages:
         if msg.role != "system":
-            messages.extend(_convert_message(msg, result_ids, call_ids))
+            messages.extend(_convert_message(msg, result_ids, call_ids, id_map))
 
     litellm_request: dict[str, Any] = {
         "model": anthropic_request.model,
@@ -1671,10 +1762,13 @@ class _StreamState:
 
     Lives only as long as ``handle_streaming``'s iteration. ``should_stop``
     is set by chunk processors when they emit a finish_reason so the outer
-    loop can break cleanly.
+    loop can break cleanly. ``tool_use_emitted`` lets the epilogue pick
+    ``tool_use`` over ``end_turn`` when the upstream closes without a
+    finish_reason mid-tool-call.
     """
 
     tool_index: int | None = None
+    tool_use_emitted: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     has_sent_stop_reason: bool = False
@@ -1711,10 +1805,11 @@ def _stream_prologue(original_request: MessagesRequest, tracker: _BlockTracker) 
     yield _SseFormatter.ping()
 
 
-def _stream_epilogue(tracker: _BlockTracker, think_parser: _ThinkStreamParser, output_tokens: int) -> Iterator[str]:
+def _stream_epilogue(state: _StreamState, tracker: _BlockTracker, think_parser: _ThinkStreamParser) -> Iterator[str]:
     yield from _translate_parser_events(think_parser.flush(), tracker)
     yield from tracker.close()
-    yield from _SseFormatter.finish("end_turn", output_tokens)
+    stop_reason = "tool_use" if state.tool_use_emitted else "end_turn"
+    yield from _SseFormatter.finish(stop_reason, state.output_tokens)
 
 
 def _log_stream_finished(state: _StreamState) -> None:
@@ -1835,6 +1930,7 @@ def _process_single_tool_call(tool_call: object, tracker: _BlockTracker, state: 
         if state.tool_index is not None:
             yield from tracker.close()
         state.tool_index = current_index
+        state.tool_use_emitted = True
         function = _get_field(tool_call, "function", {}) or {}
         name = _get_field(function, "name", "")
         tool_id = _get_field(tool_call, "id") or _new_tool_id()
@@ -1930,7 +2026,7 @@ async def handle_streaming(
         # Skip epilogue if chunk loop already terminated the stream via _emit_failure
         # — calling _translate_parser_events again here would re-emit the error frame.
         if not state.has_sent_stop_reason and not state.should_stop:
-            for event in _stream_epilogue(tracker, think_parser, state.output_tokens):
+            for event in _stream_epilogue(state, tracker, think_parser):
                 yield event
         _log_stream_finished(state)
     except Exception as e:
@@ -1959,18 +2055,167 @@ def _prepare_litellm_request(request: MessagesRequest) -> dict[str, Any]:
     return litellm_request
 
 
+_CACHE_DEBUG_DIR = pathlib.Path(".claude-code-proxy/prompts")
+_CACHE_MATCHER_HISTORY = 50
+_CACHE_MATCHER_THRESHOLD = 0.6
+
+
+class _CacheMatcher:
+    """Rolling-window prefix-equivalence matcher for llama-server cache hits.
+
+    The rendered prompt is keyed by the messages list (and tools list) —
+    metadata fields like ``model``/``max_tokens`` don't affect the prefix
+    cache. We canonicalise just the messages+tools slices, so the
+    ``startswith`` check returns true when the new outgoing is a prefix
+    extension of a prior one (the cache-hit case). On mismatch we run a
+    fuzzy match (SequenceMatcher ratio) and, when similarity crosses the
+    threshold, persist both payloads as artifacts for offline analysis.
+    """
+
+    def __init__(self, *, max_history: int, fuzzy_threshold: float, out_dir: pathlib.Path) -> None:
+        self._recent: list[tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]] = []
+        self._max_history = max_history
+        self._fuzzy_threshold = fuzzy_threshold
+        self._out_dir = out_dir
+
+    @staticmethod
+    def _strip_ids(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return copies of (messages, tools) with tool_call ids scrubbed (random per request).
+
+        Does not mutate ``payload`` — callers can rely on its tool_call ids
+        after observe() returns.
+        """
+        messages = []
+        for msg in payload.get("messages", []):
+            scrubbed = {**msg}
+            if "tool_calls" in scrubbed:
+                scrubbed["tool_calls"] = [{**tc, "id": "<id>"} for tc in scrubbed["tool_calls"]]
+            if "tool_call_id" in scrubbed:
+                scrubbed["tool_call_id"] = "<id>"
+            messages.append(scrubbed)
+        return messages, list(payload.get("tools", []))
+
+    def observe(self, payload: dict[str, Any]) -> None:
+        new_messages, new_tools = self._strip_ids(payload)
+        new_canonical = json.dumps(new_messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        # Newest-first so the matched prior is the immediately-prior request:
+        # logs show incremental growth (msgs N-1 vs N), not always the oldest entry.
+        for old_messages, old_tools, old_payload in reversed(self._recent):
+            prefix_match = (
+                new_tools == old_tools
+                and old_messages
+                and len(new_messages) >= len(old_messages)
+                and new_messages[: len(old_messages)] == old_messages
+            )
+            if prefix_match:
+                logger.debug(
+                    "cache debug: prefix hit (msgs %d vs %d) — saving to %s",
+                    len(old_messages),
+                    len(new_messages),
+                    self._out_dir,
+                )
+                self._record(payload, old_payload, 1.0, "prefix_hit")
+                self._append(new_messages, new_tools, payload)
+                return
+        # Fuzzy fallback over the canonical wire form.
+        best_score = 0.0
+        best_old_payload: dict[str, Any] | None = None
+        for old_messages, _old_tools, old_payload in self._recent:
+            old_canonical = json.dumps(old_messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            score = difflib.SequenceMatcher(None, new_canonical, old_canonical).ratio()
+            if score > best_score:
+                best_score = score
+                best_old_payload = old_payload
+        if best_score >= self._fuzzy_threshold:
+            logger.info(
+                "cache debug: fuzzy match %.2f — saving artifacts to %s",
+                best_score,
+                self._out_dir,
+            )
+            self._record(payload, best_old_payload, best_score, "fuzzy_match")
+        else:
+            logger.debug("cache debug: no match (best=%.2f)", best_score)
+        self._append(new_messages, new_tools, payload)
+
+    def _append(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], payload: dict[str, Any]) -> None:
+        self._recent.append((messages, tools, payload))
+        if len(self._recent) > self._max_history:
+            self._recent.pop(0)
+
+    def _record(
+        self,
+        new_payload: dict[str, Any],
+        old_payload: dict[str, Any] | None,
+        score: float,
+        kind: str,
+    ) -> None:
+        # Write scrubbed forms so random per-request tool_call ids don't drown the
+        # real structural change.
+        new_messages, new_tools = self._strip_ids(new_payload)
+        new_for_disk = {**new_payload, "messages": new_messages, "tools": new_tools}
+        stamp = _cache_debug_stamp(score, kind)
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        _safe_write_json(self._out_dir / f"{stamp}-new.json", new_for_disk)
+        if old_payload is not None:
+            old_messages, old_tools = self._strip_ids(old_payload)
+            old_for_disk = {**old_payload, "messages": old_messages, "tools": old_tools}
+            _safe_write_json(self._out_dir / f"{stamp}-old.json", old_for_disk)
+
+
+_cache_debug_seq = itertools.count(1)
+
+
+def _cache_debug_stamp(score: float, kind: str) -> str:
+    # Trailing seq disambiguates same-second same-pid same-score writes (every prefix_hit has score=1.00).
+    seq = next(_cache_debug_seq)
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}-{score:.2f}-{seq:04d}"
+
+
+def _safe_write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
+    try:
+        path.write_text(json.dumps(payload, default=str, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.debug("cache debug save failed: %s", e)
+
+
+@cache
+def _get_cache_matcher() -> _CacheMatcher:
+    return _CacheMatcher(
+        max_history=_CACHE_MATCHER_HISTORY,
+        fuzzy_threshold=_CACHE_MATCHER_THRESHOLD,
+        out_dir=pathlib.Path.cwd() / _CACHE_DEBUG_DIR,
+    )
+
+
+def _debug_dump_outgoing_payload(litellm_request: dict[str, Any]) -> None:
+    """Record outgoing payloads and match prefix equivalence when ``PROXY_DEBUG_CACHE_DUMP=true``.
+
+    Each request adds to a rolling window of canonical wire forms. A new
+    outgoing that starts with any prior one is a cache hit (the desired
+    case). Otherwise we fuzzy-match against the window and, on similarity
+    ≥ 0.6, save both payloads to ``$cwd/.claude-code-proxy/prompts/`` for analysis.
+
+    Artifacts: ``<ts>-<pid>-<kind>-<score>-new.json`` (current) and
+    ``<ts>-<pid>-<kind>-<score>-old.json`` (prior that matched). Compare them
+    manually — unified diff of pretty-printed JSON collapses multi-KB system
+    prompts onto a single line and isn't readable.
+    """
+    if not _debug_cache_dump_enabled():
+        return
+    _get_cache_matcher().observe(litellm_request)
+
+
 def _log_upstream_params_debug(litellm_request: dict[str, Any]) -> None:
-    # Skip the bulky fields (messages, tools) — they dominate the dump and
-    # are visible in litellm.set_verbose anyway.
+    # Skip bulky fields (dumped by litellm.set_verbose) and the api_key secret.
     if not logger.isEnabledFor(logging.DEBUG):
         return
-    debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools"}}
+    debug = {k: v for k, v in litellm_request.items() if k not in {"messages", "tools", "api_key"}}
     logger.debug("upstream params: %s", debug)
     if _litellm_debug_http_enabled():
-        # Verbose: dump the entire kwargs dict going into litellm
-        # (messages, tools, tool_choice, …) so we can confirm the
-        # exact payload upstream sees, not just the sampling subset.
-        _debug_json_dump("litellm.completion kwargs (full)", litellm_request)
+        # Dump the full kwargs (messages, tools, tool_choice, …) to confirm the
+        # exact payload upstream sees — api_key is masked first.
+        redacted = {**litellm_request, "api_key": "***"}
+        _debug_json_dump("litellm.completion kwargs (full)", redacted)
 
 
 def _log_response_debug(litellm_response: object, model: str, start_time: float) -> None:
@@ -1990,6 +2235,7 @@ def _log_response_debug(litellm_response: object, model: str, start_time: float)
 
 async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
     litellm_request = _prepare_litellm_request(request)
+    _debug_dump_outgoing_payload(litellm_request)
     _log_upstream_params_debug(litellm_request)
     _log_request(
         _LogContext(

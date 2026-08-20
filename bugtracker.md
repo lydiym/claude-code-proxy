@@ -11,22 +11,6 @@ surrounding code changes.
 
 ### Streaming resilience
 
-#### `end_turn` hardcoded when upstream omits finish_reason — `server.py:1635`
-
-- **Severity**: high — silently drops tool_use when upstream closes the
-  stream before sending `finish_reason`.
-- **Where**: `_stream_epilogue` always calls `_SseFormatter.finish("end_turn", …)`,
-  even when a `tool_use` block is mid-emission. The Anthropic SDK treats
-  `end_turn` as "no pending work" and never asks the user for tool results.
-- **Repro**: tool_use stream where upstream emits two valid tool_use blocks,
-  then closes without `finish_reason`.
-- **Suggested fix**: track whether any `tool_use` block was emitted in
-  `_StreamState`; pick `_to_anthropic_stop_reason("tool_use")` when true,
-  `end_turn` otherwise. Requires the in-flight tool_use block to remain
-  open through the finish event (Anthropic SSE expects
-  `content_block_stop` before `message_delta`).
-- **Source**: pre-existing in `main`.
-
 #### `_log_request` emits STATUS_OK before upstream call — `server.py:1907`
 
 - **Severity**: medium — failed requests logged as green 200, no failure

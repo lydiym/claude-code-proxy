@@ -121,6 +121,7 @@ known-first-party = ["server", "tests"]
     "magic-value-comparison", # tests assert against literal sampling temps/byte sizes/HTTP codes — naming each one adds ceremony without clarity
     "D",     # tests.py has its own module docstring already; per-test docstrings are noise
     "T20",   # integration runner prints scenarios + pass/fail lines
+    "S108",  # /tmp/... in test fixture strings isn't a filesystem op
 ]
 
 [tool.ty.environment]
