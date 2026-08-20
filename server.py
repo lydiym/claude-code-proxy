@@ -1010,15 +1010,19 @@ def _apply_prompt_remaps(text: str) -> str:
     """Apply configured prompt remappings in order."""
     before_len = len(text)
     fired = 0
+    total_matches = 0
     for pattern, replacement in _PROMPT_REMAPS:
         new_text, n = pattern.subn(replacement, text)
         if n:
             fired += 1
+            total_matches += n
             text = new_text
     if fired:
         logger.warning(
-            "prompt_remap: stripped %d chars via %d %s",
+            "prompt_remap: stripped %d chars in %d match%s via %d %s",
             before_len - len(text),
+            total_matches,
+            "es" if total_matches != 1 else "",
             fired,
             "entry" if fired == 1 else "entries",
         )

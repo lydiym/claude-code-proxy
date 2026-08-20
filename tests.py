@@ -1699,8 +1699,9 @@ def test_prompt_remap_logs_when_stripping() -> None:
         srv.convert_anthropic_to_litellm(req)
         strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
         assert len(strip_logs) == 1, f"expected one strip log, got {len(strip_logs)}: {strip_logs}"
-        _msg, stripped, fired, _word = strip_logs[0].args
+        _msg, stripped, matches, _es, fired, _word = strip_logs[0].args
         assert stripped > 0
+        assert matches == 1
         assert fired == 1
 
 
@@ -1718,6 +1719,25 @@ def test_prompt_remap_silent_when_no_strip() -> None:
         srv.convert_anthropic_to_litellm(req)
         strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
         assert strip_logs == [], f"expected no strip log, got {strip_logs}"
+
+
+def test_prompt_remap_logs_match_count_when_pattern_fires_multiple_times() -> None:
+    """When the same reminder appears N times, log says 'N matches' so accumulation is visible."""
+    reminder = "The task tools haven't been used recently. ignore if not applicable.\n"
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The task tools haven't been used recently.*?ignore if not applicable\.\n+", "replacement": ""},
+    ]), patch.object(srv.logger, "warning") as warning:
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise.\n\n" + reminder + reminder + reminder,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        srv.convert_anthropic_to_litellm(req)
+        strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
+        assert len(strip_logs) == 1
+        _msg, _stripped, matches, _es, _fired, _word = strip_logs[0].args
+        assert matches == 3, f"expected 3 matches for 3 reminder copies; got {matches}"
 
 
 def test_prompt_remap_multiple_entries_applied_in_order() -> None:
