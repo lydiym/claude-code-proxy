@@ -334,12 +334,7 @@ class Message(BaseModel):
     """A single turn in the conversation — user, assistant, or system reminder."""
 
     role: Literal["user", "assistant", "system"]
-    content: (
-        str
-        | list[
-            ContentBlockText | ContentBlockThinking | ContentBlockImage | ContentBlockToolUse | ContentBlockToolResult
-        ]
-    )
+    content: str | list[ContentBlockText | ContentBlockThinking | ContentBlockImage | ContentBlockToolUse | ContentBlockToolResult]
 
 
 class Tool(BaseModel):
@@ -880,12 +875,56 @@ if not OPENAI_TLS_VERIFY:
 # ---------------------------------------------------------------------------
 
 
+def _convert_tool_result_to_parts(content: object) -> str | list[dict[str, Any]]:
+    """Convert Anthropic tool_result content to OpenAI Chat Completions shape.
+
+    Returns a string when content is text-only (preserves the existing wire
+    format for backwards compatibility). Returns a list of content parts
+    when content contains any image block — text parts stay as text, image
+    parts become image_url blocks via convert_image_block.
+    """
+    if content is None:
+        return "No content provided"
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        # Route single-dict shapes through the list branch for one source of truth
+        return _convert_tool_result_to_parts([content])
+    if isinstance(content, list):
+        return _tool_result_parts_from_list(content)
+    return _str_or_unparseable(content)
+
+
+def _tool_result_parts_from_list(items: list[object]) -> str | list[dict[str, Any]]:
+    parts = [_build_tool_result_part(item) for item in items]
+    # Text-only result: flatten back to a string for wire-format stability
+    if all(p.get("type") == "text" for p in parts):
+        return "\n".join(p.get("text", "") for p in parts).strip()
+    return parts
+
+
+def _build_tool_result_part(item: object) -> dict[str, Any]:
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        if item_type == "text":
+            return {"type": "text", "text": item.get("text", "")}
+        if item_type == "image":
+            return convert_image_block(item.get("source"))
+        # Unknown block type — render via existing prose path, wrapped as text part
+        return {"type": "text", "text": _parse_tool_result_content(item)}
+    if isinstance(item, str):
+        return {"type": "text", "text": item}
+    return {"type": "text", "text": _str_or_unparseable(item)}
+
+
 def _parse_tool_result_content(content: object) -> str:
     """Normalise a tool_result ``content`` field into a plain string.
 
     Anthropic allows None, str, list of blocks, or a single dict (sometimes
     ``{"type": "text", ...}``). We stringify whatever shape we get so the
-    model sees prose rather than a raw JSON blob.
+    model sees prose rather than a raw JSON blob. Image-bearing tool results
+    are routed through _convert_tool_result_to_parts at the call site instead
+    so the image can travel as an image_url block.
     """
     match content:
         case None:
@@ -1100,13 +1139,13 @@ def _convert_user_message(msg: Message, call_ids: set[str], id_map: dict[str, st
             user_parts.append(convert_image_block(cast("ContentBlockImage", block).source))
         elif block_type == "tool_result":
             tool_use_id = _get_field(block, "tool_use_id", "") or ""
-            result_text = _parse_tool_result_content(_get_field(block, "content"))
+            raw_content = _get_field(block, "content")
             if tool_use_id in call_ids:
                 tool_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": id_map[tool_use_id],
-                        "content": result_text,
+                        "content": _convert_tool_result_to_parts(raw_content),
                     },
                 )
             else:
@@ -1114,7 +1153,7 @@ def _convert_user_message(msg: Message, call_ids: set[str], id_map: dict[str, st
                 user_parts.append(
                     {
                         "type": "text",
-                        "text": f"(Result from an earlier tool call:)\n{result_text}",
+                        "text": f"(Result from an earlier tool call:)\n{_parse_tool_result_content(raw_content)}",
                     },
                 )
 
