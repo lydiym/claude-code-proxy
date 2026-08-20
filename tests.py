@@ -748,7 +748,8 @@ def test_tool_call_arguments_preserve_unicode() -> None:
         assert "\\u" not in args_str, (
             f"Unicode must be passed through; got {args_str!r}"
         )
-        assert "北京" in args_str and "🔍" in args_str
+        assert "北京" in args_str
+        assert "🔍" in args_str
 
 
 def test_tool_call_arguments_stable_key_order() -> None:
@@ -967,6 +968,7 @@ def test_determinism_same_input_same_output() -> None:
         })
         out1 = srv.convert_anthropic_to_litellm(req)
         out2 = srv.convert_anthropic_to_litellm(req)
+
         # Strip random ids so the deterministic content can be compared.
         def _strip_ids(payload: dict[str, Any]) -> dict[str, Any]:
             payload = json.loads(_canonical_wire(payload))
@@ -1034,7 +1036,7 @@ def test_tool_definitions_parameters_not_none() -> None:
                 f"Tool parameters must be dict; got {type(params).__name__}"
             )
             assert "type" in params, (
-                f"Tool parameters must declare 'type' so upstream validates schema"
+                "Tool parameters must declare 'type' so upstream validates schema"
             )
 
 
@@ -1124,7 +1126,7 @@ def test_empty_string_tool_result_content_not_replaced() -> None:
         out = srv.convert_anthropic_to_litellm(req)
         srv.sanitize_messages_for_openai(out["messages"])
         tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
-        assert tool_msg["content"] == "", (
+        assert not tool_msg["content"], (
             f"Empty tool result must stay empty; got {tool_msg['content']!r}"
         )
 

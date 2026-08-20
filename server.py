@@ -564,6 +564,18 @@ def _parse_prompt_remap_section(body: object) -> list[dict[str, str]]:
     return out
 
 
+def _apply_known_section(out: dict[str, Any], section: str, body: dict[str, Any]) -> None:
+    """Parse a recognised [proxy] / [bucket] / [global] / [tier] body into ``out``."""
+    if section in {"big", "small"}:
+        out[section] = _parse_bucket_section(body, section)
+    elif section == "proxy":
+        out["proxy"] = _parse_proxy_section(body)
+    elif section == "global":
+        out["global"] = _parse_tier_section(body, section)
+    else:  # per-tier section (haiku/sonnet/opus/fable/mythos)
+        out["tiers"][section] = _parse_bucket_section(body, section)
+
+
 def _load_config(path: str) -> dict[str, Any]:
     """Parse TOML at path; fail-open on every parse failure (logged, not raised)."""
     out: dict[str, Any] = {"proxy": {}, "global": {}, "big": {}, "small": {}, "tiers": {}, "prompt_remap": []}
@@ -593,14 +605,7 @@ def _load_config(path: str) -> dict[str, Any]:
         if not isinstance(body, dict):
             logger.warning("[%s] must be a table, got %s; ignoring", section, type(body).__name__)
             continue
-        if section == "proxy":
-            out["proxy"] = _parse_proxy_section(body)
-        elif section in {"big", "small"}:
-            out[section] = _parse_bucket_section(body, section)
-        elif section == "global":
-            out["global"] = _parse_tier_section(body, section)
-        else:  # per-tier section
-            out["tiers"][section] = _parse_bucket_section(body, section)
+        _apply_known_section(out, section, body)
     return out
 
 
