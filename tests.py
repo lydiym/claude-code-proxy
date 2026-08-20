@@ -439,6 +439,38 @@ def test_sanitize_messages_for_openai_keeps_allowed_keys() -> None:
     assert messages[0]["content"] == "42"
 
 
+def test_sanitize_messages_for_openai_handles_list_content() -> None:
+    """Image messages arrive with content as a list of content blocks — not a set member.
+
+    Post-conversion (what sanitize actually sees) uses the OpenAI ``image_url``
+    shape; the Anthropic shape is also exercised so any regression in
+    conversion order would still fail this test.
+    """
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "text", "text": "what do you see?"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "data": "..."}},
+            {"type": "text", "text": "raw anthropic shape"},
+        ]},
+        {"role": "user", "content": []},
+        {"role": "assistant", "content": [], "tool_calls": [{"id": "x"}]},
+    ]
+    srv.sanitize_messages_for_openai(messages)
+    assert messages[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        {"type": "text", "text": "what do you see?"},
+    ]
+    assert messages[1]["content"] == [
+        {"type": "image", "source": {"type": "base64", "data": "..."}},
+        {"type": "text", "text": "raw anthropic shape"},
+    ]
+    assert messages[2]["content"] == "..."
+    assert messages[3]["content"] == []
+
+
 # --- Request conversion ---
 
 def test_convert_anthropic_to_litellm_minimal_request() -> None:

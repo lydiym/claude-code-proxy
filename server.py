@@ -1191,7 +1191,7 @@ def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
                 del msg[key]
         if msg.get("role") == "tool":
             continue
-        if msg.get("content") in {None, ""} and not msg.get("tool_calls"):
+        if not msg.get("content") and not msg.get("tool_calls"):
             msg["content"] = "..."
 
 
