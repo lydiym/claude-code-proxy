@@ -2094,12 +2094,18 @@ class _CacheMatcher:
         score: float,
         kind: str,
     ) -> None:
+        # Write scrubbed forms so random per-request tool_call ids don't drown the
+        # real structural change in the diff.
+        new_messages, new_tools = self._strip_ids(new_payload)
+        new_for_disk = {**new_payload, "messages": new_messages, "tools": new_tools}
         stamp = _cache_debug_stamp(score, kind)
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        _safe_write_json(self._out_dir / f"{stamp}-new.json", new_payload)
+        _safe_write_json(self._out_dir / f"{stamp}-new.json", new_for_disk)
         if old_payload is not None:
-            _safe_write_json(self._out_dir / f"{stamp}-old.json", old_payload)
-            _write_diff(self._out_dir / f"{stamp}-diff.diff", new_payload, old_payload)
+            old_messages, old_tools = self._strip_ids(old_payload)
+            old_for_disk = {**old_payload, "messages": old_messages, "tools": old_tools}
+            _safe_write_json(self._out_dir / f"{stamp}-old.json", old_for_disk)
+            _write_diff(self._out_dir / f"{stamp}-diff.diff", new_for_disk, old_for_disk)
 
 
 def _write_diff(path: pathlib.Path, new_payload: dict[str, Any], old_payload: dict[str, Any]) -> None:
