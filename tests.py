@@ -1861,6 +1861,33 @@ def test_debug_cache_dump_disabled_by_default() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_debug_cache_dump_does_not_mutate_payload() -> None:
+    """The matcher scrubs ids in copies; the caller's payload keeps its original tool_call ids."""
+    payload = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "f"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_abc123", "content": "result"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+    }
+    snapshot = json.loads(json.dumps(payload))  # deep copy for comparison
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload(payload)
+            srv._debug_dump_outgoing_payload(payload)  # second call hits history
+            assert payload == snapshot, (
+                f"observe() must not mutate the caller's payload; got diff:\n"
+                f"before: {snapshot}\nafter:  {payload}"
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_debug_cache_dump_enabled_prefix_hit_creates_artifacts() -> None:
     """PROXY_DEBUG_CACHE_DUMP=true creates $cwd/.claude-code-proxy/prompts/ when an outgoing
     is a prefix extension of a prior one (cache-hit evidence)."""

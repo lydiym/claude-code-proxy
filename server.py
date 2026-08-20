@@ -2024,15 +2024,20 @@ class _CacheMatcher:
 
     @staticmethod
     def _strip_ids(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Return (messages, tools) with tool_call ids scrubbed (random per request)."""
+        """Return copies of (messages, tools) with tool_call ids scrubbed (random per request).
+
+        Does not mutate ``payload`` — callers can rely on its tool_call ids
+        after observe() returns.
+        """
         messages = []
         for msg in payload.get("messages", []):
-            for tc in msg.get("tool_calls", []):
-                tc["id"] = "<id>"
-            if "tool_call_id" in msg:
-                msg["tool_call_id"] = "<id>"
-            messages.append(msg)
-        return messages, payload.get("tools", [])
+            scrubbed = {**msg}
+            if "tool_calls" in scrubbed:
+                scrubbed["tool_calls"] = [{**tc, "id": "<id>"} for tc in scrubbed["tool_calls"]]
+            if "tool_call_id" in scrubbed:
+                scrubbed["tool_call_id"] = "<id>"
+            messages.append(scrubbed)
+        return messages, list(payload.get("tools", []))
 
     def observe(self, payload: dict[str, Any]) -> None:
         new_messages, new_tools = self._strip_ids(payload)
