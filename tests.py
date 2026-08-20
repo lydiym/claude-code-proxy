@@ -19,6 +19,7 @@ import inspect
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import time
@@ -1813,6 +1814,110 @@ def test_prompt_remap_replacement_supports_newlines() -> None:
         })
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "before \n after"
+
+
+@contextlib.contextmanager
+def _patched_env(name: str, value: str) -> Iterator[None]:
+    """Temporarily set an env var; restore on exit."""
+    original = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original
+
+
+@contextlib.contextmanager
+def _patched_cwd(path: pathlib.Path) -> Iterator[None]:
+    """Temporarily chdir; restore on exit."""
+    original = pathlib.Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(original)
+
+
+def _reset_cache_matcher() -> None:
+    """Drop the @cache singleton so each test gets a fresh matcher."""
+    srv._get_cache_matcher.cache_clear()
+
+
+def test_debug_cache_dump_disabled_by_default() -> None:
+    """Without PROXY_DEBUG_CACHE_DUMP, no debug directory is created and no files written."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", ""):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload({"messages": [{"role": "user", "content": "hi"}]})
+            srv._debug_dump_outgoing_payload({"messages": [{"role": "user", "content": "hi again"}]})
+            assert not (pathlib.Path(tmp) / ".claude-code-proxy").exists(), (
+                "Disabled flag must not create the debug directory"
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_debug_cache_dump_enabled_prefix_hit_creates_artifacts() -> None:
+    """PROXY_DEBUG_CACHE_DUMP=true creates $cwd/.claude-code-proxy/prompts/ when an outgoing
+    is a prefix extension of a prior one (cache-hit evidence)."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        prompts_dir = pathlib.Path(tmp) / ".claude-code-proxy" / "prompts"
+        payload_v1 = {"messages": [{"role": "user", "content": "hi"}]}
+        payload_v2 = {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ],
+        }
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload(payload_v1)
+            # First call: no history → no directory, no files.
+            assert not prompts_dir.exists(), "No history → no debug directory should be created"
+            srv._debug_dump_outgoing_payload(payload_v2)
+            assert prompts_dir.is_dir(), f"Expected {prompts_dir} to exist after a prefix hit"
+            json_files = list(prompts_dir.glob("*-prefix_hit-*.json"))
+            assert len(json_files) == 2, f"Expected -new.json + -old.json; got {json_files}"
+            diff_files = list(prompts_dir.glob("*-prefix_hit-*-diff.diff"))
+            assert len(diff_files) == 1, f"Expected one -diff.diff artifact; got {diff_files}"
+            diff_text = diff_files[0].read_text(encoding="utf-8")
+            assert '"content": "hello"' in diff_text, (
+                f"Diff should highlight the appended assistant message; got:\n{diff_text}"
+            )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_debug_cache_dump_enabled_fuzzy_match_writes_artifacts() -> None:
+    """Two payloads that share ≥ 0.6 SequenceMatcher ratio but aren't a structural prefix
+    trigger ``fuzzy_match`` artifacts (cache-busting suspect)."""
+    tmp = tempfile.mkdtemp(prefix="ccp-debug-")
+    try:
+        prompts_dir = pathlib.Path(tmp) / ".claude-code-proxy" / "prompts"
+        # Same messages except one trailing punctuation flip — high SequenceMatcher ratio,
+        # not a structural prefix (different final char).
+        payload_v1 = {"messages": [{"role": "user", "content": "Hello"}]}
+        payload_v2 = {"messages": [{"role": "user", "content": "Hello!"}]}
+        with _patched_cwd(pathlib.Path(tmp)), _patched_env("PROXY_DEBUG_CACHE_DUMP", "true"):
+            _reset_cache_matcher()
+            srv._debug_dump_outgoing_payload(payload_v1)
+            srv._debug_dump_outgoing_payload(payload_v2)
+            fuzzy_files = list(prompts_dir.glob("*-fuzzy_match-*.json"))
+            assert fuzzy_files, (
+                f"Expected fuzzy_match artifacts; got {list(prompts_dir.glob('*'))}"
+            )
+            diff_files = list(prompts_dir.glob("*-fuzzy_match-*-diff.diff"))
+            assert len(diff_files) == 1, f"Expected one fuzzy -diff.diff; got {diff_files}"
+            diff_text = diff_files[0].read_text(encoding="utf-8")
+            assert '"content": "Hello!"' in diff_text, f"Diff should show new content; got:\n{diff_text}"
+            assert '"content": "Hello",' in diff_text, f"Diff should show old content; got:\n{diff_text}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --- Content block assembly ---

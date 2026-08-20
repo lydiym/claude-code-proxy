@@ -158,6 +158,22 @@ extra_body = { temperature = 0.3, cache_prompt = true, n_predict = 4096, chat_te
 
 Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, etc. land in the body. For offline checks, set `LOG_LEVEL=DEBUG` — the proxy logs the effective `extra_body` per request (sourced from request or `[tier]` config).
 
+### Cache-busting diagnostics (`PROXY_DEBUG_CACHE_DUMP=true`)
+
+Off by default. When enabled, every outgoing payload is matched against a rolling window of prior ones — a request whose outgoing starts with a prior one is a `prefix_hit` (the desired case); anything that crosses the 0.6 fuzzy threshold but isn't a structural prefix is `fuzzy_match` (suspect a cache-busting edit).
+
+Artifacts land in `$cwd/.claude-code-proxy/prompts/`:
+
+- `<ts>-<pid>-<kind>-<score>-new.json` — the current outgoing payload
+- `<ts>-<pid>-<kind>-<score>-old.json` — the prior payload it matched against
+- `<ts>-<pid>-<kind>-<score>-diff.diff` — unified diff of the pretty-printed payloads (skipped when identical)
+
+Inspect the diff to find which side of the comparison changed and adjust `[[prompt_remap]]` accordingly.
+
+```bash
+PROXY_DEBUG_CACHE_DUMP=true uv run uvicorn server:app
+```
+
 ### System-prompt rewrites (`[[prompt_remap]]`)
 
 Two things at once:

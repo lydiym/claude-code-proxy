@@ -4,6 +4,7 @@ Translates Anthropic Messages API requests to OpenAI Chat Completions via
 LiteLLM and converts the response back. Single FastAPI app, single code path.
 """
 
+import difflib
 import json
 import logging
 import os
@@ -66,6 +67,15 @@ def _litellm_debug_http_enabled() -> bool:
     Surfaces the actual wire payload sent to the upstream OpenAI endpoint.
     """
     return _str_to_bool(os.environ.get("LITELLM_DEBUG_HTTP"), default=False)
+
+
+def _debug_cache_dump_enabled() -> bool:
+    """PROXY_DEBUG_CACHE_DUMP=true records outgoing payloads to $cwd/.claude-code-proxy/prompts/.
+
+    Matches prefix equivalence to surface cache-busting hot spots.
+    Off by default; each request writes 0-2 files when enabled.
+    """
+    return _str_to_bool(os.environ.get("PROXY_DEBUG_CACHE_DUMP"), default=False)
 
 
 def _debug_json_dump(label: str, obj: object) -> None:
@@ -1989,6 +1999,155 @@ def _prepare_litellm_request(request: MessagesRequest) -> dict[str, Any]:
     return litellm_request
 
 
+_CACHE_DEBUG_DIR = pathlib.Path(".claude-code-proxy/prompts")
+_CACHE_MATCHER_HISTORY = 50
+_CACHE_MATCHER_THRESHOLD = 0.6
+
+
+class _CacheMatcher:
+    """Rolling-window prefix-equivalence matcher for llama-server cache hits.
+
+    The rendered prompt is keyed by the messages list (and tools list) —
+    metadata fields like ``model``/``max_tokens`` don't affect the prefix
+    cache. We canonicalise just the messages+tools slices, so the
+    ``startswith`` check returns true when the new outgoing is a prefix
+    extension of a prior one (the cache-hit case). On mismatch we run a
+    fuzzy match (SequenceMatcher ratio) and, when similarity crosses the
+    threshold, persist both payloads as artifacts for offline analysis.
+    """
+
+    def __init__(self, *, max_history: int, fuzzy_threshold: float, out_dir: pathlib.Path) -> None:
+        self._recent: list[tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]] = []
+        self._max_history = max_history
+        self._fuzzy_threshold = fuzzy_threshold
+        self._out_dir = out_dir
+
+    @staticmethod
+    def _strip_ids(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return (messages, tools) with tool_call ids scrubbed (random per request)."""
+        messages = []
+        for msg in payload.get("messages", []):
+            for tc in msg.get("tool_calls", []):
+                tc["id"] = "<id>"
+            if "tool_call_id" in msg:
+                msg["tool_call_id"] = "<id>"
+            messages.append(msg)
+        return messages, payload.get("tools", [])
+
+    def observe(self, payload: dict[str, Any]) -> None:
+        new_messages, new_tools = self._strip_ids(payload)
+        new_canonical = json.dumps(new_messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        # Structural check: new outgoing is a prefix extension of some prior one.
+        for old_messages, old_tools, old_payload in self._recent:
+            prefix_match = (
+                new_tools == old_tools
+                and old_messages
+                and len(new_messages) >= len(old_messages)
+                and new_messages[: len(old_messages)] == old_messages
+            )
+            if prefix_match:
+                logger.debug(
+                    "cache debug: prefix hit (msgs %d vs %d) — saving to %s",
+                    len(old_messages),
+                    len(new_messages),
+                    self._out_dir,
+                )
+                self._record(payload, old_payload, 1.0, "prefix_hit")
+                self._append(new_messages, new_tools, payload)
+                return
+        # Fuzzy fallback over the canonical wire form.
+        best_score = 0.0
+        best_old_payload: dict[str, Any] | None = None
+        for old_messages, _old_tools, old_payload in self._recent:
+            old_canonical = json.dumps(old_messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            score = difflib.SequenceMatcher(None, new_canonical, old_canonical).ratio()
+            if score > best_score:
+                best_score = score
+                best_old_payload = old_payload
+        if best_score >= self._fuzzy_threshold:
+            logger.info(
+                "cache debug: fuzzy match %.2f — saving artifacts to %s",
+                best_score,
+                self._out_dir,
+            )
+            self._record(payload, best_old_payload, best_score, "fuzzy_match")
+        else:
+            logger.debug("cache debug: no match (best=%.2f)", best_score)
+        self._append(new_messages, new_tools, payload)
+
+    def _append(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], payload: dict[str, Any]) -> None:
+        self._recent.append((messages, tools, payload))
+        if len(self._recent) > self._max_history:
+            self._recent.pop(0)
+
+    def _record(
+        self,
+        new_payload: dict[str, Any],
+        old_payload: dict[str, Any] | None,
+        score: float,
+        kind: str,
+    ) -> None:
+        stamp = _cache_debug_stamp(score, kind)
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        _safe_write_json(self._out_dir / f"{stamp}-new.json", new_payload)
+        if old_payload is not None:
+            _safe_write_json(self._out_dir / f"{stamp}-old.json", old_payload)
+            _write_diff(self._out_dir / f"{stamp}-diff.diff", new_payload, old_payload)
+
+
+def _write_diff(path: pathlib.Path, new_payload: dict[str, Any], old_payload: dict[str, Any]) -> None:
+    try:
+        old_lines = json.dumps(old_payload, indent=2, sort_keys=True, ensure_ascii=False).splitlines(keepends=True)
+        new_lines = json.dumps(new_payload, indent=2, sort_keys=True, ensure_ascii=False).splitlines(keepends=True)
+        diff = difflib.unified_diff(old_lines, new_lines, fromfile="old", tofile="new", n=2)
+        text = "".join(diff)
+    except Exception as e:
+        logger.debug("cache debug diff failed: %s", e)
+        return
+    if text:
+        try:
+            path.write_text(text, encoding="utf-8")
+        except Exception as e:
+            logger.debug("cache debug diff save failed: %s", e)
+
+
+def _cache_debug_stamp(score: float, kind: str) -> str:
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{kind}-{score:.2f}"
+
+
+def _safe_write_json(path: pathlib.Path, payload: dict[str, Any]) -> None:
+    try:
+        path.write_text(json.dumps(payload, default=str, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.debug("cache debug save failed: %s", e)
+
+
+@cache
+def _get_cache_matcher() -> _CacheMatcher:
+    return _CacheMatcher(
+        max_history=_CACHE_MATCHER_HISTORY,
+        fuzzy_threshold=_CACHE_MATCHER_THRESHOLD,
+        out_dir=pathlib.Path.cwd() / _CACHE_DEBUG_DIR,
+    )
+
+
+def _debug_dump_outgoing_payload(litellm_request: dict[str, Any]) -> None:
+    """Record outgoing payloads and match prefix equivalence when ``PROXY_DEBUG_CACHE_DUMP=true``.
+
+    Each request adds to a rolling window of canonical wire forms. A new
+    outgoing that starts with any prior one is a cache hit (the desired
+    case). Otherwise we fuzzy-match against the window and, on similarity
+    ≥ 0.6, save both payloads to ``$cwd/.claude-code-proxy/prompts/`` for analysis.
+
+    Artifacts: ``<ts>-<pid>-<kind>-<score>.{new,old}.json`` and
+    ``<ts>-<pid>-<kind>-<score>-diff.diff`` (unified diff of pretty-printed JSON,
+    empty diffs are skipped).
+    """
+    if not _debug_cache_dump_enabled():
+        return
+    _get_cache_matcher().observe(litellm_request)
+
+
 def _log_upstream_params_debug(litellm_request: dict[str, Any]) -> None:
     # Skip bulky fields (dumped by litellm.set_verbose) and the api_key secret.
     if not logger.isEnabledFor(logging.DEBUG):
@@ -2019,6 +2178,7 @@ def _log_response_debug(litellm_response: object, model: str, start_time: float)
 
 async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
     litellm_request = _prepare_litellm_request(request)
+    _debug_dump_outgoing_payload(litellm_request)
     _log_upstream_params_debug(litellm_request)
     _log_request(
         _LogContext(
