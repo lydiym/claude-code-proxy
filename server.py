@@ -2107,7 +2107,7 @@ class _CacheMatcher:
         kind: str,
     ) -> None:
         # Write scrubbed forms so random per-request tool_call ids don't drown the
-        # real structural change in the diff.
+        # real structural change.
         new_messages, new_tools = self._strip_ids(new_payload)
         new_for_disk = {**new_payload, "messages": new_messages, "tools": new_tools}
         stamp = _cache_debug_stamp(score, kind)
@@ -2117,23 +2117,6 @@ class _CacheMatcher:
             old_messages, old_tools = self._strip_ids(old_payload)
             old_for_disk = {**old_payload, "messages": old_messages, "tools": old_tools}
             _safe_write_json(self._out_dir / f"{stamp}-old.json", old_for_disk)
-            _write_diff(self._out_dir / f"{stamp}-diff.diff", new_for_disk, old_for_disk)
-
-
-def _write_diff(path: pathlib.Path, new_payload: dict[str, Any], old_payload: dict[str, Any]) -> None:
-    try:
-        old_lines = json.dumps(old_payload, indent=2, sort_keys=True, ensure_ascii=False).splitlines(keepends=True)
-        new_lines = json.dumps(new_payload, indent=2, sort_keys=True, ensure_ascii=False).splitlines(keepends=True)
-        diff = difflib.unified_diff(old_lines, new_lines, fromfile="old", tofile="new", n=2)
-        text = "".join(diff)
-    except Exception as e:
-        logger.debug("cache debug diff failed: %s", e)
-        return
-    if text:
-        try:
-            path.write_text(text, encoding="utf-8")
-        except Exception as e:
-            logger.debug("cache debug diff save failed: %s", e)
 
 
 _cache_debug_seq = itertools.count(1)
@@ -2169,9 +2152,10 @@ def _debug_dump_outgoing_payload(litellm_request: dict[str, Any]) -> None:
     case). Otherwise we fuzzy-match against the window and, on similarity
     ≥ 0.6, save both payloads to ``$cwd/.claude-code-proxy/prompts/`` for analysis.
 
-    Artifacts: ``<ts>-<pid>-<kind>-<score>.{new,old}.json`` and
-    ``<ts>-<pid>-<kind>-<score>-diff.diff`` (unified diff of pretty-printed JSON,
-    empty diffs are skipped).
+    Artifacts: ``<ts>-<pid>-<kind>-<score>-new.json`` (current) and
+    ``<ts>-<pid>-<kind>-<score>-old.json`` (prior that matched). Compare them
+    manually — unified diff of pretty-printed JSON collapses multi-KB system
+    prompts onto a single line and isn't readable.
     """
     if not _debug_cache_dump_enabled():
         return

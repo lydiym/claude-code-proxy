@@ -166,9 +166,11 @@ Artifacts land in `$cwd/.claude-code-proxy/prompts/`:
 
 - `<ts>-<pid>-<kind>-<score>-new.json` — the current outgoing payload
 - `<ts>-<pid>-<kind>-<score>-old.json` — the prior payload it matched against
-- `<ts>-<pid>-<kind>-<score>-diff.diff` — unified diff of the pretty-printed payloads (skipped when identical)
 
-Inspect the diff to find which side of the comparison changed and adjust `[[prompt_remap]]` accordingly.
+Compare them with your diff tool of choice (the system prompt is one long
+string, so `diff -u` won't be useful — a side-by-side viewer or a script
+that splits on `\n\n` works better). Adjust `[[prompt_remap]]` to canonicalise
+whichever side drifted.
 
 ```bash
 PROXY_DEBUG_CACHE_DUMP=true uv run uvicorn server:app

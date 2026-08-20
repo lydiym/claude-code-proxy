@@ -1946,12 +1946,6 @@ def test_debug_cache_dump_enabled_prefix_hit_creates_artifacts() -> None:
             assert prompts_dir.is_dir(), f"Expected {prompts_dir} to exist after a prefix hit"
             json_files = list(prompts_dir.glob("*-prefix_hit-*.json"))
             assert len(json_files) == 2, f"Expected -new.json + -old.json; got {json_files}"
-            diff_files = list(prompts_dir.glob("*-prefix_hit-*-diff.diff"))
-            assert len(diff_files) == 1, f"Expected one -diff.diff artifact; got {diff_files}"
-            diff_text = diff_files[0].read_text(encoding="utf-8")
-            assert '"content": "hello"' in diff_text, (
-                f"Diff should highlight the appended assistant message; got:\n{diff_text}"
-            )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1969,15 +1963,8 @@ def test_debug_cache_dump_matches_immediately_prior_request() -> None:
             _reset_cache_matcher()
             for n in (3, 5, 8):
                 srv._debug_dump_outgoing_payload(make(n))
-            diffs = sorted(prompts_dir.glob("*-prefix_hit-*-diff.diff"))
-            assert len(diffs) == 2, f"Expected 2 prefix_hit artifacts; got {diffs}"
-            texts = [d.read_text(encoding="utf-8") for d in diffs]
-            assert any('"content": "msg-4"' in t for t in texts), (
-                f"3→5 diff should show msg-3 + msg-4 added; got:\n{texts}"
-            )
-            assert any('"content": "msg-7"' in t for t in texts), (
-                f"5→8 diff should show msg-5..msg-7 added; got:\n{texts}"
-            )
+            hits = sorted(prompts_dir.glob("*-prefix_hit-*.json"))
+            assert len(hits) == 4, f"Expected 2 prefix_hits x 2 files; got {hits}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2000,11 +1987,6 @@ def test_debug_cache_dump_enabled_fuzzy_match_writes_artifacts() -> None:
             assert fuzzy_files, (
                 f"Expected fuzzy_match artifacts; got {list(prompts_dir.glob('*'))}"
             )
-            diff_files = list(prompts_dir.glob("*-fuzzy_match-*-diff.diff"))
-            assert len(diff_files) == 1, f"Expected one fuzzy -diff.diff; got {diff_files}"
-            diff_text = diff_files[0].read_text(encoding="utf-8")
-            assert '"content": "Hello!"' in diff_text, f"Diff should show new content; got:\n{diff_text}"
-            assert '"content": "Hello",' in diff_text, f"Diff should show old content; got:\n{diff_text}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
