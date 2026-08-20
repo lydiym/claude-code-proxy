@@ -1008,8 +1008,20 @@ def _build_system_message(
 
 def _apply_prompt_remaps(text: str) -> str:
     """Apply configured prompt remappings in order."""
+    before_len = len(text)
+    fired = 0
     for pattern, replacement in _PROMPT_REMAPS:
-        text = pattern.sub(replacement, text)
+        new_text, n = pattern.subn(replacement, text)
+        if n:
+            fired += 1
+            text = new_text
+    if fired:
+        logger.warning(
+            "prompt_remap: stripped %d chars via %d %s",
+            before_len - len(text),
+            fired,
+            "entry" if fired == 1 else "entries",
+        )
     return text
 
 

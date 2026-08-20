@@ -26,6 +26,7 @@ import time
 from collections.abc import AsyncGenerator, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
+from unittest.mock import patch
 
 import httpx
 from dotenv import load_dotenv
@@ -1682,6 +1683,41 @@ def test_prompt_remap_no_match_passes_through() -> None:
         })
         out = srv.convert_anthropic_to_litellm(req)
         assert out["messages"][0]["content"] == "You are concise."
+
+
+def test_prompt_remap_logs_when_stripping() -> None:
+    """WARNING log fires when any entry actually replaces text."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"The task tools haven't been used recently.*?ignore if not applicable\.\n+", "replacement": ""},
+    ]), patch.object(srv.logger, "warning") as warning:
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise.\n\nThe task tools haven't been used recently. ignore if not applicable.\n",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        srv.convert_anthropic_to_litellm(req)
+        strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
+        assert len(strip_logs) == 1, f"expected one strip log, got {len(strip_logs)}: {strip_logs}"
+        _msg, stripped, fired, _word = strip_logs[0].args
+        assert stripped > 0
+        assert fired == 1
+
+
+def test_prompt_remap_silent_when_no_strip() -> None:
+    """No WARNING log fires when no entry replaces anything."""
+    with _patched_empty_config(), _patched_prompt_remaps([
+        {"match": r"never-present-pattern-\d+", "replacement": ""},
+    ]), patch.object(srv.logger, "warning") as warning:
+        req = _make_request({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "system": "You are concise.",
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        srv.convert_anthropic_to_litellm(req)
+        strip_logs = [c for c in warning.call_args_list if c.args and c.args[0].startswith("prompt_remap: stripped")]
+        assert strip_logs == [], f"expected no strip log, got {strip_logs}"
 
 
 def test_prompt_remap_multiple_entries_applied_in_order() -> None:
