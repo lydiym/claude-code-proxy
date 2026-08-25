@@ -90,6 +90,32 @@ def _debug_json_dump(label: str, obj: object) -> None:
         logger.debug("%s dump failed: %s", label, e)
 
 
+_INBOUND_DUMP_DIR = pathlib.Path(".claude-code-proxy/anthropic-prompts")
+
+
+def _inbound_dump_enabled() -> bool:
+    """PROXY_DEBUG_INBOUND_DUMP=true writes the raw Anthropic request to a file before conversion."""
+    return _str_to_bool(os.environ.get("PROXY_DEBUG_INBOUND_DUMP"), default=False)
+
+
+def _dump_inbound_anthropic_request(request: "MessagesRequest") -> None:
+    """Write the raw Anthropic request payload before conversion.
+
+    Diagnostic aid for verifying how Claude Code shapes its requests —
+    in particular where it places ``system`` reminders across turns.
+    Best-effort: a failed write must never break the proxy.
+    """
+    if not _inbound_dump_enabled():
+        return
+    try:
+        _INBOUND_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = _INBOUND_DUMP_DIR / f"{ts}-{os.getpid()}-inbound.json"
+        path.write_text(request.model_dump_json(indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug("inbound dump failed: %s", e)
+
+
 def _resolve_tiktoken_offline() -> bool:
     """[proxy].tiktoken_offline from CONFIG_PATH, TIKTOKEN_OFFLINE env, then True."""
     path = os.environ.get("CONFIG_PATH", "./config.toml")
@@ -2234,6 +2260,7 @@ def _log_response_debug(litellm_response: object, model: str, start_time: float)
 
 
 async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
+    _dump_inbound_anthropic_request(request)
     litellm_request = _prepare_litellm_request(request)
     _debug_dump_outgoing_payload(litellm_request)
     _log_upstream_params_debug(litellm_request)

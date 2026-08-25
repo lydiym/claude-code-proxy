@@ -4574,6 +4574,68 @@ def test_resolve_tier_config_handles_none_tier_cfg() -> None:
         assert cfg["extra_body"] == {"from_global": 1, "from_big": 2}
 
 
+def test_dump_inbound_anthropic_request_disabled_by_default() -> None:
+    dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
+    original_dir = srv._INBOUND_DUMP_DIR
+    srv._INBOUND_DUMP_DIR = dump_dir
+    try:
+        with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "false"):
+            req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
+            srv._dump_inbound_anthropic_request(req)
+        assert list(dump_dir.glob("*")) == []
+    finally:
+        srv._INBOUND_DUMP_DIR = original_dir
+
+
+def test_dump_inbound_anthropic_request_writes_raw_payload() -> None:
+    dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
+    original_dir = srv._INBOUND_DUMP_DIR
+    srv._INBOUND_DUMP_DIR = dump_dir
+    try:
+        with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
+            req = _make_request({
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "system": "top",
+                "messages": [
+                    {"role": "system", "content": "inband"},
+                    {"role": "user", "content": "hello"},
+                ],
+            })
+            srv._dump_inbound_anthropic_request(req)
+        files = list(dump_dir.glob("*-inbound.json"))
+        assert len(files) == 1
+        payload = json.loads(files[0].read_text())
+        # Raw Anthropic shape — top-level system is a string, in-band role=system
+        # sits as its own message in the array, NOT pre-merged into messages[0].
+        assert payload["system"] == "top"
+        assert payload["messages"][0]["role"] == "system"
+        assert payload["messages"][0]["content"] == "inband"
+        assert payload["messages"][1]["role"] == "user"
+    finally:
+        srv._INBOUND_DUMP_DIR = original_dir
+
+
+def test_dump_inbound_anthropic_request_handles_write_errors() -> None:
+    dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
+    original_dir = srv._INBOUND_DUMP_DIR
+    srv._INBOUND_DUMP_DIR = dump_dir
+
+    def boom(_self: pathlib.Path, *_args: Any, **_kwargs: Any) -> None:
+        raise OSError("disk full")
+
+    original_write_text = pathlib.Path.write_text
+    try:
+        with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
+            pathlib.Path.write_text = boom  # type: ignore[method-assign]
+            req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
+            # Must not raise
+            srv._dump_inbound_anthropic_request(req)
+    finally:
+        pathlib.Path.write_text = original_write_text  # type: ignore[method-assign]
+        srv._INBOUND_DUMP_DIR = original_dir
+
+
 # ---------------------------------------------------------------------------
 # Integration smoke tests
 # ---------------------------------------------------------------------------

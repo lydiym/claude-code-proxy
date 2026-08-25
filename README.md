@@ -176,6 +176,28 @@ whichever side drifted.
 PROXY_DEBUG_CACHE_DUMP=true uv run uvicorn server:app
 ```
 
+### Inbound request dumps (`PROXY_DEBUG_INBOUND_DUMP=true`)
+
+Off by default. When enabled, every Anthropic request Claude Code sends is
+written verbatim (before conversion to OpenAI shape) to
+`$cwd/.claude-code-proxy/anthropic-prompts/<ts>-<pid>-inbound.json`.
+
+Use this when you need to see the raw Anthropic payload — in particular:
+
+- Where Claude Code places its `<system-reminder>` injections across turns
+  (top-level `system` field vs in-band `role="system"` messages vs user content)
+- The exact shape of the `system` field (`str` vs `list[ContentBlock]`)
+- Whether the conversation history is growing or staying stable
+
+This complements `PROXY_DEBUG_CACHE_DUMP` (which captures post-conversion
+outgoing payloads to `.claude-code-proxy/prompts/`). Inbound dumps let you
+inspect what the *client* sends; cache dumps let you inspect what
+*upstream* receives.
+
+```bash
+PROXY_DEBUG_INBOUND_DUMP=true uv run uvicorn server:app
+```
+
 ### System-prompt rewrites (`[[prompt_remap]]`)
 
 Two things at once:
