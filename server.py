@@ -1164,11 +1164,21 @@ def _collect_tool_ids(messages: list[Message]) -> tuple[set[str], set[str]]:
 def _convert_assistant_message(msg: Message, result_ids: set[str], id_map: dict[str, str]) -> dict[str, Any]:
     text_parts = []
     tool_calls = []
+    reasoning_parts = []
 
     for block in msg.content:
         block_type = _get_field(block, "type")
         if block_type == "text":
             text_parts.append(cast("ContentBlockText", block).text)
+        elif block_type == "thinking":
+            # Round-trip upstream reasoning_content back into the assistant turn so the
+            # model sees its own prior chain. Forwarded as the canonical ``reasoning_content``
+            # field on the OpenAI message dict; litellm's openai_like/chat handler spreads
+            # messages straight into the JSON body, and the openai SDK serialises them
+            # with plain json.dumps (TypedDict = no runtime validation), so the extra key
+            # reaches the wire untouched. See vertex_ai/gemini/transformation.py:826 for
+            # the canonical round-trip contract.
+            reasoning_parts.append(cast("ContentBlockThinking", block).thinking)
         elif block_type == "tool_use":
             tool_block = cast("ContentBlockToolUse", block)
             if tool_block.id in result_ids:
@@ -1200,6 +1210,10 @@ def _convert_assistant_message(msg: Message, result_ids: set[str], id_map: dict[
     out["content"] = text or (None if tool_calls else "")
     if tool_calls:
         out["tool_calls"] = tool_calls
+    if reasoning_parts:
+        # Anthropic may emit multiple thinking blocks per turn (rare). Concatenate so the
+        # model sees one continuous chain matching what it produced originally.
+        out["reasoning_content"] = "\n\n".join(reasoning_parts)
     return out
 
 
@@ -1293,12 +1307,17 @@ def sanitize_messages_for_openai(messages: list[dict[str, Any]]) -> None:
     """Strip message keys OpenAI doesn't accept and coerce empty content.
 
     Mutates in place. Keeps ``role``, ``content``, ``name``, ``tool_call_id``,
-    and ``tool_calls``; everything else is dropped. Empty/None ``content`` is
-    replaced with ``"..."`` when no tool_calls are present — OpenAI rejects
-    empty content outright. Tool result bodies are left as-is even when empty:
-    the placeholder would change the prompt's tokens.
+    ``tool_calls``, and ``reasoning_content``; everything else is dropped.
+    ``reasoning_content`` is the canonical round-trip field for prior-turn
+    reasoning — OpenAI's TypedDict doesn't declare it but the SDK's wire
+    serializer is plain json.dumps so it reaches the wire untouched (verified
+    via openapi_dumps), and litellm's vertex_ai/gemini handler reads it back
+    (vertex_ai/gemini/transformation.py:826). Empty/None ``content`` is replaced
+    with ``"..."`` when no tool_calls are present — OpenAI rejects empty
+    content outright. Tool result bodies are left as-is even when empty: the
+    placeholder would change the prompt's tokens.
     """
-    allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls"}
+    allowed_keys = {"role", "content", "name", "tool_call_id", "tool_calls", "reasoning_content"}
     for msg in messages:
         for key in list(msg.keys()):
             if key not in allowed_keys:

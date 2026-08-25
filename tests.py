@@ -759,6 +759,89 @@ def test_thinking_absent_means_no_thinking_field_in_outbound() -> None:
         assert "allowed_openai_params" not in out
 
 
+def test_thinking_block_round_trips_as_reasoning_content() -> None:
+    """Anthropic thinking blocks on prior assistant turns reach upstream as
+    ``reasoning_content`` on the assistant message — without this, models
+    trained on reasoning chains (e.g. qwen3.8 with preserve_thinking=true) lose
+    continuity and re-derive reasoning every turn.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "What is 2+2?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "The user asks a simple math question."},
+                            {"type": "text", "text": "The answer is 4."},
+                        ],
+                    },
+                    {"role": "user", "content": "And 3+3?"},
+                ],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        asst = out["messages"][1]
+        assert asst["role"] == "assistant"
+        assert asst["content"] == "The answer is 4."
+        assert asst["reasoning_content"] == "The user asks a simple math question."
+
+
+def test_multiple_thinking_blocks_concatenate() -> None:
+    """Rare: multiple thinking blocks in one turn → joined with blank line."""
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "First thought."},
+                            {"type": "thinking", "thinking": "Second thought."},
+                            {"type": "text", "text": "Hi back."},
+                        ],
+                    },
+                ],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["messages"][1]["reasoning_content"] == "First thought.\n\nSecond thought."
+
+
+def test_assistant_without_thinking_has_no_reasoning_content_field() -> None:
+    """Pure text or tool-only assistant turns → no spurious reasoning_content."""
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "Hello."},
+                ],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "reasoning_content" not in out["messages"][1]
+
+
+def test_sanitize_preserves_reasoning_content() -> None:
+    """The wire-format sanitizer must not strip reasoning_content — it's the
+    round-trip field for prior-turn reasoning. Without this the round-trip is
+    silent: the message leaves _convert_assistant_message with reasoning_content
+    attached but loses it before reaching the wire.
+    """
+    msgs = [{"role": "assistant", "content": "ok", "reasoning_content": "thoughtful"}]
+    srv.sanitize_messages_for_openai(msgs)
+    assert msgs[0]["reasoning_content"] == "thoughtful"
+
+
 def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None:
     with _patched_empty_config():
         req = _make_request(
