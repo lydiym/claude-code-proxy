@@ -1966,7 +1966,7 @@ def test_system_role_message_in_messages_array_is_hoisted() -> None:
         foo = sys_content.index("[skill: foo]")
         baz = sys_content.index("[skill: baz]")
         sys = sys_content.index("You are concise.")
-        assert foo < baz < sys
+        assert sys < foo < baz
 
 
 def test_system_role_message_with_string_content_is_hoisted() -> None:

@@ -1052,17 +1052,16 @@ def _build_system_message(
 
     Anthropic's spec only allows system at the top level, but Claude Code
     2.1.154+ has started embedding system reminders inline. We hoist them all
-    to the start so OpenAI sees one system message at the top. Order is
-    preserved: in-band messages come first, then the top-level field — which
-    is the order Claude Code most likely intended when it injected the
-    reminders inline.
+    to the start so OpenAI sees one system message at the top. Order
+    mirrors the natural Anthropic chronology: the top-level ``system``
+    field is the agent's identity and goes first, in-band reminders follow
+    in the order they appear in the ``messages`` array.
 
     Configured ``[[prompt_remap]]`` regexes are applied last.
     """
-    parts = [text for text in (_extract_text(m.content) for m in messages if m.role == "system") if text]
     top = _extract_text(system_field)
-    if top:
-        parts.append(top)
+    inband = [text for text in (_extract_text(m.content) for m in messages if m.role == "system") if text]
+    parts = ([top] if top else []) + inband
     if not parts:
         return None
     text = _apply_prompt_remaps("\n\n".join(parts)).strip()
