@@ -118,6 +118,22 @@ Merge chain is `[global] → [bucket] → [tier]` (later wins per leaf). Samplin
 
 Pick the knobs your backend actually understands — don't mix `reasoning_effort` (OpenAI o-series), `chat_template_kwargs` (llama.cpp), or Anthropic-native `thinking` in one section. They belong to different backends.
 
+### Anthropic-shaped field translations
+
+Claude Code sends a few Anthropic-native fields that don't map 1:1 to OpenAI Chat Completions. The proxy translates them so you don't have to round-trip via config:
+
+| Anthropic field           | Where it lands on the wire          | Notes |
+|---------------------------|-------------------------------------|-------|
+| `thinking`                | `extra_body.thinking` (body-only)   | Anthropic-compatible backends like MiniMax-M3 read this verbatim. Body-only because the openai SDK rejects unknown top-level kwargs; the key still reaches the JSON body via litellm's `extra_body` lift (see `openai_like/chat/handler.py:241,258`). |
+| `output_config.effort`    | top-level `reasoning_effort`        | OpenAI's reasoning-effort axis (o-series, etc.). Only translated when `effort` is set; other `output_config` keys are ignored. |
+| `metadata`, `context_management` | dropped | Anthropic-only; not forwarded. |
+
+Three more rules apply when these fields overlap with `[tier].extra_body`:
+
+- `thinking`: deep-merged with `[tier].extra_body.thinking` — config wins per leaf (e.g. config can flip `type` from `adaptive` to `disabled` while the client's `budget_tokens` survives).
+- `output_config.effort`: translated first, then `[tier].extra_body.reasoning_effort` (if any) overrides it.
+- The merged key list is published as `allowed_openai_params` at both top-level and inside `extra_body` so the litellm hop and any cascade proxy forward these vendor keys verbatim instead of filtering them.
+
 ### Lookup order
 
 For each setting, the proxy uses the first non-empty value from this list:
@@ -131,7 +147,7 @@ Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` overr
 ### Per-tier merge semantics
 
 - **Model selection**: per tier, the resolver walks `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` → `[global].model` → built-in default. First non-empty wins. `[global].model` is the catch-all for any model — including unmapped ones (tier=None).
-- **extra_body merge chain**: `[global] → [bucket] → [tier]` (haiku → `small`, others → `big`). Each layer deep-merges; later wins per leaf. Keys are lifted to top-level kwargs on the upstream call. The merged key list is published as `allowed_openai_params` (top-level + inside `extra_body`) so the litellm hop and any cascade proxy forward vendor keys (`chat_template_kwargs`, `cache_prompt`, `n_predict`, `reasoning_effort`, …) instead of dropping them.
+- **extra_body merge chain**: `[global] → [bucket] → [tier]` (haiku → `small`, others → `big`). Each layer deep-merges; later wins per leaf. Keys are lifted to top-level kwargs on the upstream call, except `thinking` and any other Anthropic-only fields that the openai SDK rejects at signature time — those stay in `extra_body` and reach the JSON body via litellm's cascade lift. The merged key list is published as `allowed_openai_params` (top-level + inside `extra_body`) so the litellm hop and any cascade proxy forward vendor keys (`chat_template_kwargs`, `cache_prompt`, `n_predict`, `reasoning_effort`, …) instead of dropping them.
 - **Sampling / reasoning / vendor fields** all live inside `[tier].extra_body` (and `[global].extra_body` / `[bucket].extra_body`). There is no per-key whitelist — pass any top-level key the upstream OpenAI Chat Completions API (or your compatible backend) accepts: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `max_completion_tokens`, `reasoning_effort`, `chat_template_kwargs`, `cache_prompt`, `n_predict`, …
 - **Conflict resolution**: when both a config layer (`[global]` / `[bucket]` / `[tier]`) and the client request set the same key (whether via Pydantic sampling fields or a request-level `extra_body`), **config wins** per leaf.
 - **No defaults applied**: when neither config nor the request sets a key, it is **omitted from the upstream call** (we don't auto-apply Anthropic defaults like `temperature=1.0`).

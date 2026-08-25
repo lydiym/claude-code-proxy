@@ -664,6 +664,101 @@ def test_explicit_null_sampling_is_dropped() -> None:
         assert "stop" not in out
 
 
+def test_output_config_effort_translates_to_reasoning_effort() -> None:
+    """Anthropic's ``output_config.effort`` lifts to OpenAI's ``reasoning_effort``.
+
+    Claude Code sends ``output_config`` to namespace reasoning controls; OpenAI
+    Chat Completions exposes the same axis at the top level for o-series and
+    other reasoning backends.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "output_config": {"effort": "low"},
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["reasoning_effort"] == "low"
+
+
+def test_output_config_without_effort_does_not_set_reasoning_effort() -> None:
+    """``output_config`` present but no ``effort`` key → no ``reasoning_effort``."""
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "output_config": {"some_future_key": "x"},
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "reasoning_effort" not in out
+
+
+def test_thinking_passes_through_to_extra_body_for_anthropic_compatible_backends() -> None:
+    """``request.thinking`` lands in ``extra_body.thinking`` (not top-level) — the
+    openai SDK rejects unknown top-level kwargs, so body-only keys reach the JSON
+    body via extra_body instead. Whitelist still published so litellm forwards it.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "thinking": {"type": "adaptive"},
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        # Body-only: NOT a top-level kwarg, but in extra_body for the JSON wire.
+        assert "thinking" not in out
+        assert out["extra_body"] == {
+            "allowed_openai_params": ["thinking"],
+            "thinking": {"type": "adaptive"},
+        }
+        # Whitelist published so cascade proxies forward verbatim.
+        assert "thinking" in out["allowed_openai_params"]
+
+
+def test_tier_extra_body_thinking_overrides_request_thinking_per_leaf() -> None:
+    """Config wins per leaf — ``[tier].extra_body.thinking.type`` overrides
+    the client's type, but unrelated leaves the client sent (budget_tokens)
+    survive the deep-merge. ``thinking`` stays body-only.
+    """
+    with _patched_config('[global]\nextra_body = { thinking = { type = "disabled" } }\n'):
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        # Config wins on the type leaf; budget_tokens only present in request survives.
+        assert "thinking" not in out
+        assert out["extra_body"]["thinking"] == {"type": "disabled", "budget_tokens": 1024}
+
+
+def test_thinking_absent_means_no_thinking_field_in_outbound() -> None:
+    """No ``thinking`` in request, none in config → no ``thinking`` on the wire."""
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "thinking" not in out
+        assert "allowed_openai_params" not in out
+
+
 def test_convert_anthropic_to_litellm_pairs_tool_call_with_tool_result() -> None:
     with _patched_empty_config():
         req = _make_request(
@@ -4048,9 +4143,11 @@ def test_extra_body_deep_merge_with_client() -> None:
             },
         )
         out = srv.convert_anthropic_to_litellm(req)
+        # thinking is body-only (openai SDK rejects unknown kwargs); lives in extra_body.
+        assert "thinking" not in out
         # thinking: both leaves present; client effort + config type (config wins per leaf)
-        assert out["thinking"]["type"] == "disabled"  # from config
-        assert out["thinking"]["effort"] == "high"  # from client (config didn't set)
+        assert out["extra_body"]["thinking"]["type"] == "disabled"  # from config
+        assert out["extra_body"]["thinking"]["effort"] == "high"  # from client (config didn't set)
         # temperature: config wins outright
         assert out["temperature"] == 0.3
         # top_p: client-only → reaches upstream
@@ -4574,65 +4671,76 @@ def test_resolve_tier_config_handles_none_tier_cfg() -> None:
         assert cfg["extra_body"] == {"from_global": 1, "from_big": 2}
 
 
-def test_dump_inbound_anthropic_request_disabled_by_default() -> None:
+def test_dump_inbound_anthropic_body_disabled_by_default() -> None:
     dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
     original_dir = srv._INBOUND_DUMP_DIR
     srv._INBOUND_DUMP_DIR = dump_dir
     try:
         with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "false"):
-            req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
-            srv._dump_inbound_anthropic_request(req)
+            srv._dump_inbound_anthropic_body(b'{"model":"x","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}')
         assert list(dump_dir.glob("*")) == []
     finally:
         srv._INBOUND_DUMP_DIR = original_dir
 
 
-def test_dump_inbound_anthropic_request_writes_raw_payload() -> None:
+def test_dump_inbound_anthropic_body_writes_raw_bytes() -> None:
     dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
     original_dir = srv._INBOUND_DUMP_DIR
     srv._INBOUND_DUMP_DIR = dump_dir
     try:
+        raw = (
+            b'{"model":"claude-sonnet","max_tokens":100,'
+            b'"system":"top",'
+            b'"messages":[{"role":"system","content":"inband"},{"role":"user","content":"hello"}]}'
+        )
         with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
-            req = _make_request({
-                "model": "claude-3-5-sonnet-20241022",
-                "max_tokens": 100,
-                "system": "top",
-                "messages": [
-                    {"role": "system", "content": "inband"},
-                    {"role": "user", "content": "hello"},
-                ],
-            })
-            srv._dump_inbound_anthropic_request(req)
+            srv._dump_inbound_anthropic_body(raw)
         files = list(dump_dir.glob("*-inbound.json"))
         assert len(files) == 1
+        # Pretty-printed JSON whose parsed payload matches the wire bytes
+        # verbatim — clients add non-Pydantic fields (thinking, metadata,
+        # output_config, context_management, …) that must survive.
         payload = json.loads(files[0].read_text())
-        # Raw Anthropic shape — top-level system is a string, in-band role=system
-        # sits as its own message in the array, NOT pre-merged into messages[0].
+        assert payload == json.loads(raw)
         assert payload["system"] == "top"
         assert payload["messages"][0]["role"] == "system"
-        assert payload["messages"][0]["content"] == "inband"
-        assert payload["messages"][1]["role"] == "user"
+        # Whitespace was rewritten, not copied verbatim.
+        assert "\n  " in files[0].read_text()
     finally:
         srv._INBOUND_DUMP_DIR = original_dir
 
 
-def test_dump_inbound_anthropic_request_handles_write_errors() -> None:
+def test_dump_inbound_anthropic_body_handles_write_errors() -> None:
     dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
     original_dir = srv._INBOUND_DUMP_DIR
     srv._INBOUND_DUMP_DIR = dump_dir
 
-    def boom(_self: pathlib.Path, *_args: Any, **_kwargs: Any) -> None:
+    def boom(_self: pathlib.Path, *_args: Any, **_kwargs: Any) -> NoReturn:
         raise OSError("disk full")
 
-    original_write_text = pathlib.Path.write_text
+    original_write_bytes = pathlib.Path.write_bytes
     try:
         with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
-            pathlib.Path.write_text = boom  # type: ignore[method-assign]
-            req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
+            pathlib.Path.write_bytes = boom  # type: ignore[method-assign]
             # Must not raise
-            srv._dump_inbound_anthropic_request(req)
+            srv._dump_inbound_anthropic_body(b"{}")
     finally:
-        pathlib.Path.write_text = original_write_text  # type: ignore[method-assign]
+        pathlib.Path.write_bytes = original_write_bytes  # type: ignore[method-assign]
+        srv._INBOUND_DUMP_DIR = original_dir
+
+
+def test_dump_inbound_anthropic_body_falls_back_to_raw_on_invalid_json() -> None:
+    """Non-JSON body (e.g. truncated upload) still lands on disk verbatim — never crash."""
+    dump_dir = pathlib.Path(tempfile.mkdtemp()) / "anthropic-prompts"
+    original_dir = srv._INBOUND_DUMP_DIR
+    srv._INBOUND_DUMP_DIR = dump_dir
+    try:
+        with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
+            srv._dump_inbound_anthropic_body(b'{"truncated"')
+        files = list(dump_dir.glob("*-inbound.json"))
+        assert len(files) == 1
+        assert files[0].read_text(encoding="utf-8") == '{"truncated"'
+    finally:
         srv._INBOUND_DUMP_DIR = original_dir
 
 

@@ -15,7 +15,7 @@ import sys
 import time
 import tomllib
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -23,7 +23,7 @@ from functools import cache
 from typing import Any, Literal, cast
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -98,20 +98,45 @@ def _inbound_dump_enabled() -> bool:
     return _str_to_bool(os.environ.get("PROXY_DEBUG_INBOUND_DUMP"), default=False)
 
 
-def _dump_inbound_anthropic_request(request: "MessagesRequest") -> None:
-    """Write the raw Anthropic request payload before conversion.
+def _inbound_dump_path() -> pathlib.Path:
+    """Build a timestamped dump path; creates the directory if missing."""
+    _INBOUND_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return _INBOUND_DUMP_DIR / f"{ts}-{os.getpid()}-inbound.json"
+
+
+def _format_inbound_body(body: bytes) -> str:
+    """Pretty-print JSON; on parse failure return raw text with replacement chars."""
+    try:
+        return json.dumps(json.loads(body), indent=2, ensure_ascii=False)
+    except (ValueError, UnicodeDecodeError):
+        return body.decode("utf-8", errors="replace")
+
+
+def _dump_inbound_anthropic_body(body: bytes) -> None:
+    """Write the raw Anthropic request body before Pydantic validation.
 
     Diagnostic aid for verifying how Claude Code shapes its requests —
-    in particular where it places ``system`` reminders across turns.
-    Best-effort: a failed write must never break the proxy.
+    in particular where it places ``system`` reminders across turns and
+    which fields it omits (the validated object would silently fill in
+    defaults and hide that). Body is pretty-printed for readability;
+    content matches the wire bytes modulo whitespace. Best-effort: a
+    failed write or parse must never break the proxy.
     """
     if not _inbound_dump_enabled():
         return
     try:
-        _INBOUND_DUMP_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        path = _INBOUND_DUMP_DIR / f"{ts}-{os.getpid()}-inbound.json"
-        path.write_text(request.model_dump_json(indent=2), encoding="utf-8")
+        path = _inbound_dump_path()
+    except Exception as e:
+        logger.debug("inbound dump failed: %s", e)
+        return
+    try:
+        text = _format_inbound_body(body)
+    except Exception as e:
+        logger.debug("inbound dump failed: %s", e)
+        return
+    try:
+        path.write_text(text, encoding="utf-8")
     except Exception as e:
         logger.debug("inbound dump failed: %s", e)
 
@@ -189,6 +214,12 @@ _VALID_TIERS = set(TIER_KEYS)
 _VALID_SECTIONS = {"proxy", "global", "big", "small"} | _VALID_TIERS
 _PROXY_KEYS = {"openai_api_key", "openai_base_url", "openai_tls_verify"}
 _PROTECTED_KEYS = {"model", "messages", "stream", "tools"}  # OpenAI Chat Completions keys the proxy owns
+# Keys that must NOT be lifted to top-level kwargs — the openai SDK's
+# signature rejects them as unknown kwargs (TypeError), but the upstream
+# HTTP body still accepts them via ``extra_body``. ``thinking`` is the
+# canonical case: Claude Code / MiniMax-M3 exchange it via JSON body, not
+# as a typed SDK param.
+_BODY_ONLY_KEYS = {"thinking"}
 _BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
 _PROVIDER_PREFIXES = ("anthropic/", "openai/", "gemini/")
 _BOOL_TLS_VERIFY = {"openai_tls_verify"}
@@ -391,6 +422,11 @@ class MessagesRequest(BaseModel):
     top_k: int | None = None
     tools: list[Tool] | None = None
     tool_choice: dict[str, Any] | None = None
+    # Anthropic-shaped knobs. ``output_config.effort`` translates to OpenAI's
+    # ``reasoning_effort``; ``thinking`` passes through to ``extra_body.thinking``
+    # for Anthropic-compatible backends (e.g. MiniMax-M3) — see convert_anthropic_to_litellm.
+    output_config: dict[str, Any] | None = None
+    thinking: dict[str, Any] | None = None
     # Pass-through bag for arbitrary OpenAI Chat Completions keys. Merged
     # with [tier].extra_body at convert time; per-leaf config-wins.
     extra_body: dict[str, Any] | None = None
@@ -884,6 +920,21 @@ def _log_request(ctx: _LogContext) -> None:
 app = FastAPI(lifespan=_configure_logging)
 
 
+@app.middleware("http")
+async def _inbound_body_dump_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    """Capture the raw request body for PROXY_DEBUG_INBOUND_DUMP before Pydantic validation.
+
+    Reading the body here also lets the downstream handler re-parse it
+    (FastAPI caches the body on ``request._body`` so the route handler
+    still sees the same bytes). Best-effort: a failed read or write
+    must never break the request.
+    """
+    if _inbound_dump_enabled() and request.url.path == "/v1/messages" and request.method == "POST":
+        body = await request.body()
+        _dump_inbound_anthropic_body(body)
+    return await call_next(request)
+
+
 OPENAI_API_KEY = _proxy_value("openai_api_key", "OPENAI_API_KEY")
 OPENAI_BASE_URL = _proxy_value("openai_base_url", "OPENAI_BASE_URL")
 
@@ -1360,8 +1411,23 @@ def _apply_merged_extra_body(
     whitelist twice — top-level so litellm extends supported_params
     (utils.py:3877), and inside extra_body so cascade proxies forward vendor
     keys instead of filtering them (openai_like/chat/handler.py:241,254-259).
+
+    Three client-side sources are folded in (later wins per leaf):
+      1. ``request.thinking`` (Anthropic-shaped) → passes through to
+         Anthropic-compatible backends like MiniMax-M3 verbatim.
+      2. ``request.output_config.effort`` → translated to ``reasoning_effort``
+         (OpenAI's reasoning-effort axis used by o-series).
+      3. ``request.extra_body`` → arbitrary keys the client wants to forward.
+    ``[tier].extra_body`` overrides any of the above per leaf — apply last.
     """
     merged_extra: dict[str, Any] = {}
+    if anthropic_request.thinking:
+        merged_extra = _deep_merge(merged_extra, {"thinking": anthropic_request.thinking})
+    if anthropic_request.output_config and anthropic_request.output_config.get("effort") is not None:
+        merged_extra = _deep_merge(
+            merged_extra,
+            {"reasoning_effort": anthropic_request.output_config["effort"]},
+        )
     if anthropic_request.extra_body:
         merged_extra = _deep_merge(merged_extra, anthropic_request.extra_body)
     tier_extra = tier_cfg.get("extra_body")
@@ -1372,12 +1438,19 @@ def _apply_merged_extra_body(
         if k in _PROTECTED_KEYS:
             logger.warning("ignoring protected key in extra_body: %s", k)
             continue
+        if k in _BODY_ONLY_KEYS:
+            # Don't lift to top-level — the openai SDK rejects unknown kwargs.
+            # The key still lands in the JSON body via extra_body below.
+            continue
         litellm_request[k] = v
 
     if merged_extra:
         keys = list(merged_extra.keys())
+        # Body-only keys still need to be in allowed_openai_params so litellm
+        # forwards them; they reach the JSON body through extra_body in
+        # openai_like/chat/handler.py:241,258 which bypasses the SDK signature.
         litellm_request["allowed_openai_params"] = keys
-        litellm_request["extra_body"] = {"allowed_openai_params": keys}
+        litellm_request["extra_body"] = {"allowed_openai_params": keys, **merged_extra}
 
 
 # ---------------------------------------------------------------------------
@@ -2259,7 +2332,6 @@ def _log_response_debug(litellm_response: object, model: str, start_time: float)
 
 
 async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
-    _dump_inbound_anthropic_request(request)
     litellm_request = _prepare_litellm_request(request)
     _debug_dump_outgoing_payload(litellm_request)
     _log_upstream_params_debug(litellm_request)
