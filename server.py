@@ -682,6 +682,7 @@ def _load_config(path: str) -> dict[str, Any]:
 
 
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "./config.toml")
+CONFIG: dict[str, Any]
 try:
     CONFIG = _load_config(CONFIG_PATH)
 except Exception:
