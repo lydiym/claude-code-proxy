@@ -699,6 +699,26 @@ def test_output_config_without_effort_does_not_set_reasoning_effort() -> None:
         assert "reasoning_effort" not in out
 
 
+def test_output_config_empty_string_effort_is_dropped() -> None:
+    """``output_config.effort=""`` is treated as absent — the empty string is not
+    a valid enum value for any reasoning backend (Anthropic, OpenAI o-series,
+    Moonshot kimi), and forwarding it produces a 422. Truthy guard matches the
+    proxy's general rule of not auto-applying defaults when the client sent
+    nothing meaningful.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "output_config": {"effort": ""},
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "reasoning_effort" not in out
+
+
 def test_thinking_passes_through_to_extra_body_for_anthropic_compatible_backends() -> None:
     """``request.thinking`` lands in ``extra_body.thinking`` (not top-level) — the
     openai SDK rejects unknown top-level kwargs, so body-only keys reach the JSON
