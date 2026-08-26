@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import contextlib
 import inspect
+import itertools
 import json
 import os
 import pathlib
@@ -1576,6 +1577,22 @@ def test_tool_result_text_only_unchanged_string() -> None:
         out = srv.convert_anthropic_to_litellm(req)
         tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
         assert tool_msg["content"] == "first\nsecond", f"Text-only list must flatten to newline-joined string; got {tool_msg['content']!r}"
+
+
+def test_tool_result_text_block_with_null_text_does_not_crash() -> None:
+    """``{"type": "text", "text": null}`` must not raise ``TypeError`` later when
+    ``_tool_result_parts_from_list`` joins text parts — null is not a str.
+    """
+    with _patched_empty_config():
+        req = _make_tool_result_request(
+            [
+                {"type": "text", "text": None},
+                {"type": "text", "text": "after"},
+            ],
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        tool_msg = next(m for m in out["messages"] if m.get("role") == "tool")
+        assert tool_msg["content"] == "after", f"Null text must collapse to empty; got {tool_msg['content']!r}"
 
 
 def test_tool_result_with_multiple_images() -> None:
@@ -4798,7 +4815,7 @@ def test_dump_inbound_anthropic_body_writes_raw_bytes() -> None:
         )
         with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
             srv._dump_inbound_anthropic_body(raw)
-        files = list(dump_dir.glob("*-inbound.json"))
+        files = list(dump_dir.glob("*-inbound-*.json"))
         assert len(files) == 1
         # Pretty-printed JSON whose parsed payload matches the wire bytes
         # verbatim — clients add non-Pydantic fields (thinking, metadata,
@@ -4809,6 +4826,24 @@ def test_dump_inbound_anthropic_body_writes_raw_bytes() -> None:
         assert payload["messages"][0]["role"] == "system"
         # Whitespace was rewritten, not copied verbatim.
         assert "\n  " in files[0].read_text()
+    finally:
+        srv._INBOUND_DUMP_DIR = original_dir
+
+
+def test_inbound_dump_path_disambiguates_same_second_writes() -> None:
+    """Two dumps within the same second must produce distinct filenames — a
+    seq counter stops the second from clobbering the first.
+    """
+    dump_dir = pathlib.Path(tempfile.mkdtemp())
+    original_dir = srv._INBOUND_DUMP_DIR
+    srv._INBOUND_DUMP_DIR = dump_dir
+    try:
+        srv._INBOUND_DUMP_SEQ = itertools.count(1)
+        path_a = srv._inbound_dump_path()
+        path_b = srv._inbound_dump_path()
+        assert path_a != path_b, f"Same-second dumps collided: {path_a.name} == {path_b.name}"
+        assert path_a.name.endswith("-inbound-0001.json")
+        assert path_b.name.endswith("-inbound-0002.json")
     finally:
         srv._INBOUND_DUMP_DIR = original_dir
 
@@ -4840,7 +4875,7 @@ def test_dump_inbound_anthropic_body_falls_back_to_raw_on_invalid_json() -> None
     try:
         with _patched_env("PROXY_DEBUG_INBOUND_DUMP", "true"):
             srv._dump_inbound_anthropic_body(b'{"truncated"')
-        files = list(dump_dir.glob("*-inbound.json"))
+        files = list(dump_dir.glob("*-inbound-*.json"))
         assert len(files) == 1
         assert files[0].read_text(encoding="utf-8") == '{"truncated"'
     finally:
