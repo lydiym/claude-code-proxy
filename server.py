@@ -930,8 +930,11 @@ async def _inbound_body_dump_middleware(request: Request, call_next: Callable[[R
     must never break the request.
     """
     if _inbound_dump_enabled() and request.url.path == "/v1/messages" and request.method == "POST":
-        body = await request.body()
-        _dump_inbound_anthropic_body(body)
+        try:
+            body = await request.body()
+            _dump_inbound_anthropic_body(body)
+        except Exception:  # debug-only — never break the request
+            logger.debug("inbound body dump failed", exc_info=True)
     return await call_next(request)
 
 
@@ -1442,11 +1445,9 @@ def _apply_merged_extra_body(
     merged_extra: dict[str, Any] = {}
     if anthropic_request.thinking:
         merged_extra = _deep_merge(merged_extra, {"thinking": anthropic_request.thinking})
-    if anthropic_request.output_config and anthropic_request.output_config.get("effort") is not None:
-        merged_extra = _deep_merge(
-            merged_extra,
-            {"reasoning_effort": anthropic_request.output_config["effort"]},
-        )
+    effort = anthropic_request.output_config.get("effort") if anthropic_request.output_config else None
+    if effort:
+        merged_extra = _deep_merge(merged_extra, {"reasoning_effort": effort})
     if anthropic_request.extra_body:
         merged_extra = _deep_merge(merged_extra, anthropic_request.extra_body)
     tier_extra = tier_cfg.get("extra_body")
