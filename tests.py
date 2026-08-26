@@ -2629,8 +2629,8 @@ def test_prompt_remap_bad_match_string_skipped() -> None:
     with (
         _patched_empty_config(),
         _patched_prompt_remaps(
-            [
-                {"match": 123, "replacement": ""},  # ty: ignore[list-item]
+            [  # ty: ignore[invalid-argument-type] — non-string match is the regression input
+                {"match": 123, "replacement": ""},
                 {"match": r"real-match", "replacement": "Y"},
             ],
         ),
@@ -3408,13 +3408,13 @@ async def test_streaming_preserves_partial_tool_arguments_when_index_changes() -
             cb = e.get("content_block") or {}
             if cb.get("type") == "tool_use":
                 current_name = cb.get("name")
-                blocks[current_name] = {"index": e["index"], "deltas": []}
+                blocks[current_name] = {"index": e["index"], "deltas": []}  # ty: ignore[invalid-assignment] — current_name is str|None, narrowed by tool_use branch above
         elif e["type"] == "content_block_stop":
             current_name = None
         elif e["type"] == "content_block_delta" and current_name:
             d = e.get("delta") or {}
             if d.get("type") == "input_json_delta":
-                blocks[current_name]["deltas"].append(d.get("partial_json", ""))
+                blocks[current_name]["deltas"].append(d.get("partial_json", ""))  # ty: ignore[unresolved-attribute] — narrowed by `and current_name` guard above
 
     assert set(blocks) == {"Bash", "Read"}, f"expected Bash and Read blocks; got {set(blocks)}"
     assert blocks["Bash"]["deltas"] == ["{"], (
@@ -3945,7 +3945,7 @@ def test_resolve_tier_config_handles_none_global() -> None:
     downstream .get access (regression — None guard added at the resolver).
     """
     with _patched_empty_config():
-        srv.CONFIG["global"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
+        srv.CONFIG["global"] = None  # None-handling regression test
         req = _make_request({"model": "claude-3-5-haiku-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
         assert cfg == {}
@@ -4569,7 +4569,7 @@ def test_default_model_for_tier_handles_none_bucket() -> None:
     try:
         with _patched_empty_config():
             srv._default_model_for_tier.cache_clear()
-            srv.CONFIG["big"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
+            srv.CONFIG["big"] = None  # None-handling regression test
             assert srv._default_model_for_tier("sonnet") == "gpt-4.1"
     finally:
         for k, v in saved.items():
@@ -4772,7 +4772,7 @@ def test_resolve_tier_config_empty_and_unknown_tier() -> None:
 def test_resolve_tier_config_handles_none_global_cfg() -> None:
     """CONFIG['global'] patched to None — must not crash on `.is not None` guard."""
     with _patched_empty_config():
-        srv.CONFIG["global"] = None  # ty: ignore[invalid-assignment] — None-handling regression test
+        srv.CONFIG["global"] = None  # None-handling regression test
         srv.CONFIG["big"] = {"extra_body": {"from_big": 1}}
         req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
         cfg = srv._resolve_tier_config(req)
