@@ -9,6 +9,44 @@ surrounding code changes.
 
 ## Active
 
+### Security / proxy invariants
+
+#### `extra_body` spread doesn't filter protected keys — `server.py:1478`
+
+- **Severity**: medium — operator or client can override the proxy's own
+  `model`, `messages`, `stream`, `tools` keys via `request.extra_body` or
+  `[tier].extra_body`. The WARNING log at server.py:1464 reads "ignoring
+  protected key" but the value still reaches the JSON body upstream via
+  litellm's `openai_like/chat/handler.py:241,258` spread path.
+- **Where**: `_apply_merged_extra_body` does
+  `litellm_request["extra_body"] = {"allowed_openai_params": keys, **merged_extra}`.
+  The loop at server.py:1462-1470 correctly skips protected keys for the
+  top-level kwarg lift, but the `**merged_extra` spread below re-includes
+  them in `extra_body`, which is forwarded verbatim into the wire body.
+- **Repro**: `[sonnet].extra_body.model = "evil-model"` →
+  `WARNING ignoring protected key in extra_body: model` is logged, but
+  `out["extra_body"]["model"] == "evil-model"` and upstream receives a
+  second `model` field alongside the legitimate `out["model"]`. Same
+  hazard for `stream=true` (silently toggles streaming against the
+  route's expectation) and `messages=...` (replaces the proxy-built
+  messages list).
+- **Why caught now**: existing test `test_extra_body_protected_keys_blocked`
+  only asserts on top-level kwargs (`out["model"]`, `out["messages"]`,
+  `out["stream"]`); it doesn't check `out["extra_body"]` so the bypass
+  slipped through. Reviewer-verified via runtime execution of
+  `_prepare_litellm_request` against a malicious config.
+- **Suggested fix**: filter `merged_extra` before the spread —
+  `safe_extra = {k: v for k, v in merged_extra.items() if k not in _PROTECTED_KEYS}`
+  — and use `safe_extra` (not `merged_extra`) in the `extra_body` dict.
+  Extend `test_extra_body_protected_keys_blocked` to assert
+  `"model" not in out["extra_body"]`, etc.
+- **Source**: introduced on `fix/bugs` by commit `d8f953e feat(server):
+  translate output_config.effort + pass thinking through` (the spread
+  was added so body-only keys like `thinking` could reach the JSON body
+  — but the spread didn't filter `_PROTECTED_KEYS`). Pre-merge-base, on
+  `main`, `extra_body` only held `{"allowed_openai_params": keys}` — no
+  spread, no bypass.
+
 ### Streaming resilience
 
 #### `_log_request` emits STATUS_OK before upstream call — `server.py:1907`
