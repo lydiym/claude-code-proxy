@@ -98,11 +98,15 @@ def _inbound_dump_enabled() -> bool:
     return _str_to_bool(os.environ.get("PROXY_DEBUG_INBOUND_DUMP"), default=False)
 
 
+_INBOUND_DUMP_SEQ = itertools.count(1)
+
+
 def _inbound_dump_path() -> pathlib.Path:
     """Build a timestamped dump path; creates the directory if missing."""
     _INBOUND_DUMP_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    return _INBOUND_DUMP_DIR / f"{ts}-{os.getpid()}-inbound.json"
+    seq = next(_INBOUND_DUMP_SEQ)
+    return _INBOUND_DUMP_DIR / f"{ts}-{os.getpid()}-inbound-{seq:04d}.json"
 
 
 def _format_inbound_body(body: bytes) -> str:
@@ -987,7 +991,8 @@ def _build_tool_result_part(item: object) -> dict[str, Any]:
     if isinstance(item, dict):
         item_type = item.get("type")
         if item_type == "text":
-            return {"type": "text", "text": item.get("text", "")}
+            text = item.get("text")
+            return {"type": "text", "text": text if isinstance(text, str) else ""}
         if item_type == "image":
             return convert_image_block(item.get("source"))
         # Unknown block type — render via existing prose path, wrapped as text part
