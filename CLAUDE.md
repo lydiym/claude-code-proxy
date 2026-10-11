@@ -112,6 +112,17 @@ Logs go to stderr with a single timestamped format. `log_request` prints one lin
 
 Follow the convention: add a unit test by writing a `test_foo` function; it'll be picked up automatically. Use `assert` statements — failures are caught and printed with the function name.
 
+## Code review
+
+After every `/code-review` invocation on a feature branch, run a **findings triage** before acting on fixes:
+
+- **Scope check** — for each finding, determine whether it belongs to the current branch's commits (`fix/...`, `feat/...`) or was already present on `main` before the branch diverged. Use `git log main..HEAD --stat` and `git merge-base HEAD main` to draw the boundary.
+- **Relevance check** — if a finding predates the branch, it is out of scope for *this* review. Note it in the triage summary so it isn't forgotten, but do not bundle the fix into the branch's commits (keep diffs reviewable; queue the finding separately).
+- **Verification** — re-read the cited file:line against the current `HEAD`, since file:line anchors drift across commits. Findings citing a line that no longer contains the alleged code are stale and should be discarded.
+- **Outcome** — report each finding as one of: `fix in branch`, `pre-existing → file separate ticket`, `stale → discard`. Only act on the first category.
+
+The triage happens once per `/code-review` invocation, before any code changes — not on every finding individually.
+
 ## Files to know
 
 - `server.py` — everything (proxy, models, translation, streaming, config loader)

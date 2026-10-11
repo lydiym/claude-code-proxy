@@ -118,6 +118,22 @@ Merge chain is `[global] → [bucket] → [tier]` (later wins per leaf). Samplin
 
 Pick the knobs your backend actually understands — don't mix `reasoning_effort` (OpenAI o-series), `chat_template_kwargs` (llama.cpp), or Anthropic-native `thinking` in one section. They belong to different backends.
 
+### Anthropic-shaped field translations
+
+Claude Code sends a few Anthropic-native fields that don't map 1:1 to OpenAI Chat Completions. The proxy translates them so you don't have to round-trip via config:
+
+| Anthropic field           | Where it lands on the wire          | Notes |
+|---------------------------|-------------------------------------|-------|
+| `thinking`                | `extra_body.thinking` (body-only)   | Anthropic-compatible backends like MiniMax-M3 read this verbatim. Body-only because the openai SDK rejects unknown top-level kwargs; the key still reaches the JSON body via litellm's `extra_body` lift (see `openai_like/chat/handler.py:241,258`). |
+| `output_config.effort`    | top-level `reasoning_effort`        | OpenAI's reasoning-effort axis (o-series, etc.). Only translated when `effort` is set; other `output_config` keys are ignored. |
+| `metadata`, `context_management` | dropped | Anthropic-only; not forwarded. |
+
+Three more rules apply when these fields overlap with `[tier].extra_body`:
+
+- `thinking`: deep-merged with `[tier].extra_body.thinking` — config wins per leaf (e.g. config can flip `type` from `adaptive` to `disabled` while the client's `budget_tokens` survives).
+- `output_config.effort`: translated first, then `[tier].extra_body.reasoning_effort` (if any) overrides it.
+- The merged key list is published as `allowed_openai_params` at both top-level and inside `extra_body` so the litellm hop and any cascade proxy forward these vendor keys verbatim instead of filtering them.
+
 ### Lookup order
 
 For each setting, the proxy uses the first non-empty value from this list:
@@ -131,7 +147,7 @@ Env wins so `docker run -e KEY=VAL` and `docker-compose.yml: environment:` overr
 ### Per-tier merge semantics
 
 - **Model selection**: per tier, the resolver walks `{TIER}_MODEL` env → `{BIG|SMALL}_MODEL` env → `[tier].model` → `[bucket].model` → `[global].model` → built-in default. First non-empty wins. `[global].model` is the catch-all for any model — including unmapped ones (tier=None).
-- **extra_body merge chain**: `[global] → [bucket] → [tier]` (haiku → `small`, others → `big`). Each layer deep-merges; later wins per leaf. Keys are lifted to top-level kwargs on the upstream call. The merged key list is published as `allowed_openai_params` (top-level + inside `extra_body`) so the litellm hop and any cascade proxy forward vendor keys (`chat_template_kwargs`, `cache_prompt`, `n_predict`, `reasoning_effort`, …) instead of dropping them.
+- **extra_body merge chain**: `[global] → [bucket] → [tier]` (haiku → `small`, others → `big`). Each layer deep-merges; later wins per leaf. Keys are lifted to top-level kwargs on the upstream call, except `thinking` and any other Anthropic-only fields that the openai SDK rejects at signature time — those stay in `extra_body` and reach the JSON body via litellm's cascade lift. The merged key list is published as `allowed_openai_params` (top-level + inside `extra_body`) so the litellm hop and any cascade proxy forward vendor keys (`chat_template_kwargs`, `cache_prompt`, `n_predict`, `reasoning_effort`, …) instead of dropping them.
 - **Sampling / reasoning / vendor fields** all live inside `[tier].extra_body` (and `[global].extra_body` / `[bucket].extra_body`). There is no per-key whitelist — pass any top-level key the upstream OpenAI Chat Completions API (or your compatible backend) accepts: `temperature`, `top_p`, `top_k`, `stop`, `seed`, `max_completion_tokens`, `reasoning_effort`, `chat_template_kwargs`, `cache_prompt`, `n_predict`, …
 - **Conflict resolution**: when both a config layer (`[global]` / `[bucket]` / `[tier]`) and the client request set the same key (whether via Pydantic sampling fields or a request-level `extra_body`), **config wins** per leaf.
 - **No defaults applied**: when neither config nor the request sets a key, it is **omitted from the upstream call** (we don't auto-apply Anthropic defaults like `temperature=1.0`).
@@ -158,6 +174,46 @@ extra_body = { temperature = 0.3, cache_prompt = true, n_predict = 4096, chat_te
 
 Inspect upstream logs (or use `mitmproxy`) to confirm `cache_prompt`, `chat_template_kwargs`, etc. land in the body. For offline checks, set `LOG_LEVEL=DEBUG` — the proxy logs the effective `extra_body` per request (sourced from request or `[tier]` config).
 
+### Cache-busting diagnostics (`PROXY_DEBUG_CACHE_DUMP=true`)
+
+Off by default. When enabled, every outgoing payload is matched against a rolling window of prior ones — a request whose outgoing starts with a prior one is a `prefix_hit` (the desired case); anything that crosses the 0.6 fuzzy threshold but isn't a structural prefix is `fuzzy_match` (suspect a cache-busting edit).
+
+Artifacts land in `$cwd/.claude-code-proxy/prompts/`:
+
+- `<ts>-<pid>-<kind>-<score>-new.json` — the current outgoing payload
+- `<ts>-<pid>-<kind>-<score>-old.json` — the prior payload it matched against
+
+Compare them with your diff tool of choice (the system prompt is one long
+string, so `diff -u` won't be useful — a side-by-side viewer or a script
+that splits on `\n\n` works better). Adjust `[[prompt_remap]]` to canonicalise
+whichever side drifted.
+
+```bash
+PROXY_DEBUG_CACHE_DUMP=true uv run uvicorn server:app
+```
+
+### Inbound request dumps (`PROXY_DEBUG_INBOUND_DUMP=true`)
+
+Off by default. When enabled, every Anthropic request Claude Code sends is
+written verbatim (before conversion to OpenAI shape) to
+`$cwd/.claude-code-proxy/anthropic-prompts/<ts>-<pid>-inbound.json`.
+
+Use this when you need to see the raw Anthropic payload — in particular:
+
+- Where Claude Code places its `<system-reminder>` injections across turns
+  (top-level `system` field vs in-band `role="system"` messages vs user content)
+- The exact shape of the `system` field (`str` vs `list[ContentBlock]`)
+- Whether the conversation history is growing or staying stable
+
+This complements `PROXY_DEBUG_CACHE_DUMP` (which captures post-conversion
+outgoing payloads to `.claude-code-proxy/prompts/`). Inbound dumps let you
+inspect what the *client* sends; cache dumps let you inspect what
+*upstream* receives.
+
+```bash
+PROXY_DEBUG_INBOUND_DUMP=true uv run uvicorn server:app
+```
+
 ### System-prompt rewrites (`[[prompt_remap]]`)
 
 Two things at once:
@@ -167,7 +223,7 @@ Two things at once:
 
 ```toml
 [[prompt_remap]]
-match = "The TodoWrite tool hasn't been used recently.*?ignore if not applicable\\.\\n+"
+match = "The (?:TodoWrite tool hasn't|task tools haven't) been used recently.*?ignore if not applicable\\.\\n+"
 replacement = ""
 ```
 
