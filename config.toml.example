@@ -107,3 +107,10 @@
 match = "The (?:TodoWrite tool hasn't|task tools haven't) been used recently.*?ignore if not applicable\\.\\n+"
 replacement = ""
 
+[[prompt_remap]]
+# Newer Claude Code appends a token-budget line to the first system prompt.
+# Unstripped it re-varies every turn, so the system-prompt prefix never
+# stays cache-stable.
+match = "\\n\\n.total_tokens.15000000 tokens left..total_tokens."
+replacement = ""
+
