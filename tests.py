@@ -1495,7 +1495,7 @@ def _make_tool_result_request(tool_result_content: object) -> srv.MessagesReques
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "toolu_01abc", "name": "Read", "input": {"path": "/tmp/s.png"}},
+                        {"type": "tool_use", "id": "toolu_01abc", "name": "Read", "input": {"path": "/home/user/s.png"}},
                     ],
                 },
                 {
@@ -1715,7 +1715,7 @@ def test_tool_result_image_survives_full_pipeline() -> None:
                     {
                         "role": "assistant",
                         "content": [
-                            {"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"path": "/tmp/x.png"}},
+                            {"type": "tool_use", "id": "toolu_read", "name": "Read", "input": {"path": "/home/user/x.png"}},
                         ],
                     },
                     {
@@ -3395,7 +3395,7 @@ async def test_streaming_preserves_partial_tool_arguments_when_index_changes() -
     )
     chunks = [
         _tool_delta_chunk(0, tool_id="call_bash", name="Bash", arguments="{"),
-        _tool_delta_chunk(1, tool_id="call_read", name="Read", arguments='{"file_path":"/tmp/x.png"}'),
+        _tool_delta_chunk(1, tool_id="call_read", name="Read", arguments='{"file_path":"/home/user/x.png"}'),
         _finish_chunk("tool_calls"),
     ]
     events = await _run_stream(chunks, req)
@@ -3420,7 +3420,7 @@ async def test_streaming_preserves_partial_tool_arguments_when_index_changes() -
     assert blocks["Bash"]["deltas"] == ["{"], (
         f"Bash must carry the literal partial_json from upstream — no synthetic closing; got {blocks['Bash']['deltas']!r}"
     )
-    assert blocks["Read"]["deltas"] == ['{"file_path":"/tmp/x.png"}'], (
+    assert blocks["Read"]["deltas"] == ['{"file_path":"/home/user/x.png"}'], (
         f"Read must carry its full arguments; got {blocks['Read']['deltas']!r}"
     )
 
