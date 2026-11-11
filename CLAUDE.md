@@ -50,11 +50,15 @@ The incoming model name is also captured into `original_model` by `capture_origi
 
 `convert_litellm_to_anthropic` handles non-streaming. `_build_content_blocks` emits blocks in order: `thinking` (from `reasoning_content`), `text`, then `tool_use` for each call. Tool call `arguments` strings are JSON-parsed; non-JSON falls back to `{"raw": "..."}`.
 
+Token usage comes from the upstream's own counters — the proxy never counts tokens itself. `_map_usage` maps the OpenAI-shaped usage onto Anthropic's four counters: `prompt_tokens` is the prompt total, `prompt_tokens_details.cached_tokens` is the cache-hit subset, and the remainder is fresh input. The three input counters always sum back to `prompt_tokens`.
+
 `handle_streaming` handles streaming. Key collaborators:
 
 - **`BlockTracker`** — manages which Anthropic content block index is currently open. `ensure(kind)` closes a different-kind block first; `open(kind)` is unconditional. The tool_use path relies on this so consecutive parallel tool calls each get a fresh index without an intervening `content_block_stop`.
 - **`ThinkStreamParser`** — splits a stream into text vs. thinking chunks by recognising `think`/`/think` markers that some backends inline into `content`. Buffers across chunks so a marker split mid-stream is handled.
 - **`SseFormatter`** — stateless helpers for the Anthropic SSE event shape (`event: <name>\ndata: <json>\n\n`). The trailing `data: [DONE]\n\n` is the only frame without an `event:` line.
+
+Streaming requests set `stream_options: {include_usage: true}` — without it the upstream sends no usage at all. Upstreams report usage in a chunk that arrives *after* `finish_reason`, so the terminal frames are emitted only once the stream is fully read; `message_delta` carries all four counters because Anthropic clients accumulate usage across frames and size their context window from `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
 
 Native `delta.reasoning_content` from the upstream is honoured before falling back to  think-tag parsing.
 

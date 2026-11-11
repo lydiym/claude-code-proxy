@@ -234,6 +234,8 @@ MAX_OUTPUT_TOKENS = 16384  # OpenAI caps max_completion_tokens at this for most 
 MSG_ID_HEX_LEN = 24
 MAX_CONSECUTIVE_CHUNK_ERRORS = 5  # per-streak tolerance before surfacing chunk failures
 STATUS_OK = 200
+HTTP_CLIENT_ERROR_MIN = 400
+HTTP_CLIENT_ERROR_MAX = 499
 
 # Recognised bare names; anything else gets `openai/` prefix.
 OPENAI_MODELS = {
@@ -1396,6 +1398,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> dict[str
         "max_completion_tokens": anthropic_request.max_tokens,
         "stream": anthropic_request.stream,
     }
+    if anthropic_request.stream:
+        # Ask for the trailing usage chunk — without it the client never learns
+        # the prompt size, and Anthropic-shaped clients (Claude Code) size
+        # their context window from it.
+        litellm_request["stream_options"] = {"include_usage": True}
     if anthropic_request.tools:
         litellm_request["tools"] = _convert_tool_definitions(anthropic_request.tools)
     if anthropic_request.tool_choice:
@@ -1549,11 +1556,46 @@ def _build_content_blocks(
     return blocks or [{"type": "text", "text": ""}]
 
 
-def _extract_usage(usage: dict[str, object]) -> tuple[int, int]:
-    return (  # ty: ignore[unsound-return-statement] — `or 0` collapses falsy only; pre-existing pattern
-        _get_field(usage, "prompt_tokens", 0) or 0,
-        _get_field(usage, "completion_tokens", 0) or 0,
-    )
+def _token_count(value: object) -> int:
+    """Coerce an upstream token counter to a non-negative int."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    count = int(value)
+    return max(0, count)
+
+
+def _cache_counters(usage: object) -> tuple[int, int]:
+    """Return (cache_read, cache_creation) reported by an upstream usage object.
+
+    Anthropic-shaped upstreams name the counters directly; OpenAI-shaped ones
+    report the cache-hit subset under ``prompt_tokens_details.cached_tokens``
+    and the cache-write subset under ``prompt_tokens_details.cache_creation_tokens``.
+    """
+    cache_read = _token_count(_get_field(usage, "cache_read_input_tokens", 0))
+    cache_creation = _token_count(_get_field(usage, "cache_creation_input_tokens", 0))
+    details = _get_field(usage, "prompt_tokens_details", None)
+    if details is not None:
+        if not cache_read:
+            cache_read = _token_count(_get_field(details, "cached_tokens", 0))
+        if not cache_creation:
+            cache_creation = _token_count(_get_field(details, "cache_creation_tokens", 0))
+    return cache_read, cache_creation
+
+
+def _map_usage(usage: object) -> tuple[int, int, int, int]:
+    """Map an upstream usage object onto Anthropic's four counters.
+
+    Anthropic splits the prompt into fresh input, cache writes and cache reads;
+    OpenAI-shaped upstreams report one ``prompt_tokens`` total plus the cached
+    subset. Returns (input_tokens, output_tokens, cache_creation, cache_read) —
+    the three input counters always sum back to the upstream prompt total.
+    """
+    prompt_tokens = _token_count(_get_field(usage, "prompt_tokens", 0))
+    output_tokens = _token_count(_get_field(usage, "completion_tokens", 0))
+    cache_read, cache_creation = _cache_counters(usage)
+    cache_read = min(cache_read, prompt_tokens)
+    cache_creation = min(cache_creation, prompt_tokens - cache_read)
+    return prompt_tokens - cache_read - cache_creation, output_tokens, cache_creation, cache_read
 
 
 def convert_litellm_to_anthropic(
@@ -1579,9 +1621,9 @@ def _build_anthropic_response(litellm_response: object, original_request: Messag
     tool_calls = _extract_tool_calls(message)
     choice = _first_choice(litellm_response)
     finish_reason = _get_field(choice, "finish_reason", "stop")
-    usage = cast("dict[str, object]", _get_field(litellm_response, "usage", {}))
+    usage = _get_field(litellm_response, "usage", {})
     response_id = str(_get_field(litellm_response, "id", _new_msg_id()))
-    prompt_tokens, completion_tokens = _extract_usage(usage)
+    input_tokens, output_tokens, cache_creation, cache_read = _map_usage(usage)
     return MessagesResponse(
         id=response_id,
         model=original_request.model,
@@ -1589,7 +1631,12 @@ def _build_anthropic_response(litellm_response: object, original_request: Messag
         content=_build_content_blocks(text, reasoning, tool_calls),
         stop_reason=_to_anthropic_stop_reason(finish_reason),
         stop_sequence=None,
-        usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
+        usage=Usage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
+        ),
     )
 
 
@@ -1711,13 +1758,13 @@ class _SseFormatter:
         )
 
     @staticmethod
-    def message_delta(stop_reason: str, output_tokens: int) -> str:
+    def message_delta(stop_reason: str, usage: dict[str, int]) -> str:
         return _SseFormatter.event(
             "message_delta",
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
+                "usage": usage,
             },
         )
 
@@ -1745,9 +1792,9 @@ class _SseFormatter:
         )
 
     @staticmethod
-    def finish(stop_reason: str, output_tokens: int) -> list[str]:
+    def finish(stop_reason: str, usage: dict[str, int]) -> list[str]:
         return [
-            _SseFormatter.message_delta(stop_reason, output_tokens),
+            _SseFormatter.message_delta(stop_reason, usage),
             _SseFormatter.message_stop(),
             _SseFormatter.done(),
         ]
@@ -1854,7 +1901,7 @@ def _translate_parser_events(events: list[tuple[str, str | None]], tracker: _Blo
 def _emit_failure(
     parser: "_ThinkStreamParser",
     tracker: _BlockTracker,
-    output_tokens: int,
+    usage: dict[str, int],
     exc: BaseException,
     message_prefix: str,
 ) -> Iterator[str]:
@@ -1872,7 +1919,7 @@ def _emit_failure(
             yield event
     except Exception:
         logger.exception("closing tracker on fail")
-    yield _SseFormatter.message_delta("end_turn", output_tokens)
+    yield _SseFormatter.message_delta("end_turn", usage)
     yield _SseFormatter.error(
         _anthropic_error_type(exc),
         _sanitize_error_message(f"{message_prefix}: {exc}"),
@@ -1895,7 +1942,10 @@ class _StreamState:
     tool_use_emitted: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     has_sent_stop_reason: bool = False
+    stop_reason: str | None = None
     debug_first_chunk_logged: bool = False
     debug_chunk_count: int = 0
     consecutive_chunk_errors: int = 0
@@ -1929,11 +1979,27 @@ def _stream_prologue(original_request: MessagesRequest, tracker: _BlockTracker) 
     yield _SseFormatter.ping()
 
 
+def _state_usage(state: _StreamState) -> dict[str, int]:
+    """Build the Anthropic-shaped usage payload for a streamed response.
+
+    The Anthropic SDK accumulates usage across SSE frames: ``message_start``
+    carries the initial snapshot, ``message_delta`` overwrites each counter it
+    includes. Emitting all four here lets the client learn the prompt size,
+    which is what it sizes its context window from.
+    """
+    return {
+        "input_tokens": state.input_tokens,
+        "output_tokens": state.output_tokens,
+        "cache_creation_input_tokens": state.cache_creation_input_tokens,
+        "cache_read_input_tokens": state.cache_read_input_tokens,
+    }
+
+
 def _stream_epilogue(state: _StreamState, tracker: _BlockTracker, think_parser: _ThinkStreamParser) -> Iterator[str]:
     yield from _translate_parser_events(think_parser.flush(), tracker)
     yield from tracker.close()
-    stop_reason = "tool_use" if state.tool_use_emitted else "end_turn"
-    yield from _SseFormatter.finish(stop_reason, state.output_tokens)
+    stop_reason = state.stop_reason or ("tool_use" if state.tool_use_emitted else "end_turn")
+    yield from _SseFormatter.finish(stop_reason, _state_usage(state))
 
 
 def _log_stream_finished(state: _StreamState) -> None:
@@ -1967,12 +2033,13 @@ def _record_chunk_usage(chunk: object, state: _StreamState) -> None:
     usage = _get_field(chunk, "usage")
     if usage is None:
         return
-    incoming = _get_field(usage, "prompt_tokens")
-    if isinstance(incoming, (int, float)) and incoming:
-        state.input_tokens = int(incoming)
-    incoming = _get_field(usage, "completion_tokens")
-    if isinstance(incoming, (int, float)) and incoming:
-        state.output_tokens = int(incoming)
+    input_tokens, output_tokens, cache_creation, cache_read = _map_usage(usage)
+    if input_tokens or cache_creation or cache_read:
+        state.input_tokens = input_tokens
+        state.cache_creation_input_tokens = cache_creation
+        state.cache_read_input_tokens = cache_read
+    if output_tokens:
+        state.output_tokens = output_tokens
 
 
 def _coerce_delta_field(delta: object, key: str) -> object:
@@ -1997,6 +2064,11 @@ def _process_chunk(
 ) -> Iterator[str]:
     _record_chunk_debug(chunk, state)
     _record_chunk_usage(chunk, state)
+
+    if state.has_sent_stop_reason:
+        # Past the finish_reason: only the trailing usage chunk is still
+        # expected. Any further content would reopen a closed block.
+        return
 
     choices = _get_field(chunk, "choices")
     if not isinstance(choices, list) or not choices:
@@ -2023,10 +2095,12 @@ def _process_chunk(
 
     if finish_reason and not state.has_sent_stop_reason:
         state.has_sent_stop_reason = True
+        state.stop_reason = _to_anthropic_stop_reason(finish_reason)
         yield from _translate_parser_events(think_parser.flush(), tracker)
         yield from tracker.close()
-        yield from _SseFormatter.finish(_to_anthropic_stop_reason(finish_reason), state.output_tokens)
-        state.should_stop = True
+        # The upstream sends its usage counters in a trailing chunk that
+        # arrives *after* this one — keep reading so they are not lost.
+        # The terminal frames are emitted once the stream ends.
 
 
 def _process_tool_calls(
@@ -2099,6 +2173,9 @@ async def _stream_chunks(
                 yield event
         if state.should_stop:
             return
+        # The stream is not over yet: the upstream may still send its trailing
+        # usage chunk. Keep reading until it does — Anthropic clients size
+        # their context window from those counters.
 
 
 def _handle_chunk_error(
@@ -2121,7 +2198,7 @@ def _handle_chunk_error(
     # still leaves the loop guard set.
     state.should_stop = True
     logger.error("Chunk error threshold exceeded; surfacing error", exc_info=exc)
-    yield from _emit_failure(think_parser, tracker, state.output_tokens, exc, "chunk processing failed")
+    yield from _emit_failure(think_parser, tracker, _state_usage(state), exc, "chunk processing failed")
 
 
 async def handle_streaming(
@@ -2147,15 +2224,17 @@ async def handle_streaming(
         async for event in _stream_chunks(response_generator, tracker, think_parser, state):
             yield event
 
-        # Skip epilogue if chunk loop already terminated the stream via _emit_failure
-        # — calling _translate_parser_events again here would re-emit the error frame.
-        if not state.has_sent_stop_reason and not state.should_stop:
+        # The upstream sends its usage counters in a trailing chunk, so the
+        # terminal frames are emitted only after the stream is fully read.
+        # Skip if the chunk loop already terminated via _emit_failure —
+        # calling _translate_parser_events again here would re-emit the error frame.
+        if not state.should_stop:
             for event in _stream_epilogue(state, tracker, think_parser):
                 yield event
         _log_stream_finished(state)
     except Exception as e:
         logger.exception("Error in streaming")
-        for event in _emit_failure(think_parser, tracker, state.output_tokens, e, "upstream streaming failed"):
+        for event in _emit_failure(think_parser, tracker, _state_usage(state), e, "upstream streaming failed"):
             yield event
     finally:
         # Close so the internal httpx client releases deterministically —
@@ -2357,6 +2436,32 @@ def _log_response_debug(litellm_response: object, model: str, start_time: float)
     _debug_json_dump("litellm.completion response (full)", payload)
 
 
+async def _open_stream(litellm_request: dict[str, Any]) -> Any:
+    """Open an upstream stream, retrying without ``stream_options`` if rejected.
+
+    ``stream_options.include_usage`` is what makes the upstream report token
+    counts, but strict OpenAI-compatible servers reject the unknown field.
+    Losing the counts is better than failing the request outright.
+    """
+    try:
+        return await litellm.acompletion(**litellm_request)
+    except Exception as exc:
+        if "stream_options" not in litellm_request or not _is_unsupported_field_error(exc, "stream_options"):
+            raise
+        logger.warning("upstream rejected stream_options; retrying without it (token counts will be missing)")
+        retry_request = {k: v for k, v in litellm_request.items() if k != "stream_options"}
+        return await litellm.acompletion(**retry_request)
+
+
+def _is_unsupported_field_error(exc: BaseException, field: str) -> bool:
+    """Detect a 4xx complaining about an unknown request field."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and not HTTP_CLIENT_ERROR_MIN <= status_code <= HTTP_CLIENT_ERROR_MAX:
+        return False
+    message = str(exc).lower()
+    return field.lower() in message and ("unknown" in message or "unsupported" in message or "not permitted" in message)
+
+
 async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
     litellm_request = _prepare_litellm_request(request)
     _debug_dump_outgoing_payload(litellm_request)
@@ -2375,7 +2480,7 @@ async def _handle_request(request: MessagesRequest) -> MessagesResponse | Stream
     )
 
     if request.stream:
-        response_generator = await litellm.acompletion(**litellm_request)
+        response_generator = await _open_stream(litellm_request)
         return StreamingResponse(
             handle_streaming(response_generator, request),
             media_type="text/event-stream",

@@ -543,6 +543,39 @@ def test_convert_anthropic_to_litellm_minimal_request() -> None:
         assert "tool_choice" not in out
 
 
+def test_convert_anthropic_to_litellm_requests_stream_usage() -> None:
+    """Streaming must ask the upstream for its usage chunk.
+
+    Without stream_options.include_usage the upstream sends no usage at all
+    in streaming mode, so the client never learns the prompt size.
+    """
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert out["stream_options"] == {"include_usage": True}
+
+
+def test_convert_anthropic_to_litellm_omits_stream_options_when_not_streaming() -> None:
+    """include_usage is only valid on a streaming request."""
+    with _patched_empty_config():
+        req = _make_request(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "stream_options" not in out
+
+
 def test_no_max_tokens_clamp() -> None:
     """Client max_tokens flows through unmodified — the proxy no longer caps at MAX_OUTPUT_TOKENS.
     Users explicitly want 24000 when they ask for 24000.
@@ -2079,6 +2112,36 @@ def test_convert_litellm_to_anthropic_recovers_from_broken_usage() -> None:
     assert out.content[0].model_dump() == {"type": "text", "text": "ok"}
 
 
+def test_convert_litellm_to_anthropic_splits_cache_read_tokens() -> None:
+    """Cached prompt tokens are reported separately from fresh input.
+
+    Anthropic counts input_tokens as the prompt portion that was neither
+    read from nor written to cache; the three counters sum to the prompt size.
+    """
+    req = _make_request(
+        {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
+    response = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 500,
+            "completion_tokens": 3,
+            "prompt_tokens_details": {"cached_tokens": 400},
+        },
+    }
+    out = srv.convert_litellm_to_anthropic(response, req)
+    assert out.usage.input_tokens == 100
+    assert out.usage.cache_read_input_tokens == 400
+    assert out.usage.cache_creation_input_tokens == 0
+    assert out.usage.output_tokens == 3
+    total = out.usage.input_tokens + out.usage.cache_read_input_tokens + out.usage.cache_creation_input_tokens
+    assert total == 500, "the three input counters must sum to the prompt size"
+
+
 def test_convert_litellm_to_anthropic_handles_string_arguments_gracefully() -> None:
     """Tool arguments are typically strings (JSON-encoded); a non-string must not crash."""
     req = _base_request()
@@ -3303,7 +3366,7 @@ def test_emit_failure_flushes_buffered_think_content() -> None:
     tracker = srv._BlockTracker()
     exc = RuntimeError("test")
 
-    raw = list(srv._emit_failure(parser, tracker, 0, exc, "test failed"))
+    raw = list(srv._emit_failure(parser, tracker, {"output_tokens": 0}, exc, "test failed"))
     events = _parse_sse(raw)
 
     thinking_deltas = [e for e in events if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "thinking_delta"]
@@ -3456,6 +3519,123 @@ async def test_streaming_maps_finish_reason_length_to_max_tokens() -> None:
     stop = next(e for e in events if e["type"] == "message_delta")
     assert stop["delta"]["stop_reason"] == "max_tokens"
     assert stop["usage"]["output_tokens"] == 99
+
+
+async def test_streaming_reports_prompt_tokens_in_message_delta() -> None:
+    """The client sizes its context window from usage.input_tokens.
+
+    Anthropic clients accumulate usage across SSE frames: message_start
+    carries the initial snapshot, message_delta overwrites each counter it
+    includes. So the prompt size must be present on message_delta too.
+    """
+    req = _base_request(stream=True)
+    chunks = [_text_chunk("hi"), _finish_chunk("stop")]
+    events = await _run_stream(chunks, req)
+    stop = next(e for e in events if e["type"] == "message_delta")
+    assert stop["usage"]["input_tokens"] == 10, "prompt size must reach the client"
+    assert stop["usage"]["output_tokens"] == 5
+
+
+async def test_streaming_reports_usage_from_trailing_chunk() -> None:
+    """Upstreams send usage in a chunk that arrives after finish_reason."""
+    req = _base_request(stream=True)
+    chunks = [
+        _text_chunk("hi"),
+        _finish_chunk("stop"),
+        {"choices": [], "usage": {"prompt_tokens": 4242, "completion_tokens": 7}},
+    ]
+    events = await _run_stream(chunks, req)
+    stop = next(e for e in events if e["type"] == "message_delta")
+    assert stop["usage"]["input_tokens"] == 4242
+    assert stop["usage"]["output_tokens"] == 7
+
+
+async def test_streaming_splits_cache_read_tokens() -> None:
+    """Cached prompt tokens are reported separately from fresh input.
+
+    Anthropic counts input_tokens as the prompt portion that was neither
+    read from nor written to cache; the three counters sum to the prompt size.
+    """
+    req = _base_request(stream=True)
+    chunks = [
+        _text_chunk("hi"),
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 400},
+            },
+        },
+    ]
+    events = await _run_stream(chunks, req)
+    stop = next(e for e in events if e["type"] == "message_delta")
+    assert stop["usage"]["input_tokens"] == 100
+    assert stop["usage"]["cache_read_input_tokens"] == 400
+    assert stop["usage"]["cache_creation_input_tokens"] == 0
+
+
+async def test_streaming_ignores_content_after_finish_reason() -> None:
+    """Chunks past finish_reason must not reopen a closed content block."""
+    req = _base_request(stream=True)
+    chunks = [
+        _text_chunk("hi"),
+        _finish_chunk("stop"),
+        _text_chunk("late"),
+    ]
+    events = await _run_stream(chunks, req)
+    deltas = [e for e in events if e["type"] == "content_block_delta"]
+    assert len(deltas) == 1, "no content may be emitted after the stop reason"
+    assert deltas[0]["delta"]["text"] == "hi"
+
+
+async def test_open_stream_retries_without_stream_options_when_rejected() -> None:
+    """Strict OpenAI-compatible servers reject ``stream_options`` with a 4xx.
+
+    The proxy must retry without the field instead of failing the request —
+    losing the token counts beats losing the answer.
+    """
+
+    class _BadRequestError(Exception):
+        status_code = 400
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_acompletion(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        if "stream_options" in kwargs:
+            raise _BadRequestError("Unknown field: stream_options")
+        return "stream"
+
+    with patch.object(srv.litellm, "acompletion", _fake_acompletion):
+        result = await srv._open_stream({"model": "m", "stream": True, "stream_options": {"include_usage": True}})
+
+    assert result == "stream"
+    assert len(calls) == 2, "the request must be retried exactly once"
+    assert "stream_options" not in calls[1], "the retry must drop stream_options"
+
+
+async def test_open_stream_reraises_unrelated_errors() -> None:
+    """Only unknown-field rejections trigger the retry — everything else propagates."""
+
+    class _ServerError(Exception):
+        status_code = 500
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_acompletion(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        raise _ServerError("Unknown field: stream_options")
+
+    with patch.object(srv.litellm, "acompletion", _fake_acompletion):
+        try:
+            await srv._open_stream({"model": "m", "stream": True, "stream_options": {"include_usage": True}})
+        except _ServerError:
+            pass
+        else:
+            raise AssertionError("a 5xx must not be retried")
+
+    assert len(calls) == 1, "a 5xx must not be retried"
 
 
 async def test_streaming_message_id_format() -> None:

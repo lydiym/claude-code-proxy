@@ -40,3 +40,6 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# Debug artifacts (PROXY_DEBUG_CACHE_DUMP / PROXY_DEBUG_INBOUND_DUMP)
+.claude-code-proxy/
