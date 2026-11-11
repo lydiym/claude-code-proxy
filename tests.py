@@ -4478,6 +4478,109 @@ def test_extra_body_allowed_openai_params_set() -> None:
         assert set(out["extra_body"]["allowed_openai_params"]) == {"reasoning_effort", "top_k"}
 
 
+def test_extra_body_protected_keys_not_forwarded_in_body() -> None:
+    """Protected keys are dropped from extra_body too — the body must not carry them."""
+    with _patched_config("""
+        [sonnet]
+        extra_body = { model = "evil-model", stream = true, reasoning_effort = "low" }
+    """):
+        req = _make_request({"model": "claude-3-5-sonnet-20241022", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}]})
+        out = srv.convert_anthropic_to_litellm(req)
+        assert "model" not in out["extra_body"]
+        assert "stream" not in out["extra_body"]
+        assert out["extra_body"]["reasoning_effort"] == "low"
+
+
+def test_nested_extra_body_request_nests_only_body_only_keys() -> None:
+    """The gateway-safe form nests ``thinking`` and leaves vendor keys lifted."""
+    request = {
+        "model": "openai/fake",
+        "messages": [],
+        "chat_template_kwargs": {"enable_thinking": False},
+        "allowed_openai_params": ["thinking", "chat_template_kwargs"],
+        "extra_body": {"allowed_openai_params": ["thinking", "chat_template_kwargs"], "thinking": {"type": "enabled"}},
+    }
+    nested = srv._nested_extra_body_request(request)
+    assert nested is not None
+    assert nested["extra_body"]["extra_body"] == {"thinking": {"type": "enabled"}}
+    # Vendor keys stay lifted — litellm moves them into extra_body on its own.
+    assert nested["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "thinking" not in nested
+
+
+def test_nested_extra_body_request_without_body_only_keys() -> None:
+    """Nothing to nest → no variant."""
+    request = {"model": "m", "extra_body": {"allowed_openai_params": ["top_k"], "top_k": 5}}
+    assert srv._nested_extra_body_request(request) is None
+
+
+def test_gateway_kwarg_rejection_is_detected() -> None:
+    """The gateway's 'unexpected keyword argument' complaint is recognised."""
+    exc = Exception("OpenAIException - AsyncCompletions.create() got an unexpected keyword argument 'thinking'.")
+    assert srv._is_gateway_kwarg_rejection(exc, ["thinking"])
+    assert not srv._is_gateway_kwarg_rejection(exc, ["chat_template_kwargs"])
+    assert not srv._is_gateway_kwarg_rejection(Exception("boom"), ["thinking"])
+
+
+async def test_call_upstream_retries_with_nested_extra_body_on_gateway_rejection() -> None:
+    """A gateway that rejects a key as a kwarg gets the nested form instead."""
+
+    class _GatewayError(Exception):
+        pass
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_completion(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _GatewayError("OpenAIException - AsyncCompletions.create() got an unexpected keyword argument 'thinking'.")
+        return "response"
+
+    saved = set(srv._NESTED_EXTRA_BODY_UPSTREAMS)
+    srv._NESTED_EXTRA_BODY_UPSTREAMS.clear()
+    try:
+        request = {
+            "model": "m",
+            "allowed_openai_params": ["thinking"],
+            "extra_body": {"allowed_openai_params": ["thinking"], "thinking": {"type": "enabled"}},
+        }
+        with patch.object(srv.litellm, "completion", _fake_completion):
+            result = await srv._call_upstream(dict(request), stream=False)
+        remembered = set(srv._NESTED_EXTRA_BODY_UPSTREAMS)
+    finally:
+        srv._NESTED_EXTRA_BODY_UPSTREAMS.clear()
+        srv._NESTED_EXTRA_BODY_UPSTREAMS.update(saved)
+
+    assert result == "response"
+    assert len(calls) == 2, "the request must be retried exactly once"
+    assert calls[1]["extra_body"]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert srv.OPENAI_BASE_URL in remembered, "the upstream is remembered as a gateway"
+
+
+async def test_call_upstream_does_not_retry_unrelated_errors() -> None:
+    """Only a kwarg rejection triggers the nested retry — everything else propagates."""
+
+    class _UpstreamError(Exception):
+        pass
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_completion(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        raise _UpstreamError("upstream is down")
+
+    request = {"model": "m", "extra_body": {"allowed_openai_params": ["thinking"], "thinking": {"type": "enabled"}}}
+    with patch.object(srv.litellm, "completion", _fake_completion):
+        try:
+            await srv._call_upstream(dict(request), stream=False)
+        except _UpstreamError:
+            pass
+        else:
+            raise AssertionError("the error must propagate")
+
+    assert len(calls) == 1, "an unrelated error must not be retried"
+
+
 def test_no_max_tokens_clamp_arbitrary_large_value() -> None:
     """Any large max_tokens value (including well above MAX_OUTPUT_TOKENS) flows through unchanged."""
     with _patched_empty_config():

@@ -15,7 +15,7 @@ import sys
 import time
 import tomllib
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -224,6 +224,13 @@ _PROTECTED_KEYS = {"model", "messages", "stream", "tools"}  # OpenAI Chat Comple
 # canonical case: Claude Code / MiniMax-M3 exchange it via JSON body, not
 # as a typed SDK param.
 _BODY_ONLY_KEYS = {"thinking"}
+# A LiteLLM gateway parses the JSON body and splats it into acompletion()
+# kwargs, so a top-level vendor key becomes an unknown SDK kwarg there.
+# Nesting the extra_body keys one level deeper keeps them in the body — the
+# gateway forwards that object to its provider, which merges it back into the
+# top level of the outgoing request. Upstreams that rejected a key as a kwarg
+# are remembered here.
+_NESTED_EXTRA_BODY_UPSTREAMS: set[str] = set()
 _BUCKET_FOR_TIER = {t: ("small" if t == "haiku" else "big") for t in TIER_KEYS}
 _PROVIDER_PREFIXES = ("anthropic/", "openai/", "gemini/")
 _BOOL_TLS_VERIFY = {"openai_tls_verify"}
@@ -1435,17 +1442,8 @@ def _apply_sampling_fields(litellm_request: dict[str, Any], anthropic_request: M
         litellm_request["stop"] = anthropic_request.stop_sequences
 
 
-def _apply_merged_extra_body(
-    litellm_request: dict[str, Any],
-    anthropic_request: MessagesRequest,
-    tier_cfg: dict[str, Any],
-) -> None:
-    """Merge client extra_body under tier extra_body (config wins per leaf).
-
-    Lift every key to top-level kwargs on the upstream call and publish the
-    whitelist twice — top-level so litellm extends supported_params
-    (utils.py:3877), and inside extra_body so cascade proxies forward vendor
-    keys instead of filtering them (openai_like/chat/handler.py:241,254-259).
+def _collect_merged_extra(anthropic_request: MessagesRequest, tier_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Fold the client's Anthropic-shaped fields and extra_body with the tier config.
 
     Three client-side sources are folded in (later wins per leaf):
       1. ``request.thinking`` (Anthropic-shaped) → passes through to
@@ -1466,11 +1464,29 @@ def _apply_merged_extra_body(
     tier_extra = tier_cfg.get("extra_body")
     if isinstance(tier_extra, dict):
         merged_extra = _deep_merge(merged_extra, tier_extra)
+    return merged_extra
 
-    for k, v in merged_extra.items():
+
+def _apply_merged_extra_body(
+    litellm_request: dict[str, Any],
+    anthropic_request: MessagesRequest,
+    tier_cfg: dict[str, Any],
+) -> None:
+    """Merge client extra_body under tier extra_body (config wins per leaf).
+
+    Lift every key to top-level kwargs on the upstream call and publish the
+    whitelist twice — top-level so litellm extends supported_params
+    (utils.py:3877), and inside extra_body so cascade proxies forward vendor
+    keys instead of filtering them (openai_like/chat/handler.py:241,254-259).
+    """
+    merged_extra = _collect_merged_extra(anthropic_request, tier_cfg)
+
+    for k in list(merged_extra):
         if k in _PROTECTED_KEYS:
             logger.warning("ignoring protected key in extra_body: %s", k)
-            continue
+            del merged_extra[k]
+
+    for k, v in merged_extra.items():
         if k in _BODY_ONLY_KEYS:
             # Don't lift to top-level — the openai SDK rejects unknown kwargs.
             # The key still lands in the JSON body via extra_body below.
@@ -1484,6 +1500,43 @@ def _apply_merged_extra_body(
         # openai_like/chat/handler.py:241,258 which bypasses the SDK signature.
         litellm_request["allowed_openai_params"] = keys
         litellm_request["extra_body"] = {"allowed_openai_params": keys, **merged_extra}
+        if str(OPENAI_BASE_URL) in _NESTED_EXTRA_BODY_UPSTREAMS:
+            nested = _nested_extra_body_request(litellm_request)
+            if nested is not None:
+                litellm_request.clear()
+                litellm_request.update(nested)
+
+
+def _nested_extra_body_request(litellm_request: dict[str, Any]) -> dict[str, Any] | None:
+    """Pack the body-only keys one level deeper, for LiteLLM-gateway upstreams.
+
+    A gateway re-splats the JSON body into acompletion() kwargs, so a
+    top-level ``thinking`` reaches the provider SDK as an unknown kwarg.
+    Nested under a literal ``extra_body`` object the key stays in the body:
+    the gateway hands that object to its own provider, which merges it back
+    into the top level of the request it sends on.
+
+    Vendor keys (chat_template_kwargs, reasoning, …) stay lifted — litellm
+    does not know them and moves them into extra_body on its own, so they
+    reach the backend either way.
+    """
+    extra = litellm_request.get("extra_body")
+    if not isinstance(extra, dict):
+        return None
+    body_only = {k: v for k, v in extra.items() if k in _BODY_ONLY_KEYS}
+    if not body_only:
+        return None
+    request = dict(litellm_request)
+    request["extra_body"] = {"allowed_openai_params": list(extra.get("allowed_openai_params") or []), "extra_body": body_only}
+    return request
+
+
+def _is_gateway_kwarg_rejection(exc: BaseException, keys: Iterable[str]) -> bool:
+    """Detect an upstream rejecting a forwarded key as an unknown kwarg."""
+    message = str(exc)
+    if "unexpected keyword argument" not in message and "does not support parameters" not in message:
+        return False
+    return any(key in message for key in keys)
 
 
 # ---------------------------------------------------------------------------
@@ -2453,6 +2506,24 @@ async def _open_stream(litellm_request: dict[str, Any]) -> Any:
         return await litellm.acompletion(**retry_request)
 
 
+async def _call_upstream(litellm_request: dict[str, Any], *, stream: bool) -> Any:
+    """Call the upstream, retrying with a nested extra_body if a key is rejected.
+
+    A LiteLLM gateway in front of the backend re-splats the JSON body into
+    acompletion() kwargs, so a forwarded vendor key arrives as an unknown SDK
+    kwarg. The nested form keeps those keys in the body.
+    """
+    try:
+        return await _open_stream(litellm_request) if stream else litellm.completion(**litellm_request)
+    except Exception as exc:
+        nested = _nested_extra_body_request(litellm_request)
+        if nested is None or not _is_gateway_kwarg_rejection(exc, nested["extra_body"]["extra_body"]):
+            raise
+        logger.warning("upstream rejected an extra_body key as a kwarg; retrying with a nested extra_body")
+        _NESTED_EXTRA_BODY_UPSTREAMS.add(str(OPENAI_BASE_URL))
+        return await _open_stream(nested) if stream else litellm.completion(**nested)
+
+
 def _is_unsupported_field_error(exc: BaseException, field: str) -> bool:
     """Detect a 4xx complaining about an unknown request field."""
     status_code = getattr(exc, "status_code", None)
@@ -2480,14 +2551,14 @@ async def _handle_request(request: MessagesRequest) -> MessagesResponse | Stream
     )
 
     if request.stream:
-        response_generator = await _open_stream(litellm_request)
+        response_generator = await _call_upstream(litellm_request, stream=True)
         return StreamingResponse(
             handle_streaming(response_generator, request),
             media_type="text/event-stream",
         )
 
     start_time = time.time()
-    litellm_response = litellm.completion(**litellm_request)
+    litellm_response = await _call_upstream(litellm_request, stream=False)
     _log_response_debug(litellm_response, str(litellm_request.get("model") or ""), start_time)
     return convert_litellm_to_anthropic(litellm_response, request)
 
