@@ -318,6 +318,11 @@ def _new_msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
 
+def _new_request_id() -> str:
+    """Short id tying the request log line to the response log line."""
+    return uuid.uuid4().hex[:8]
+
+
 def _new_tool_id() -> str:
     return f"toolu_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
 
@@ -926,6 +931,7 @@ class _LogContext:
     num_messages: int
     num_tools: int
     status_code: int
+    request_id: str
     tokens: _TokenUsage | None = None
 
 
@@ -954,6 +960,7 @@ def _log_request(ctx: _LogContext) -> None:
     line = (
         f"{_color(_Colors.BOLD, ctx.method)} {_color(_Colors.BOLD, endpoint)} "
         f"{_color(status_color, ctx.status_code)} "
+        f"[{ctx.request_id}] "
         f"{_color(_Colors.CYAN, _short_model(ctx.source_model))} "
         f"{_color(_Colors.BOLD, arrow)} "
         f"{_color(_Colors.GREEN, _short_model(ctx.target_model))}"
@@ -2581,7 +2588,7 @@ def _is_unsupported_field_error(exc: BaseException, field: str) -> bool:
     return field.lower() in message and ("unknown" in message or "unsupported" in message or "not permitted" in message)
 
 
-async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
+async def _handle_request(request: MessagesRequest, request_id: str) -> MessagesResponse | StreamingResponse:
     litellm_request = _prepare_litellm_request(request)
     _debug_dump_outgoing_payload(litellm_request)
     _log_upstream_params_debug(litellm_request)
@@ -2594,6 +2601,7 @@ async def _handle_request(request: MessagesRequest) -> MessagesResponse | Stream
         len(litellm_request["messages"]),
         len(request.tools) if request.tools else 0,
         STATUS_OK,
+        request_id,
     )
     _log_request(log_ctx)
 
@@ -2632,10 +2640,11 @@ async def create_message(request: MessagesRequest) -> MessagesResponse | Streami
     Wraps every error as an ``HTTPException`` with the upstream status code
     (falling back to 500) so the Anthropic SDK sees a real HTTP error.
     """
+    request_id = _new_request_id()
     try:
-        return await _handle_request(request)
+        return await _handle_request(request, request_id)
     except Exception as e:
-        logger.exception("Error processing request")
+        logger.exception("Error processing request [%s]", request_id)
         status_code = getattr(e, "status_code", 500)
         message = getattr(e, "message", None) or str(e)
         raise HTTPException(status_code=status_code, detail=message) from e
