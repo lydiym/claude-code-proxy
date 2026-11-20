@@ -5317,6 +5317,96 @@ def filter_scenarios(scenarios: dict[str, dict[str, Any]], args: argparse.Namesp
 
 
 # ---------------------------------------------------------------------------
+# Token-usage log line
+# ---------------------------------------------------------------------------
+
+
+def test_log_request_line_keeps_tools_and_messages() -> None:
+    """The request line describes the request."""
+    ctx = srv._LogContext("POST", "/v1/messages", "claude-sonnet", "openai/minimax", "sonnet", 5, 2, srv.STATUS_OK, "a1b2c3d4")
+    with patch.object(srv.logger, "info") as info:
+        srv._log_request(ctx)
+    line = info.call_args[0][0]
+    assert "2 tools" in line
+    assert "5 messages" in line
+    assert "tokens:" not in line
+    assert "→" in line
+    assert "←" not in line
+    assert "[a1b2c3d4]" in line
+
+
+def test_log_request_line_reports_token_counters() -> None:
+    """The response line describes the token counters."""
+    ctx = srv._LogContext(
+        "POST",
+        "/v1/messages",
+        "claude-sonnet",
+        "openai/minimax",
+        "sonnet",
+        5,
+        2,
+        srv.STATUS_OK,
+        "a1b2c3d4",
+        tokens=srv._TokenUsage(input_tokens=100, output_tokens=7, cache_read=400, cache_write=20),
+    )
+    with patch.object(srv.logger, "info") as info:
+        srv._log_request(ctx)
+    line = info.call_args[0][0]
+    assert "tokens:" in line
+    assert "in=100 out=7" in line
+    assert "cache_read=400 cache_write=20" in line
+    assert "←" in line
+    assert "→" not in line
+
+
+async def test_handle_request_logs_token_counts() -> None:
+    """A non-streaming request logs a second line with the upstream's counters."""
+
+    def _fake_completion(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "id": "resp-1",
+            "model": "minimax",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 400},
+            },
+        }
+
+    req = _base_request()
+    with patch.object(srv.litellm, "completion", _fake_completion), patch.object(srv.logger, "info") as info:
+        await srv._handle_request(req, "a1b2c3d4")
+    lines = [call[0][0] for call in info.call_args_list]
+    assert len(lines) == 2, "one line for the request, one for the tokens"
+    assert "messages" in lines[0]
+    assert "tokens:" in lines[1]
+    assert "in=100 out=3" in lines[1]
+    assert "cache_read=400 cache_write=0" in lines[1]
+    assert "[a1b2c3d4]" in lines[0], "both lines carry the request id"
+    assert "[a1b2c3d4]" in lines[1]
+
+
+async def test_handle_streaming_logs_token_counts() -> None:
+    """A streaming request logs its token line once the stream is over."""
+    req = _base_request(stream=True)
+    chunks = [
+        _text_chunk("hi"),
+        _finish_chunk("stop"),
+        {"choices": [], "usage": {"prompt_tokens": 4242, "completion_tokens": 7}},
+    ]
+    log_ctx = srv._LogContext("POST", "/v1/messages", "claude-sonnet", "openai/minimax", "sonnet", 1, 0, srv.STATUS_OK, "a1b2c3d4")
+    with patch.object(srv.logger, "info") as info:
+        [piece async for piece in srv.handle_streaming(_aiter(chunks), req, log_ctx=log_ctx)]
+    lines = [call[0][0] for call in info.call_args_list]
+    assert lines, "the token line must be logged"
+    line = lines[-1]
+    assert "tokens:" in line
+    assert "in=4242 out=7" in line
+    assert "cache_read=0 cache_write=0" in line
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 

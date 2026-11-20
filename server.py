@@ -18,7 +18,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import Any, Literal, cast
 
@@ -316,6 +316,11 @@ def _get_field(obj: object, key: str, default: Any = None) -> Any:
 
 def _new_msg_id() -> str:
     return f"msg_{uuid.uuid4().hex[:MSG_ID_HEX_LEN]}"
+
+
+def _new_request_id() -> str:
+    """Short id tying the request log line to the response log line."""
+    return uuid.uuid4().hex[:8]
 
 
 def _new_tool_id() -> str:
@@ -895,6 +900,21 @@ async def _configure_logging(_app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+@dataclass(frozen=True)
+class _TokenUsage:
+    """Token counters of one response, as the client sees them.
+
+    ``input_tokens`` counts the fresh part of the prompt — the cached
+    portions are reported separately, exactly like the Anthropic usage
+    payload.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+
+
 @dataclass
 class _LogContext:
     """Per-request fields needed to format the ``log_request`` line.
@@ -911,22 +931,41 @@ class _LogContext:
     num_messages: int
     num_tools: int
     status_code: int
+    request_id: str
+    tokens: _TokenUsage | None = None
 
 
 def _log_request(ctx: _LogContext) -> None:
-    """Emit the per-request log line. Pure formatter — no side effects beyond ``logger.info``."""
+    """Emit a per-request log line. Pure formatter — no side effects beyond ``logger.info``.
+
+    Without ``tokens`` the line describes the request (tools, messages);
+    with them it describes the response (token counters). The arrow follows
+    the flow: the request goes out to the upstream model, the answer comes
+    back from it.
+    """
     endpoint = ctx.path.split("?", 1)[0] if "?" in ctx.path else ctx.path
     status_color = _Colors.GREEN if ctx.status_code == STATUS_OK else _Colors.RED
     tier_str = f" tier={_color(_Colors.YELLOW, ctx.tier)}" if ctx.tier else ""
+    if ctx.tokens is None:
+        arrow = "→"
+        detail = f"({_color(_Colors.MAGENTA, f'{ctx.num_tools} tools')}, {_color(_Colors.BLUE, f'{ctx.num_messages} messages')})"
+    else:
+        arrow = "←"
+        tokens = ctx.tokens
+        detail = (
+            f"({_color(_Colors.MAGENTA, 'tokens:')} "
+            f"{_color(_Colors.BLUE, f'in={tokens.input_tokens} out={tokens.output_tokens}')} "
+            f"{_color(_Colors.BLUE, f'cache_read={tokens.cache_read} cache_write={tokens.cache_write}')})"
+        )
     line = (
         f"{_color(_Colors.BOLD, ctx.method)} {_color(_Colors.BOLD, endpoint)} "
         f"{_color(status_color, ctx.status_code)} "
+        f"[{ctx.request_id}] "
         f"{_color(_Colors.CYAN, _short_model(ctx.source_model))} "
-        f"{_color(_Colors.BOLD, '→')} "
+        f"{_color(_Colors.BOLD, arrow)} "
         f"{_color(_Colors.GREEN, _short_model(ctx.target_model))}"
         f"{tier_str} "
-        f"({_color(_Colors.MAGENTA, f'{ctx.num_tools} tools')}, "
-        f"{_color(_Colors.BLUE, f'{ctx.num_messages} messages')})"
+        f"{detail}"
     )
     logger.info(line)
 
@@ -2257,6 +2296,7 @@ def _handle_chunk_error(
 async def handle_streaming(
     response_generator: AsyncGenerator[Any, None],
     original_request: MessagesRequest,
+    log_ctx: _LogContext | None = None,
 ) -> AsyncIterator[str]:
     """Yield Anthropic SSE frames for a streaming LiteLLM response.
 
@@ -2265,6 +2305,9 @@ async def handle_streaming(
     Outer try catches upstream connection failures and surfaces them as a
     canonical error frame; inner tolerance lets isolated bad chunks through
     without breaking the stream.
+
+    ``log_ctx`` makes the generator emit a second log line carrying the
+    response's token counters once the stream is over.
     """
     state = _StreamState()
     tracker = _BlockTracker()
@@ -2290,6 +2333,18 @@ async def handle_streaming(
         for event in _emit_failure(think_parser, tracker, _state_usage(state), e, "upstream streaming failed"):
             yield event
     finally:
+        if log_ctx is not None:
+            _log_request(
+                replace(
+                    log_ctx,
+                    tokens=_TokenUsage(
+                        input_tokens=state.input_tokens,
+                        output_tokens=state.output_tokens,
+                        cache_read=state.cache_read_input_tokens,
+                        cache_write=state.cache_creation_input_tokens,
+                    ),
+                ),
+            )
         # Close so the internal httpx client releases deterministically —
         # otherwise mid-stream cancellation leaks it until GC.
         await response_generator.aclose()
@@ -2533,34 +2588,47 @@ def _is_unsupported_field_error(exc: BaseException, field: str) -> bool:
     return field.lower() in message and ("unknown" in message or "unsupported" in message or "not permitted" in message)
 
 
-async def _handle_request(request: MessagesRequest) -> MessagesResponse | StreamingResponse:
+async def _handle_request(request: MessagesRequest, request_id: str) -> MessagesResponse | StreamingResponse:
     litellm_request = _prepare_litellm_request(request)
     _debug_dump_outgoing_payload(litellm_request)
     _log_upstream_params_debug(litellm_request)
-    _log_request(
-        _LogContext(
-            "POST",
-            "/v1/messages",
-            request.original_model or "unknown",
-            litellm_request.get("model", "unknown"),
-            request.tier,
-            len(litellm_request["messages"]),
-            len(request.tools) if request.tools else 0,
-            STATUS_OK,
-        ),
+    log_ctx = _LogContext(
+        "POST",
+        "/v1/messages",
+        request.original_model or "unknown",
+        litellm_request.get("model", "unknown"),
+        request.tier,
+        len(litellm_request["messages"]),
+        len(request.tools) if request.tools else 0,
+        STATUS_OK,
+        request_id,
     )
+    _log_request(log_ctx)
 
     if request.stream:
         response_generator = await _call_upstream(litellm_request, stream=True)
         return StreamingResponse(
-            handle_streaming(response_generator, request),
+            handle_streaming(response_generator, request, log_ctx=log_ctx),
             media_type="text/event-stream",
         )
 
     start_time = time.time()
     litellm_response = await _call_upstream(litellm_request, stream=False)
     _log_response_debug(litellm_response, str(litellm_request.get("model") or ""), start_time)
-    return convert_litellm_to_anthropic(litellm_response, request)
+    response = convert_litellm_to_anthropic(litellm_response, request)
+    usage = response.usage
+    _log_request(
+        replace(
+            log_ctx,
+            tokens=_TokenUsage(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read=usage.cache_read_input_tokens,
+                cache_write=usage.cache_creation_input_tokens,
+            ),
+        ),
+    )
+    return response
 
 
 @app.post("/v1/messages", response_model=None)
@@ -2572,10 +2640,11 @@ async def create_message(request: MessagesRequest) -> MessagesResponse | Streami
     Wraps every error as an ``HTTPException`` with the upstream status code
     (falling back to 500) so the Anthropic SDK sees a real HTTP error.
     """
+    request_id = _new_request_id()
     try:
-        return await _handle_request(request)
+        return await _handle_request(request, request_id)
     except Exception as e:
-        logger.exception("Error processing request")
+        logger.exception("Error processing request [%s]", request_id)
         status_code = getattr(e, "status_code", 500)
         message = getattr(e, "message", None) or str(e)
         raise HTTPException(status_code=status_code, detail=message) from e
