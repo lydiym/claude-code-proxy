@@ -933,14 +933,18 @@ def _log_request(ctx: _LogContext) -> None:
     """Emit a per-request log line. Pure formatter — no side effects beyond ``logger.info``.
 
     Without ``tokens`` the line describes the request (tools, messages);
-    with them it describes the response (token counters).
+    with them it describes the response (token counters). The arrow follows
+    the flow: the request goes out to the upstream model, the answer comes
+    back from it.
     """
     endpoint = ctx.path.split("?", 1)[0] if "?" in ctx.path else ctx.path
     status_color = _Colors.GREEN if ctx.status_code == STATUS_OK else _Colors.RED
     tier_str = f" tier={_color(_Colors.YELLOW, ctx.tier)}" if ctx.tier else ""
     if ctx.tokens is None:
+        arrow = "→"
         detail = f"({_color(_Colors.MAGENTA, f'{ctx.num_tools} tools')}, {_color(_Colors.BLUE, f'{ctx.num_messages} messages')})"
     else:
+        arrow = "←"
         tokens = ctx.tokens
         detail = (
             f"({_color(_Colors.MAGENTA, 'tokens:')} "
@@ -951,7 +955,7 @@ def _log_request(ctx: _LogContext) -> None:
         f"{_color(_Colors.BOLD, ctx.method)} {_color(_Colors.BOLD, endpoint)} "
         f"{_color(status_color, ctx.status_code)} "
         f"{_color(_Colors.CYAN, _short_model(ctx.source_model))} "
-        f"{_color(_Colors.BOLD, '→')} "
+        f"{_color(_Colors.BOLD, arrow)} "
         f"{_color(_Colors.GREEN, _short_model(ctx.target_model))}"
         f"{tier_str} "
         f"{detail}"

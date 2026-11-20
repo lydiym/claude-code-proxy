@@ -5330,6 +5330,8 @@ def test_log_request_line_keeps_tools_and_messages() -> None:
     assert "2 tools" in line
     assert "5 messages" in line
     assert "tokens:" not in line
+    assert "→" in line
+    assert "←" not in line
 
 
 def test_log_request_line_reports_token_counters() -> None:
@@ -5351,6 +5353,8 @@ def test_log_request_line_reports_token_counters() -> None:
     assert "tokens:" in line
     assert "in=100 out=7" in line
     assert "cache_read=400 cache_write=20" in line
+    assert "←" in line
+    assert "→" not in line
 
 
 async def test_handle_request_logs_token_counts() -> None:
